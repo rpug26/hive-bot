@@ -36,6 +36,20 @@ from telegram.ext import (
 
 )
 
+from notion_client import Client
+from datetime import datetime, timezone, timedelta
+import time
+
+# ... existing imports ...
+
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+
+notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
+
+# Simple in-memory cache: { "KEFI": {"data": {...}, "expires": timestamp} }
+_ticker_cache: dict[str, dict] = {}
+CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
 load_dotenv()
@@ -477,22 +491,6 @@ KNOWLEDGE = {
 
     },
 
-}
-
-from notion_client import Client
-from datetime import datetime, timezone, timedelta
-import time
-
-# ... existing imports ...
-
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-
-notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
-
-# Simple in-memory cache: { "KEFI": {"data": {...}, "expires": timestamp} }
-_ticker_cache: dict[str, dict] = {}
-CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
 async def get_ticker_from_notion(ticker: str) -> dict | None:
