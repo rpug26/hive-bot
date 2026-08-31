@@ -73,6 +73,7 @@ def _get_plain_text(prop: dict) -> str:
 async def get_ticker_from_notion(ticker: str) -> dict | None:
     """Fetch a single ticker from the UK AIM Micro-Cap Notion database."""
     if not notion or not NOTION_TICKERS_DB_ID:
+        logger.warning("Notion client or NOTION_TICKERS_DB_ID missing")
         return None
 
     ticker = ticker.upper().strip()
@@ -83,20 +84,30 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         return cached["data"]
 
     try:
-        response = notion.databases.query(
-            database_id=NOTION_TICKERS_DB_ID,
-            filter={
-                "property": "Ticker",
-                "title": {"equals": ticker},
-            },
-            page_size=1,
-        )
+        # Try Title property first, then Rich Text (normal Text property)
+        filters_to_try = [
+            {"property": "Ticker", "title": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"contains": ticker}},  # fallback
+        ]
 
-        results = response.get("results", [])
+        results = []
+        for f in filters_to_try:
+            response = notion.databases.query(
+                database_id=NOTION_TICKERS_DB_ID,
+                filter=f,
+                page_size=5,
+            )
+            results = response.get("results", [])
+            if results:
+                break
+
         if not results:
+            logger.info("No Notion page found for ticker: %s", ticker)
             return None
 
         props = results[0]["properties"]
+        logger.info("Found ticker %s – properties: %s", ticker, list(props.keys()))
 
         data = {
             "company": _get_plain_text(props.get("Company")),
