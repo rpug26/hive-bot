@@ -84,38 +84,22 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         return cached["data"]
 
     try:
-        # Try Title property first, then Rich Text (normal Text property)
-        filters_to_try = [
-            {"property": "Ticker", "title": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"contains": ticker}},  # fallback
-        ]
-
-        results = []
-        for f in filters_to_try:
-            response = notion.databases.query(
-                database_id=NOTION_TICKERS_DB_ID,
-                filter=f,
-                page_size=5,
-            )
-            results = response.get("results", [])
-            if results:
-                break
-
-        if not results:
-            logger.info("No Notion page found for ticker: %s", ticker)
-            return None
-
-        props = results[0]["properties"]
-        logger.info("Found ticker %s – properties: %s", ticker, list(props.keys()))
+        # Try multiple possible property names for each field
+        def find_prop(*names):
+            for name in names:
+                if name in props:
+                    val = _get_plain_text(props[name])
+                    if val:
+                        return val
+            return ""
 
         data = {
-            "company": _get_plain_text(props.get("Company")),
-            "status": _get_plain_text(props.get("Status")),
-            "mcap": _get_plain_text(props.get("Mkt Cap")),
-            "summary": _get_plain_text(props.get("Summary")),
-            "red_flags": _get_plain_text(props.get("Red Flags")),
-            "next": _get_plain_text(props.get("Next")),
+            "company": find_prop("Company", "Name", "Company Name"),
+            "status": find_prop("Status", "Stage", "Category"),
+            "mcap": find_prop("Mkt Cap", "Market Cap", "Mcap", "Market Capitalisation", "Market Cap (£)"),
+            "summary": find_prop("Summary", "Overview", "Description", "Thesis"),
+            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
+            "next": find_prop("Next", "Next Catalyst", "Catalyst", "Next Steps", "Upcoming"),
         }
 
         _ticker_cache[ticker] = {
