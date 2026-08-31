@@ -29,8 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app.add_handler(CommandHandler("debug", debug_cmd))
-
 # ------------------------------------------------------------
 # Environment
 # ------------------------------------------------------------
