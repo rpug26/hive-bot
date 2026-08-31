@@ -1,506 +1,83 @@
 #!/usr/bin/env python3
-
 """
-
 Hive SupportBot – AIM/Small Cap knowledge bot
-
+Live data from Notion + #stockpick capture
 """
-
-from notion_client import client 
-
-from datetime import datetime, timezone
 
 import os
-
 import re
-
+import time
 import logging
-
-from datetime import datetime
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-
+from notion_client import Client
 from telegram import Update
-
 from telegram.ext import (
-
     Application,
-
     CommandHandler,
-
     MessageHandler,
-
     ContextTypes,
-
     filters,
-
 )
 
-from notion_client import Client
-from datetime import datetime, timezone, timedelta
-import time
+load_dotenv()
 
-# ... existing imports ...
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+# Environment
+# ------------------------------------------------------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN missing")
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")          # for #stockpick captures
+NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID")      # UK AIM Micro-Cap database
 
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
-# Simple in-memory cache: { "KEFI": {"data": {...}, "expires": timestamp} }
+if not notion:
+    logger.warning("Notion credentials missing – live lookup and #stockpick write disabled")
+
+# ------------------------------------------------------------
+# Simple in-memory cache for ticker lookups
+# ------------------------------------------------------------
 _ticker_cache: dict[str, dict] = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
-load_dotenv()
-
-
-
-logging.basicConfig(
-
-    format="%(asctime)s - %(levelname)s - %(message)s",
-
-    level=logging.INFO,
-
-)
-
-logger = logging.getLogger(__name__)
-
-
-
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-if not TOKEN:
-
-    raise ValueError("TELEGRAM_BOT_TOKEN missing")
-
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID)
-NOTION_TICKERS_DB_ID = <database id of UK AIM Micro-Cap>
-
-notion = None 
-if NOTION_TOKEN and NOTION_DATABASE_ID:
-    notion = Client(auth=NOTION_TOKEN)
-else logger.warning("Notion credentials missing - "Stockpick will only be acknowledged")
-
-# ============================================================
-
-# Knowledge snapshot (UK AIM Micro-Cap)
-
-# ============================================================
-
-KNOWLEDGE = {
-
-    "KEFI": {
-
-        "company": "KEFI Gold and Copper plc",
-
-        "status": "Action",
-
-        "mcap": "£147m",
-
-        "summary": "Fully-funded Tulu Kapi gold project Ethiopia. US$400m mining contract signed. Construction on schedule. Debt drawdown Q4 2026 target. Main Market listing path with Stifel.",
-
-        "red_flags": "Very large share count. Dilution history.",
-
-        "next": "Q4 2026 project debt drawdown + Jibal Qutman FID",
-
-    },
-
-    "AXL": {
-
-        "company": "Arrow Exploration Corp.",
-
-        "status": "Action",
-
-        "mcap": "£65m",
-
-        "summary": "Colombian oil producer. >5,300 boe/d. Strong cash generation, no debt. Excellent drilling record.",
-
-        "red_flags": "Oil & gas sector. Colombia risk.",
-
-        "next": "Further 2026 drilling results",
-
-    },
-
-    "ATOM": {
-
-        "company": "ATOME plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£32m",
-
-        "summary": "Green fertiliser project Villeta Paraguay. Fully financed US$665m. PPA under government review.",
-
-        "red_flags": "Paraguay PPA uncertainty. Single project risk.",
-
-        "next": "PPA clarity (early Sep 2026 target)",
-
-    },
-
-    "ALRT": {
-
-        "company": "Defence Holdings plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£27m",
-
-        "summary": "UK defence technology group. First MoD contract. Meridian accelerator. £4m placing. Moving toward multi-pillar defence model.",
-
-        "red_flags": "Early commercial stage. Dilution from placing. Main Market transition.",
-
-        "next": "Further MoD / defence contracts + Meridian progress",
-
-    },
-
-    "GSCU": {
-
-        "company": "Great Southern Copper Plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£25m",
-
-        "summary": "Chile copper-gold-silver explorer. High-grade hits at Mostaza. System open ~2 km.",
-
-        "red_flags": "Chile jurisdiction. Early stage.",
-
-        "next": "Further drilling / resource definition",
-
-    },
-
-    "HE1": {
-
-        "company": "Helium One Global Ltd",
-
-        "status": "Watchlist",
-
-        "mcap": "£40m",
-
-        "summary": "Helium explorer Tanzania (Rukwa) + 50% Colorado project with first offtake sales.",
-
-        "red_flags": "Tanzania risk. Exploration stage.",
-
-        "next": "Rukwa appraisal or Colorado production ramp",
-
-    },
-
-    "GROC": {
-
-        "company": "GreenRoc Strategic Materials Plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£12m",
-
-        "summary": "Amitsoq graphite (Greenland) – high grade. Exploitation Licence granted. Anode pilot plant progressing. EU Strategic Project.",
-
-        "red_flags": "Greenland jurisdiction. Financing still needed.",
-
-        "next": "Pilot plant + financing / offtake",
-
-    },
-
-    "88E": {
-
-        "company": "88 Energy Ltd",
-
-        "status": "Researching",
-
-        "mcap": "£15m",
-
-        "summary": "Alaska North Slope explorer. Resources upgraded. Augusta-1 well targeted Q1 2027.",
-
-        "red_flags": "Pre-revenue. 2027 spud. Funding needs.",
-
-        "next": "Farm-out progress + Q1 2027 spud",
-
-    },
-
-    "AAU": {
-
-        "company": "Ariana Resources plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£43m",
-
-        "summary": "Dokwe Gold Project Zimbabwe (~1.1Moz). Non-dilutive cash from Turkish asset sales. Debt-free.",
-
-        "red_flags": "Zimbabwe / Turkey jurisdiction.",
-
-        "next": "Dokwe feasibility & resource updates",
-
-    },
-
-    "AEG": {
-
-        "company": "Active Energy Group plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£6.8m",
-
-        "summary": "UAE AI/crypto hosting + UK solar/BESS. Hosting revenue started. Pipeline growing.",
-
-        "red_flags": "Multi-pillar complexity. Early revenue. Dilution history.",
-
-        "next": "UAE revenue ramp + further energisations",
-
-    },
-
-    "AEX": {
-
-        "company": "Aminex plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£110m",
-
-        "summary": "Tanzania gas. Debt-free. Ntorya development carried but currently in operator budget dispute.",
-
-        "red_flags": "Operator dispute could delay first gas.",
-
-        "next": "Resolution of ARA Petroleum budget dispute",
-
-    },
-
-    "AGI": {
-
-        "company": "Potentially AI plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£30m",
-
-        "summary": "AI platform (model routing). RTO completed Jul 2026. Products targeted H2 2026.",
-
-        "red_flags": "Pre-revenue. Competitive AI space.",
-
-        "next": "H2 2026 product launches",
-
-    },
-
-    "APTA": {
-
-        "company": "Aptamer Group plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£20m",
-
-        "summary": "Optimer binders. Ebola diagnostic programme + pharma contracts + radiopharma.",
-
-        "red_flags": "Small revenue. Cash runway. Binary development risk.",
-
-        "next": "Ebola programme progress + further contracts",
-
-    },
-
-    "ARCM": {
-
-        "company": "Arc Minerals Ltd",
-
-        "status": "Watchlist",
-
-        "mcap": "£10m",
-
-        "summary": "Kalahari Copper Belt Botswana + Zambia. Major diamond drill programme starting.",
-
-        "red_flags": "Early stage. Funding for drilling.",
-
-        "next": "First assays from Virgo programme",
-
-    },
-
-    "BHL": {
-
-        "company": "Bradda Head Lithium Limited",
-
-        "status": "Watchlist",
-
-        "mcap": "£6m",
-
-        "summary": "Arizona lithium. Technical committee with Rio Tinto subsidiary. Drilling mobilising at Whistlejacket.",
-
-        "red_flags": "Still far below 2022 highs.",
-
-        "next": "First assay results",
-
-    },
-
-    "BLOE": {
-
-        "company": "Block Energy plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£14m",
-
-        "summary": "Georgia producer + Gabon growth. Partner-funded model. 3D seismic underway.",
-
-        "red_flags": "Country risk. Historical dilution.",
-
-        "next": "Seismic results + Gabon progress",
-
-    },
-
-    "BRES": {
-
-        "company": "Blencowe Resources plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£34m",
-
-        "summary": "Orom-Cross graphite Uganda. Big resource upgrade. Non-China purification LOI. Defence applications testing.",
-
-        "red_flags": "Still pre-production / pre-funding Phase 1.",
-
-        "next": "Tender results Q3 2026 + orbital testing",
-
-    },
-
-    "ALL": {
-
-        "company": "Atlantic Lithium Ltd",
-
-        "status": "Watchlist",
-
-        "mcap": "£125m",
-
-        "summary": "Ewoyaa lithium Ghana. Moving toward construction decision.",
-
-        "red_flags": "Ghana risk. Financing still required.",
-
-        "next": "FID / funding / offtake updates",
-
-    },
-
-    "AVCT": {
-
-        "company": "Avacta Group plc",
-
-        "status": "Watchlist",
-
-        "mcap": "£319m",
-
-        "summary": "Oncology biopharma. pre|CISION platform. AVA6103 Phase 1 data expected late H2 2026.",
-
-        "red_flags": "Convertible bond overhang. Ongoing cash needs.",
-
-        "next": "AVA6103 Phase 1 data H2 2026",
-
-    },
-
-    "SYME": {
-
-        "company": "Supply@ME Capital plc",
-
-        "status": "Researching",
-
-        "mcap": "£15.4m",
-
-        "summary": "Inventory monetisation fintech. Expanding into Italian credit intermediation.",
-
-        "red_flags": "Funding dependence. Delayed accounts.",
-
-        "next": "SFE deal documentation + Italian transactions",
-
-    },
-
-    "FRG": {
-
-        "company": "Firering Strategic Minerals plc",
-
-        "status": "Researching",
-
-        "mcap": "£5m",
-
-        "summary": "Lithium / critical minerals West Africa (Côte d'Ivoire).",
-
-        "red_flags": "Early exploration. Jurisdiction risk.",
-
-        "next": "Exploration results",
-
-    },
-
-    "CMRS": {
-
-        "company": "Critical Mineral Resources PLC",
-
-        "status": "Researching",
-
-        "mcap": "£2m",
-
-        "summary": "Copper-silver Morocco.",
-
-        "red_flags": "Very small. Limited track record.",
-
-        "next": "Exploration updates",
-
-    },
-
-    "CPX": {
-
-        "company": "CAP-XX Limited",
-
-        "status": "Researching",
-
-        "mcap": "£9m",
-
-        "summary": "Supercapacitors for IoT / electronics / automotive.",
-
-        "red_flags": "Heavy dilution. Loss-making.",
-
-        "next": "Design wins / volume orders",
-
-    },
-
-    "80M": {
-
-        "company": "80 Mile Plc",
-
-        "status": "Researching",
-
-        "mcap": "£28m",
-
-        "summary": "Greenland critical minerals + Italy biofuels (Ferrandina). Disko drilling under JV funding.",
-
-        "red_flags": "Greenland early stage.",
-
-        "next": "Disko assays + Ferrandina progress",
-
-    },
-
-    "TERN": {
-
-        "company": "Tern plc",
-
-        "status": "Passed",
-
-        "mcap": "£11m",
-
-        "summary": "IoT/AI venture investor. Continuous discounted raises. Shrinking NAV.",
-
-        "red_flags": "Chronic dilution. Falling NAV.",
-
-        "next": "Any portfolio liquidity event",
-
-    },
-
+# ------------------------------------------------------------
+# Notion helpers
+# ------------------------------------------------------------
+def _get_plain_text(prop: dict) -> str:
+    """Extract plain text from a Notion property."""
+    if not prop:
+        return ""
+    ptype = prop.get("type")
+    if ptype == "title":
+        return "".join(t.get("plain_text", "") for t in prop.get("title", [])).strip()
+    if ptype == "rich_text":
+        return "".join(t.get("plain_text", "") for t in prop.get("rich_text", [])).strip()
+    if ptype == "select":
+        sel = prop.get("select")
+        return sel.get("name", "") if sel else ""
+    return ""
 
 
 async def get_ticker_from_notion(ticker: str) -> dict | None:
-    """Fetch a single ticker from the Notion database. Returns dict or None."""
+    """Fetch a single ticker from the UK AIM Micro-Cap Notion database."""
     if not notion or not NOTION_TICKERS_DB_ID:
         return None
 
     ticker = ticker.upper().strip()
 
-    # Check cache first
+    # Cache hit?
     cached = _ticker_cache.get(ticker)
     if cached and cached["expires"] > time.time():
         return cached["data"]
@@ -509,8 +86,8 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         response = notion.databases.query(
             database_id=NOTION_TICKERS_DB_ID,
             filter={
-                "property": "Ticker",          # change if your property name is different
-                "title": {"equals": ticker}    # use "rich_text" if Ticker is a Text property
+                "property": "Ticker",
+                "title": {"equals": ticker},
             },
             page_size=1,
         )
@@ -521,26 +98,15 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
 
         props = results[0]["properties"]
 
-        def get_text(prop_name: str) -> str:
-            p = props.get(prop_name, {})
-            if p.get("type") == "title":
-                return "".join([t.get("plain_text", "") for t in p.get("title", [])]).strip()
-            if p.get("type") == "rich_text":
-                return "".join([t.get("plain_text", "") for t in p.get("rich_text", [])]).strip()
-            if p.get("type") == "select":
-                return (p.get("select") or {}).get("name", "")
-            return ""
-
         data = {
-            "company": get_text("Company"),
-            "status": get_text("Status"),
-            "mcap": get_text("Mkt Cap"),
-            "summary": get_text("Summary"),
-            "red_flags": get_text("Red Flags"),
-            "next": get_text("Next"),
+            "company": _get_plain_text(props.get("Company")),
+            "status": _get_plain_text(props.get("Status")),
+            "mcap": _get_plain_text(props.get("Mkt Cap")),
+            "summary": _get_plain_text(props.get("Summary")),
+            "red_flags": _get_plain_text(props.get("Red Flags")),
+            "next": _get_plain_text(props.get("Next")),
         }
 
-        # Store in cache
         _ticker_cache[ticker] = {
             "data": data,
             "expires": time.time() + CACHE_TTL_SECONDS,
@@ -548,196 +114,13 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         return data
 
     except Exception as e:
-        logger.error("Notion lookup failed for %s: %s", ticker, e)
+        logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
         return None
 
 
-def extract_tickers(text: str) -> list:
-
-    """Extract tickers from plain text or hashtags (#ALRT → ALRT)."""
-
-    if not text:
-
-        return []
-
-    pattern = r"(?:^|[\s$#])([A-Za-z0-9]{2,5})(?=[\s.,!?;:\)]|$)"
-
-    candidates = re.findall(pattern, text)
-
-    found = []
-
-    for c in candidates:
-
-        t = c.upper()
-
-        if t in KNOWLEDGE and t not in found:
-
-            found.append(t)
-
-    return found
-
-
-
-
-
-def format_reply(ticker: str, data: dict) -> str:
-
-    return (
-
-        f" 🔖📑 {ticker} – {data['company']}\n"
-
-        f"Status: {data['status']}  |  Mkt Cap: {data['mcap']}\n\n"
-
-        f"Summary:\n{data['summary']}\n\n"
-
-        f"Red Flags:\n{data['red_flags']}\n\n"
-
-        f"Next catalyst:\n{data['next']}\n\n"
-
-        f"_Hive knowledge snapshot. Not financial advice. DYOR._"
-
-    )
-
-
-
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    name = update.effective_user.first_name or "there"
-
-    await update.message.reply_text(
-
-        f"Hi {name}! 👋\n\n"
-
-        "I'm SupportBot for The Hive 🐝\n\n"
-
-        "Send a ticker (KEFI, AXL, #ALRT, etc.) and I’ll pull the notes.\n"
-
-        "Commands: /help  /tickers  /faq"
-
-    )
-
-
-
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    await update.message.reply_text(
-
-        "What I can do:\n"
-
-        "• Look up AIM micro-caps from the Hive knowledge base\n"
-
-        "• Accept tickers with or without # (e.g. ALRT or #ALRT)\n\n"
-
-        "/start – Welcome\n"
-
-        "/help – This message\n"
-
-        "/tickers – List loaded tickers\n"
-
-        "/faq – Common questions\n\n"
-
-        "In groups, tag me or just post the ticker / #ticker."
-
-    )
-
-
-
-
-
-async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    await update.message.reply_text(
-
-        "1. How do I look up a stock?\n"
-
-        "   → Send the ticker (KEFI or #KEFI)\n\n"
-
-        "2. Is this advice?\n"
-
-        "   → No. Discussion points only. Always DYOR.\n\n"
-
-        "3. Admin support?\n"
-
-        "   → Contact human admin in The Hive group."
-
-    )
-
-
-
-
-
-async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    tickers = ", ".join(sorted(KNOWLEDGE.keys()))
-
-    await update.message.reply_text(
-
-        f"Loaded tickers ({len(KNOWLEDGE)}):\n\n{tickers}\n\n"
-
-        "Just send any of them (with or without #)."
-
-    )
-
-
-
-
-
-def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-
-    if update.effective_chat.type == "private":
-
-        return True
-
-
-
-    msg = update.message
-
-    if not msg or not msg.text:
-
-        return False
-
-
-
-    bot_username = (context.bot.username or "").lower()
-
-    if msg.entities:
-
-        for e in msg.entities:
-
-            if e.type == "mention":
-
-                mention = msg.text[e.offset : e.offset + e.length].lower()
-
-                if mention == f"@{bot_username}":
-
-                    return True
-
-
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-
-        if msg.reply_to_message.from_user.id == context.bot.id:
-
-            return True
-
-
-
-    if extract_tickers(msg.text) or "#stockpick" in msg.text.lower():
-
-        return True
-
-
-
-    return False
-
-
 async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None = None) -> bool:
-    """Write a #stockpick message into the Notion database."""
-    if not notion:
+    """Write a #stockpick message into the captures database."""
+    if not notion or not NOTION_DATABASE_ID:
         return False
 
     try:
@@ -770,141 +153,200 @@ async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None
         )
         return True
     except Exception as e:
-        logger.error("Failed to write to Notion: %s", e)
+        logger.error("Failed to write #stockpick to Notion: %s", e)
         return False
-        
-    if "#stockpick" in lower:
-    user = update.effective_user
-    user_name = user.full_name if user else "Unknown"
-    tickers = extract_tickers(text)
-    ticker = tickers[0] if tickers else None
-
-    success = await save_stockpick_to_notion(text, user_name, ticker)
-
-    if success:
-        await update.message.reply_text(
-            f"Got it ✅  Captured your #stockpick"
-            + (f" ({ticker})" if ticker else "")
-            + " and saved to Notion."
-        )
-    else:
-        await update.message.reply_text(
-            "Got it ✅  Captured your #stockpick.\n"
-            "(Could not write to Notion – check the bot logs.)"
-        )
-    return
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    if not should_reply(update, context):
-
-        return
-
-
-
-    text = (update.message.text or "").strip()
-
-    lower = text.lower()
-
-
-
-    if any(w in lower for w in ("hi", "hello", "hey", "good morning", "good evening")) and len(text) < 25:
-
-        await update.message.reply_text(
-
-            "Hi! 👋 Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up."
-
-        )
-
-        return
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def extract_tickers(text: str) -> list[str]:
+    """Extract plausible tickers (2–5 alphanumeric) from text or hashtags."""
+    if not text:
+        return []
+    pattern = r"(?:^|[\s$#])([A-Za-z]{2,5})(?=[\s.,!?;:\)]|$)"
+    candidates = re.findall(pattern, text)
+    found = []
+    for c in candidates:
+        t = c.upper()
+        if t not in found and t.isalpha():
+            found.append(t)
+    return found
 
 
-
-    if any(w in lower for w in ("thank", "thanks", "cheers")):
-
-        await update.message.reply_text("You're welcome! 🐝")
-
-        return
-
-
-
-	tickers = extract_tickers(text)   # you may need to relax the "must be in KNOWLEDGE" check
-	if tickers:
-    	for t in tickers:
-     	   data = await get_ticker_from_notion(t)
-      	  if data:
-       	     await update.message.reply_text(format_reply(t, data))
-        	else:
-         	   await update.message.reply_text(
-          	      f"I don't have {t} in the current UK AIM Micro-Cap snapshot.\n"
-           	     "It may not be curated yet, or the name is different."
-            	)
-    	return
-
-
-    if "#stockpick" in lower:
-
-        await update.message.reply_text(
-
-            "Got it ✅  Captured your #stockpick.\n"
-
-            "(Notion live write will be enabled once the integration token is provided.)"
-
-        )
-
-        return
-
-
-
-    await update.message.reply_text(
-
-        "I don't have that ticker in the current snapshot.\n"
-
-        "Try /tickers to see what’s loaded, or contact human admin support in The Hive group."
-
+def format_reply(ticker: str, data: dict) -> str:
+    return (
+        f"📊 *{ticker}* – {data.get('company') or 'N/A'}\n"
+        f"Status: {data.get('status') or 'N/A'}  |  Mkt Cap: {data.get('mcap') or 'N/A'}\n\n"
+        f"*Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
+        f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n\n"
+        f"*Next catalyst:*\n{data.get('next') or 'N/A'}\n\n"
+        f"_Hive knowledge snapshot (live from Notion). Not financial advice. DYOR._"
     )
 
 
+# ------------------------------------------------------------
+# Command handlers
+# ------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = update.effective_user.first_name or "there"
+    await update.message.reply_text(
+        f"Hi {name}! 👋\n\n"
+        "I’m the Hive SupportBot.\n"
+        "Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up from the latest curated snapshot.\n"
+        "Use /help for more commands."
+    )
 
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🐝 *Hive SupportBot commands*\n\n"
+        "/start – Welcome message\n"
+        "/help – This help\n"
+        "/faq – Quick FAQ\n"
+        "/tickers – How to request a ticker\n\n"
+        "Just post a ticker (KEFI, #AXL, etc.) and I’ll reply with the latest summary.\n"
+        "In groups you can also use #stockpick to capture ideas.",
+        parse_mode="Markdown",
+    )
+
+
+async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📌 *FAQ*\n\n"
+        "• Data is pulled live from the curated UK AIM Micro-Cap Notion page.\n"
+        "• This is *not* financial advice – always DYOR.\n"
+        "• Use #stockpick in the group to log ideas.\n"
+        "• Contact a human admin in The Hive if something looks wrong.",
+        parse_mode="Markdown",
+    )
+
+
+async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Just send any ticker you’re interested in (e.g. `KEFI` or `#ALRT`).\n"
+        "I’ll look it up in the live UK AIM Micro-Cap snapshot.",
+        parse_mode="Markdown",
+    )
+
+
+# ------------------------------------------------------------
+# Message handling
+# ------------------------------------------------------------
+def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Decide whether the bot should respond to this message."""
+    msg = update.message
+    if not msg or not msg.text:
+        return False
+
+    # Always reply in private chats
+    if msg.chat.type == "private":
+        return True
+
+    # In groups: reply if bot is mentioned, replied to, or message contains a ticker / #stockpick
+    bot_username = (context.bot.username or "").lower()
+    if msg.entities:
+        for e in msg.entities:
+            if e.type == "mention":
+                mention = msg.text[e.offset : e.offset + e.length].lower()
+                if mention == f"@{bot_username}":
+                    return True
+
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if msg.reply_to_message.from_user.id == context.bot.id:
+            return True
+
+    if extract_tickers(msg.text) or "#stockpick" in msg.text.lower():
+        return True
+
+    return False
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not should_reply(update, context):
+        return
+
+    text = (update.message.text or "").strip()
+    lower = text.lower()
+
+    # Simple greetings
+    if any(w in lower for w in ("hi", "hello", "hey", "good morning", "good evening")) and len(text) < 25:
+        await update.message.reply_text(
+            "Hi! 👋 Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up."
+        )
+        return
+
+    if any(w in lower for w in ("thank", "thanks", "cheers")):
+        await update.message.reply_text("You're welcome! 🐝")
+        return
+
+    # #stockpick capture
+    if "#stockpick" in lower:
+        user = update.effective_user
+        user_name = user.full_name if user else "Unknown"
+        tickers = extract_tickers(text)
+        ticker = tickers[0] if tickers else None
+
+        success = await save_stockpick_to_notion(text, user_name, ticker)
+
+        if success:
+            reply = "✅ Captured your #stockpick"
+            if ticker:
+                reply += f" ({ticker})"
+            reply += " and saved to Notion."
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(
+                "✅ Captured your #stockpick.\n"
+                "(Could not write to Notion – check the bot logs.)"
+            )
+        return
+
+    # Ticker lookup
+    tickers = extract_tickers(text)
+    if tickers:
+        for t in tickers:
+            data = await get_ticker_from_notion(t)
+            if data:
+                await update.message.reply_text(
+                    format_reply(t, data),
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"I don’t have *{t}* in the current UK AIM Micro-Cap snapshot.\n"
+                    "It may not be curated yet, or the name is slightly different.",
+                    parse_mode="Markdown",
+                )
+        return
+
+    # Fallback
+    await update.message.reply_text(
+        "I don’t recognise that as a ticker I know.\n"
+        "Try sending a ticker (e.g. KEFI) or use /help."
+    )
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-
-    logger.error("Error: %s", context.error)
-
+    logger.error("Error while handling update: %s", context.error)
 
 
-
-
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 def main() -> None:
-
     app = Application.builder().token(TOKEN).build()
 
-
-
     app.add_handler(CommandHandler("start", start))
-
     app.add_handler(CommandHandler("help", help_cmd))
-
     app.add_handler(CommandHandler("faq", faq))
-
     app.add_handler(CommandHandler("tickers", tickers_cmd))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.add_error_handler(error_handler)
 
-
-
-    logger.info("Hive SupportBot starting...")
-
+    logger.info("Hive SupportBot starting (live Notion mode)...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
-
-
-
 if __name__ == "__main__":
-
     main()
