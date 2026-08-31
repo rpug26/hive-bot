@@ -242,36 +242,45 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ------------------------------------------------------------
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    In groups: only respond when the bot is explicitly @mentioned.
-    In private: always respond.
-    Also checks authorisation for group users.
+    Strict group behaviour:
+    - Only respond if the bot is @mentioned, OR
+    - The message contains a #hashtag (e.g. #KEFI, #stockpick)
+    - Also checks authorisation in groups
     """
     msg = update.message
     if not msg or not msg.text:
         return False
 
-    # --- Authorisation (groups only) ---
+    text = msg.text
+    lower = text.lower()
+
+    # --- Authorisation check (groups only) ---
     if msg.chat.type != "private":
         if not await is_authorized(update):
             return False
-    # ----------------------------------
+    # ----------------------------------------
 
-    # Private chats are always allowed
+    # Private chats → always allow
     if msg.chat.type == "private":
         return True
 
-    # Groups: only continue if the bot was @mentioned
+    # ---------- GROUP RULES ----------
     bot_username = (context.bot.username or "").lower()
-    if not bot_username:
-        return False
 
-    if msg.entities:
+    # 1. Bot was @mentioned?
+    if bot_username and msg.entities:
         for entity in msg.entities:
             if entity.type == "mention":
-                mention = msg.text[entity.offset : entity.offset + entity.length].lower()
+                mention = text[entity.offset : entity.offset + entity.length].lower()
                 if mention == f"@{bot_username}":
                     return True
 
+    # 2. Message contains a #hashtag (ticker or #stockpick)
+    #    Matches #KEFI, #ALRT, #stockpick, etc.
+    if re.search(r"#([A-Za-z]{2,12})\b", text):
+        return True
+
+    # Everything else in the group → stay silent
     return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
