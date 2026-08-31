@@ -62,6 +62,7 @@ if not TOKEN:
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID)
+NOTION_TICKERS_DB_ID = <database id of UK AIM Micro-Cap>
 
 notion = None 
 if NOTION_TOKEN and NOTION_DATABASE_ID:
@@ -478,8 +479,79 @@ KNOWLEDGE = {
 
 }
 
+from notion_client import Client
+from datetime import datetime, timezone, timedelta
+import time
+
+# ... existing imports ...
+
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+
+notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
+
+# Simple in-memory cache: { "KEFI": {"data": {...}, "expires": timestamp} }
+_ticker_cache: dict[str, dict] = {}
+CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
+async def get_ticker_from_notion(ticker: str) -> dict | None:
+    """Fetch a single ticker from the Notion database. Returns dict or None."""
+    if not notion or not NOTION_TICKERS_DB_ID:
+        return None
+
+    ticker = ticker.upper().strip()
+
+    # Check cache first
+    cached = _ticker_cache.get(ticker)
+    if cached and cached["expires"] > time.time():
+        return cached["data"]
+
+    try:
+        response = notion.databases.query(
+            database_id=NOTION_TICKERS_DB_ID,
+            filter={
+                "property": "Ticker",          # change if your property name is different
+                "title": {"equals": ticker}    # use "rich_text" if Ticker is a Text property
+            },
+            page_size=1,
+        )
+
+        results = response.get("results", [])
+        if not results:
+            return None
+
+        props = results[0]["properties"]
+
+        def get_text(prop_name: str) -> str:
+            p = props.get(prop_name, {})
+            if p.get("type") == "title":
+                return "".join([t.get("plain_text", "") for t in p.get("title", [])]).strip()
+            if p.get("type") == "rich_text":
+                return "".join([t.get("plain_text", "") for t in p.get("rich_text", [])]).strip()
+            if p.get("type") == "select":
+                return (p.get("select") or {}).get("name", "")
+            return ""
+
+        data = {
+            "company": get_text("Company"),
+            "status": get_text("Status"),
+            "mcap": get_text("Mkt Cap"),
+            "summary": get_text("Summary"),
+            "red_flags": get_text("Red Flags"),
+            "next": get_text("Next"),
+        }
+
+        # Store in cache
+        _ticker_cache[ticker] = {
+            "data": data,
+            "expires": time.time() + CACHE_TTL_SECONDS,
+        }
+        return data
+
+    except Exception as e:
+        logger.error("Notion lookup failed for %s: %s", ticker, e)
+        return None
 
 
 def extract_tickers(text: str) -> list:
@@ -514,7 +586,7 @@ def format_reply(ticker: str, data: dict) -> str:
 
     return (
 
-        f"📊 {ticker} – {data['company']}\n"
+        f" 🔖📑 {ticker} – {data['company']}\n"
 
         f"Status: {data['status']}  |  Mkt Cap: {data['mcap']}\n\n"
 
@@ -759,16 +831,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 
-    tickers = extract_tickers(text)
-
-    if tickers:
-
-        for t in tickers:
-
-            await update.message.reply_text(format_reply(t, KNOWLEDGE[t]))
-
-        return
-
+	tickers = extract_tickers(text)   # you may need to relax the "must be in KNOWLEDGE" check
+	if tickers:
+    	for t in tickers:
+     	   data = await get_ticker_from_notion(t)
+      	  if data:
+       	     await update.message.reply_text(format_reply(t, data))
+        	else:
+         	   await update.message.reply_text(
+          	      f"I don't have {t} in the current UK AIM Micro-Cap snapshot.\n"
+           	     "It may not be curated yet, or the name is different."
+            	)
+    	return
 
 
     if "#stockpick" in lower:
