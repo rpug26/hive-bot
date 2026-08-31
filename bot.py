@@ -112,10 +112,10 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         data = {
             "company": _get_plain_text(props.get("Company")),
             "status": _get_plain_text(props.get("Status")),
-            "mcap": _get_plain_text(props.get("Mkt Cap")),
-            "summary": _get_plain_text(props.get("Summary")),
+            "mcap": _get_plain_text(props.get("Mkt Cap GBPm")),
+            "summary": _get_plain_text(props.get("Summary & Next Catalyst")),
             "red_flags": _get_plain_text(props.get("Red Flags")),
-            "next": _get_plain_text(props.get("Next")),
+            "next": _get_plain_text(props.get("Last RNS Date")),
         }
 
         _ticker_cache[ticker] = {
