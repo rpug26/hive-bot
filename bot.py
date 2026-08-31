@@ -170,7 +170,7 @@ async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None
 # Helpers
 # ------------------------------------------------------------
 def extract_tickers(text: str) -> list[str]:
-    """Extract plausible tickers (2–5 alphanumeric) from text or hashtags."""
+    """Extract plausible tickers (2–5 alphanumeric) from hashtags only."""
     if not text:
         return []
     pattern = r"(?:^|[\s$#])([A-Za-z]{2,5})(?=[\s.,!?;:\)]|$)"
@@ -199,8 +199,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"Hi {name}! 👋\n\n"
-        "It's 🐝 BuuzBot here, I’m your Hive Group SupportBot.\n"
-        "Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up from the latest curated snapshot.\n"
+        "It's 🐝 BuzzBot here, I’m your Hive Group SupportBot.\n"
+        "Send a ticker (e.g. #KEFI or #ALRT) and I’ll look it up from the latest curated snapshot.\n"
         "Use /help for more commands."
     )
 
@@ -212,7 +212,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help – This help\n"
         "/faq – Quick FAQ\n"
         "/tickers – How to request a ticker\n\n"
-        "Just post a ticker (KEFI, #AXL, etc.) and I’ll reply with the latest summary.\n"
+        "Just post a ticker (#KEFI, #AXL, etc.) and I’ll reply with the latest summary.\n"
         "In groups you can also use #stockpick to capture ideas.",
         parse_mode="Markdown",
     )
@@ -231,7 +231,7 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Just send any ticker you’re interested in (e.g. `KEFI` or `#ALRT`).\n"
+        "Just send any ticker you’re interested in (e.g. `#KEFI` or `#ALRT`).\n"
         "I’ll look it up in the live UK AIM Micro-Cap snapshot.",
         parse_mode="Markdown",
     )
@@ -325,7 +325,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 3. Pure mention with no useful content
     await update.message.reply_text(
-        "Hi! Send a ticker (e.g. `@Bot KEFI`) or use `#stockpick` with a note."
+        "Hi! Send a ticker (e.g. `@Bot #KEFI`) or use `#stockpick` with a note."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,7 +338,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Simple greetings
     if any(w in lower for w in ("hi", "hello", "hey", "good morning", "good evening")) and len(text) < 25:
         await update.message.reply_text(
-            "Hi! 👋 Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up."
+            "Hi! 👋 Send a ticker (e.g. #KEFI or #ALRT) and I’ll look it up."
         )
         return
 
@@ -389,7 +389,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Fallback
     await update.message.reply_text(
         "I don’t recognise that as a ticker I know.\n"
-        "Try sending a ticker (e.g. KEFI) or use /help."
+        "Try sending a ticker (e.g. #KEFI) or use /help."
     )
 
 
