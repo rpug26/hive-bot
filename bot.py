@@ -185,12 +185,10 @@ def extract_tickers(text: str) -> list[str]:
 
 def format_reply(ticker: str, data: dict) -> str:
     return (
-        f"📊 *{ticker}* – {data.get('company') or 'N/A'}\n"
-        f"Status: {data.get('status') or 'N/A'}  |  Mkt Cap: {data.get('mcap') or 'N/A'}\n\n"
+        f" 🔖📑 *{ticker}* – {data.get('company') or 'N/A'}\n"
         f"*Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n\n"
-        f"*Next catalyst:*\n{data.get('next') or 'N/A'}\n\n"
-        f"_Hive knowledge snapshot (live from Notion). Not financial advice. DYOR._"
+        f"_powered by: The Hive 🐝 Bot knowledge snapshot. Not financial advice. DYOR._"
     )
 
 
