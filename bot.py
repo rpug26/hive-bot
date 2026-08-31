@@ -240,25 +240,18 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ------------------------------------------------------------
 # Message handling
 # ------------------------------------------------------------
+
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Strict group behaviour:
     - Only respond if the bot is @mentioned, OR
     - The message contains a #hashtag (e.g. #KEFI, #stockpick)
-    - Also checks authorisation in groups
     """
     msg = update.message
     if not msg or not msg.text:
         return False
 
     text = msg.text
-    lower = text.lower()
-
-    # --- Authorisation check (groups only) ---
-    if msg.chat.type != "private":
-        if not await is_authorized(update):
-            return False
-    # ----------------------------------------
 
     # Private chats → always allow
     if msg.chat.type == "private":
@@ -275,14 +268,12 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
                 if mention == f"@{bot_username}":
                     return True
 
-    # 2. Message contains a #hashtag (ticker or #stockpick)
-    #    Matches #KEFI, #ALRT, #stockpick, etc.
+    # 2. Message contains a #hashtag
     if re.search(r"#([A-Za-z]{2,12})\b", text):
         return True
 
-    # Everything else in the group → stay silent
+    # Everything else → stay silent
     return False
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await should_reply(update, context):
