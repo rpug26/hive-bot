@@ -29,6 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+app.add_handler(CommandHandler("debug", debug_cmd))
+
 # ------------------------------------------------------------
 # Environment
 # ------------------------------------------------------------
@@ -341,6 +343,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporary diagnostic – shows first few pages from the tickers database."""
+    if not notion or not NOTION_TICKERS_DB_ID:
+        await update.message.reply_text("Notion client or NOTION_TICKERS_DB_ID is missing.")
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=NOTION_TICKERS_DB_ID,
+            page_size=5,
+        )
+        results = response.get("results", [])
+
+        if not results:
+            await update.message.reply_text(
+                "Database is accessible but returned **0 pages**.\n"
+                "Possible causes:\n"
+                "• Wrong Database ID\n"
+                "• Integration not connected to this database\n"
+                "• Database is empty"
+            )
+            return
+
+        lines = [f"Found {len(results)} page(s). Showing first few:\n"]
+        for page in results:
+            props = page.get("properties", {})
+            prop_names = list(props.keys())
+            # Try to get a title-like value
+            title = ""
+            for key in prop_names:
+                val = _get_plain_text(props[key])
+                if val:
+                    title = f"{key}: {val}"
+                    break
+            lines.append(f"• {title or 'No text'}  |  properties: {prop_names}")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        await update.message.reply_text(f"Error talking to Notion:\n`{e}`", parse_mode="Markdown")
 
 # ------------------------------------------------------------
 # Main
