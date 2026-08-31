@@ -274,6 +274,59 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
     return False
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await should_reply(update, context):
+        return
+
+    text = (update.message.text or "").strip()
+    lower = text.lower()
+
+    # Remove the bot mention from the text so we can parse cleanly
+    bot_username = (context.bot.username or "").lower()
+    clean_text = re.sub(rf"@{bot_username}\b", "", text, flags=re.IGNORECASE).strip()
+    clean_lower = clean_text.lower()
+
+    # 1. #stockpick capture
+    if "#stockpick" in clean_lower:
+        user = update.effective_user
+        user_name = user.full_name if user else "Unknown"
+        tickers = extract_tickers(clean_text)
+        ticker = tickers[0] if tickers else None
+
+        success = await save_stockpick_to_notion(clean_text, user_name, ticker)
+        if success:
+            reply = "✅ Captured your #stockpick"
+            if ticker:
+                reply += f" ({ticker})"
+            reply += " and saved to Notion."
+            await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(
+                "✅ Captured your #stockpick.\n(Could not write to Notion – check logs.)"
+            )
+        return
+
+    # 2. Ticker lookup
+    tickers = extract_tickers(clean_text)
+    if tickers:
+        for t in tickers:
+            data = await get_ticker_from_notion(t)
+            if data:
+                await update.message.reply_text(
+                    format_reply(t, data),
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"I don’t have *{t}* in the current UK AIM Micro-Cap snapshot.",
+                    parse_mode="Markdown",
+                )
+        return
+
+    # 3. Pure mention with no useful content
+    await update.message.reply_text(
+        "Hi! Send a ticker (e.g. `@Bot KEFI`) or use `#stockpick` with a note."
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not should_reply(update, context):
