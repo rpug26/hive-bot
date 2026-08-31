@@ -241,22 +241,26 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Message handling
 # ------------------------------------------------------------
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Only respond when the bot is @mentioned (and user is authorised in groups)."""
+    """
+    In groups: only respond when the bot is explicitly @mentioned.
+    In private: always respond.
+    Also checks authorisation for group users.
+    """
     msg = update.message
     if not msg or not msg.text:
         return False
 
-    # --- Authorisation check (groups only) ---
+    # --- Authorisation (groups only) ---
     if msg.chat.type != "private":
         if not await is_authorized(update):
             return False
-    # ----------------------------------------
+    # ----------------------------------
 
-    # Always allow private chats
+    # Private chats are always allowed
     if msg.chat.type == "private":
         return True
 
-    # In groups: only respond if the bot is explicitly @mentioned
+    # Groups: only continue if the bot was @mentioned
     bot_username = (context.bot.username or "").lower()
     if not bot_username:
         return False
