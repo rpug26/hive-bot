@@ -185,10 +185,10 @@ def extract_tickers(text: str) -> list[str]:
 
 def format_reply(ticker: str, data: dict) -> str:
     return (
-        f" 🔖📑 *{ticker}* – {data.get('company') or 'N/A'}\n"
+        f" 🔖📑 #*{ticker}* – {data.get('company') or 'N/A'}\n"
         f"*Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n\n"
-        f"_powered by: The Hive 🐝 Bot knowledge snapshot. Not financial advice. DYOR._"
+        f"_🔋🪫Powered by: The Hive 🐝 BuzzBot Knowledge Hub. Not financial advice. DYOR._"
     )
 
 
