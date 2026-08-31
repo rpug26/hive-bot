@@ -240,31 +240,33 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ------------------------------------------------------------
 # Message handling
 # ------------------------------------------------------------
-def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Decide whether the bot should respond to this message."""
+async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Only respond when the bot is @mentioned (and user is authorised in groups)."""
     msg = update.message
     if not msg or not msg.text:
         return False
 
-    # Always reply in private chats
+    # --- Authorisation check (groups only) ---
+    if msg.chat.type != "private":
+        if not await is_authorized(update):
+            return False
+    # ----------------------------------------
+
+    # Always allow private chats
     if msg.chat.type == "private":
         return True
 
-    # In groups: reply if bot is mentioned, replied to, or message contains a ticker / #stockpick
+    # In groups: only respond if the bot is explicitly @mentioned
     bot_username = (context.bot.username or "").lower()
+    if not bot_username:
+        return False
+
     if msg.entities:
-        for e in msg.entities:
-            if e.type == "mention":
-                mention = msg.text[e.offset : e.offset + e.length].lower()
+        for entity in msg.entities:
+            if entity.type == "mention":
+                mention = msg.text[entity.offset : entity.offset + entity.length].lower()
                 if mention == f"@{bot_username}":
                     return True
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if msg.reply_to_message.from_user.id == context.bot.id:
-            return True
-
-    if extract_tickers(msg.text) or "#stockpick" in msg.text.lower():
-        return True
 
     return False
 
