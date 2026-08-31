@@ -221,10 +221,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📌 *FAQ*\n\n"
-        "• Data is pulled live from the curated UK AIM Micro-Cap Notion page.\n"
+        "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
         "• Use #stockpick in the group to log ideas.\n"
-        "• Contact a human admin in The Hive if something looks wrong.",
+        "• Contact a human admin in The Hive group if something looks wrong or incorrect.",
         parse_mode="Markdown",
     )
 
