@@ -6,7 +6,9 @@ Hive SupportBot – AIM/Small Cap knowledge bot
 
 """
 
+from notion_client import client 
 
+from datetime import datetime, timezone
 
 import os
 
@@ -58,7 +60,13 @@ if not TOKEN:
 
     raise ValueError("TELEGRAM_BOT_TOKEN missing")
 
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID)
 
+notion = None 
+if NOTION_TOKEN and NOTION_DATABASE_ID:
+    notion = Client(auth=NOTION_TOKEN)
+else logger.warning("Notion credentials missing - "Stockpick will only be acknowledged")
 
 # ============================================================
 
@@ -657,7 +665,64 @@ def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 
+async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None = None) -> bool:
+    """Write a #stockpick message into the Notion database."""
+    if not notion:
+        return False
 
+    try:
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": text[:100]}}]
+            },
+            "Message": {
+                "rich_text": [{"text": {"content": text[:2000]}}]
+            },
+            "User": {
+                "rich_text": [{"text": {"content": user_name or "Unknown"}}]
+            },
+            "Date": {
+                "date": {"start": datetime.now(timezone.utc).isoformat()}
+            },
+            "Source": {
+                "rich_text": [{"text": {"content": "Telegram"}}]
+            },
+        }
+
+        if ticker:
+            properties["Ticker"] = {
+                "rich_text": [{"text": {"content": ticker}}]
+            }
+
+        notion.pages.create(
+            parent={"database_id": NOTION_DATABASE_ID},
+            properties=properties,
+        )
+        return True
+    except Exception as e:
+        logger.error("Failed to write to Notion: %s", e)
+        return False
+        
+    if "#stockpick" in lower:
+    user = update.effective_user
+    user_name = user.full_name if user else "Unknown"
+    tickers = extract_tickers(text)
+    ticker = tickers[0] if tickers else None
+
+    success = await save_stockpick_to_notion(text, user_name, ticker)
+
+    if success:
+        await update.message.reply_text(
+            f"Got it ✅  Captured your #stockpick"
+            + (f" ({ticker})" if ticker else "")
+            + " and saved to Notion."
+        )
+    else:
+        await update.message.reply_text(
+            "Got it ✅  Captured your #stockpick.\n"
+            "(Could not write to Notion – check the bot logs.)"
+        )
+    return
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
