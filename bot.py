@@ -37,7 +37,7 @@ if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN missing")
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")          # for #stockpick captures
+NOTION_DATABASE_ID = os.getenv("NOTION_TOKEN")          # for #stockpick captures
 NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID")      # UK AIM Micro-Cap database
 
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
