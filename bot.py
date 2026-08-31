@@ -186,7 +186,7 @@ def extract_tickers(text: str) -> list[str]:
 def format_reply(ticker: str, data: dict) -> str:
     return (
         f" 🔖📑 #*{ticker}* – {data.get('company') or 'N/A'}\n"
-        f"*Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
+        f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n\n"
         f"_🔋🪫Powered by: The Hive 🐝 BuzzBot Knowledge Hub. Not financial advice. DYOR._"
     )
@@ -199,7 +199,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"Hi {name}! 👋\n\n"
-        "I’m the Hive SupportBot.\n"
+        "It's 🐝 BuuzBot here, I’m your Hive Group SupportBot.\n"
         "Send a ticker (e.g. KEFI or #ALRT) and I’ll look it up from the latest curated snapshot.\n"
         "Use /help for more commands."
     )
