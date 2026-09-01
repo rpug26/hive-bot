@@ -150,15 +150,20 @@ def _query_notion_auth(telegram_user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def is_authorised(telegram_user_id: int) -> bool:
+    # Temporary hard-coded allow list (your ID)
+    if telegram_user_id in (1670138803,):
+        return True
+
     now = datetime.now(timezone.utc).timestamp()
     cached = _auth_cache.get(telegram_user_id)
     if cached and (now - cached.get("ts", 0)) < CACHE_TTL_SECONDS:
         return cached.get("authorised", False)
+
     record = _query_notion_auth(telegram_user_id)
     authorised = bool(record and record.get("status") == "Authorised")
     _auth_cache[telegram_user_id] = {"authorised": authorised, "ts": now, "record": record}
     return authorised
-
+    
 
 def create_stockpick_page(text: str, user, chat) -> Optional[str]:
     """Create a row in Hive Stock Picks. Returns page URL or None."""
