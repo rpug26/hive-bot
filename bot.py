@@ -304,11 +304,7 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    Strict group rules:
-    - Private chat → always allow
-    - Group → only reply if:
-        1. Bot is @mentioned AND message contains at least one #TICKER
-        2. OR message contains #stockpick
+    Strict group rules + debug logging
     """
     msg = update.message
     if not msg or not msg.text:
@@ -316,19 +312,23 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
     text = msg.text
     lower = text.lower()
+    chat_type = msg.chat.type
 
     # Private chats always allowed
-    if msg.chat.type == "private":
+    if chat_type == "private":
+        logger.info("ALLOW (private chat)")
         return True
 
-    # --- Authorisation (groups) ---
-    if not await is_authorized(update):
+    # --- Authorisation ---
+    authorized = await is_authorized(update)
+    if not authorized:
+        logger.info("DENY (not authorised) – user: %s", 
+                    update.effective_user.username if update.effective_user else "unknown")
         return False
 
     # --- Group trigger rules ---
     bot_username = (context.bot.username or "").lower()
 
-    # Check if bot was @mentioned
     has_mention = False
     if bot_username and msg.entities:
         for entity in msg.entities:
@@ -341,15 +341,22 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     hashtag_tickers = extract_hashtag_tickers(text)
     has_stockpick = "#stockpick" in lower
 
-    # Rule 1: #stockpick → always allow (for authorised users)
+    logger.info(
+        "CHECK – chat=%s | mention=%s | tickers=%s | stockpick=%s | text=%s",
+        chat_type, has_mention, hashtag_tickers, has_stockpick, text[:80]
+    )
+
+    # Rule 1: #stockpick
     if has_stockpick:
+        logger.info("ALLOW (#stockpick)")
         return True
 
-    # Rule 2: Must have BOTH @mention AND at least one #TICKER
+    # Rule 2: @mention + #TICKER
     if has_mention and hashtag_tickers:
+        logger.info("ALLOW (@mention + #ticker)")
         return True
 
-    # Everything else → stay completely silent
+    logger.info("DENY (no matching rule)")
     return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
