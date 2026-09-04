@@ -297,6 +297,32 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Let a user check whether they are authorised."""
+    user = update.effective_user
+    if not user:
+        return
+
+    authorised = await is_authorized(update)
+
+    if authorised:
+        await update.message.reply_text(
+            f"✅ You are **Authorised**.\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"User ID: `{user.id}`",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ You are **not authorised** yet.\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"User ID: `{user.id}`\n\n"
+            "Send /request to submit an access request.",
+            parse_mode="Markdown",
+        )
+        
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
 # ------------------------------------------------------------
@@ -580,6 +606,8 @@ def main() -> None:
     app.add_handler(CommandHandler("faq", faq))
     app.add_handler(CommandHandler("tickers", tickers_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+	app.add_handler(CommandHandler("request", request_access))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
