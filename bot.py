@@ -297,6 +297,34 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
+async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Allow a user to request access to the bot."""
+    user = update.effective_user
+    if not user:
+        return
+
+    # Already authorised?
+    if await is_authorized(update):
+        await update.message.reply_text("You are already authorised. You can use the bot.")
+        return
+
+    success = await create_access_request(user)
+
+    if success:
+        await update.message.reply_text(
+            "✅ Your access request has been submitted.\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"User ID: `{user.id}`\n\n"
+            "An admin will review it and change your Status to **Authorised** in Notion.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "Sorry, I could not submit your request right now. "
+            "Please try again later or contact an admin."
+        )
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Let a user check whether they are authorised."""
     user = update.effective_user
@@ -607,13 +635,12 @@ def main() -> None:
     app.add_handler(CommandHandler("tickers", tickers_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-	app.add_handler(CommandHandler("request", request_access))
+    app.add_handler(CommandHandler("request", request_access))   # ← must exist
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("Hive SupportBot starting (strict group mode)...")
+    logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
