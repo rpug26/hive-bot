@@ -320,11 +320,8 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         return True
 
     # --- Authorisation ---
-    authorized = await is_authorized(update)
-    if not authorized:
-        logger.info("DENY (not authorised) – user: %s", 
-                    update.effective_user.username if update.effective_user else "unknown")
-        return False
+	if not await is_authorized(update):
+	    return False
 
     # --- Group trigger rules ---
     bot_username = (context.bot.username or "").lower()
