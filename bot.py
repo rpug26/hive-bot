@@ -304,56 +304,76 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    Strict group rules + debug logging
+    TEMPORARY DEBUG VERSION – very noisy on purpose
     """
     msg = update.message
     if not msg or not msg.text:
+        logger.info("DENY – no message or no text")
         return False
 
     text = msg.text
     lower = text.lower()
     chat_type = msg.chat.type
+    user = update.effective_user
+    username = user.username if user else "none"
+
+    logger.info("===== NEW MESSAGE =====")
+    logger.info("chat_type = %s", chat_type)
+    logger.info("from_user = %s", username)
+    logger.info("text = %s", text[:150])
 
     # Private chats always allowed
     if chat_type == "private":
-        logger.info("ALLOW (private chat)")
+        logger.info("ALLOW – private chat")
         return True
 
-    # --- Authorisation ---
-	if not await is_authorized(update):
-	    return False
+    # ---- TEMPORARILY DISABLE AUTHORISATION ----
+    # (we will turn it back on later)
+    # ------------------------------------------
 
-    # --- Group trigger rules ---
     bot_username = (context.bot.username or "").lower()
+    logger.info("bot_username = %s", bot_username)
 
+    # Show all entities so we can see what Telegram is sending
+    if msg.entities:
+        for i, entity in enumerate(msg.entities):
+            piece = text[entity.offset : entity.offset + entity.length]
+            logger.info("entity[%d] type=%s  value=%s", i, entity.type, piece)
+    else:
+        logger.info("No entities found in message")
+
+    # Detect mention in two ways (more reliable)
     has_mention = False
-    if bot_username and msg.entities:
-        for entity in msg.entities:
-            if entity.type == "mention":
-                mention = text[entity.offset : entity.offset + entity.length].lower()
-                if mention == f"@{bot_username}":
-                    has_mention = True
-                    break
+    if bot_username:
+        # Method 1: official entity
+        if msg.entities:
+            for entity in msg.entities:
+                if entity.type == "mention":
+                    mention = text[entity.offset : entity.offset + entity.length].lower()
+                    if mention == f"@{bot_username}":
+                        has_mention = True
+                        break
+        # Method 2: simple text search (backup)
+        if f"@{bot_username}" in lower:
+            has_mention = True
 
     hashtag_tickers = extract_hashtag_tickers(text)
     has_stockpick = "#stockpick" in lower
 
-    logger.info(
-        "CHECK – chat=%s | mention=%s | tickers=%s | stockpick=%s | text=%s",
-        chat_type, has_mention, hashtag_tickers, has_stockpick, text[:80]
-    )
+    logger.info("has_mention = %s | hashtag_tickers = %s | has_stockpick = %s",
+                has_mention, hashtag_tickers, has_stockpick)
 
     # Rule 1: #stockpick
     if has_stockpick:
-        logger.info("ALLOW (#stockpick)")
+        logger.info("ALLOW – #stockpick")
         return True
 
     # Rule 2: @mention + #TICKER
     if has_mention and hashtag_tickers:
-        logger.info("ALLOW (@mention + #ticker)")
+        logger.info("ALLOW – @mention + #ticker")
         return True
 
-    logger.info("DENY (no matching rule)")
+    logger.info("DENY – no matching rule")
     return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
