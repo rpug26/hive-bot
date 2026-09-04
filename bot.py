@@ -247,20 +247,38 @@ def format_reply(ticker: str, data: dict) -> str:
         f"_🔋🪫 Powered by: The Hive 🐝 BuzzBot Knowledge Hub. Not financial advice. DYOR._"
     )
 
-
 # ------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    name = update.effective_user.first_name or "there"
-    await update.message.reply_text(
-        f"Hi {name}! 👋\n\n"
-        "It's 🐝 BuzzBot here, I’m your Hive Group SupportBot.\n"
-        "In the group: @mention me + #TICKER, or use #TICKER with words like "
-        "summary / snapshot / thesis / stockpick.\n"
-        "Use /help for more commands."
-    )
+    user = update.effective_user
+    name = user.first_name if user else "there"
 
+    # Check authorisation
+    authorised = await is_authorized(update)
+
+    if authorised:
+        await update.message.reply_text(
+            f"Hi {name}! 👋\n\n"
+            "It's 🐝 BuzzBot here.\n"
+            "✅ You are **Authorised** and can use the bot.\n\n"
+            "In the group use:\n"
+            "• `@Bot #TICKER` to look up a stock\n"
+            "• `#stockpick your idea` to save an idea\n\n"
+            "Type /help for more commands.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"Hi {name}! 👋\n\n"
+            "It's 🐝 BuzzBot here.\n"
+            "❌ You are **not authorised** yet.\n\n"
+            "To request access, please send:\n"
+            "`/request`\n\n"
+            "An admin will review your request and approve it in Notion.\n"
+            "You can also check your status anytime with `/status`.",
+            parse_mode="Markdown",
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -298,12 +316,10 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow a user to request access to the bot."""
     user = update.effective_user
     if not user:
         return
 
-    # Already authorised?
     if await is_authorized(update):
         await update.message.reply_text("You are already authorised. You can use the bot.")
         return
@@ -316,15 +332,40 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Name: {user.full_name}\n"
             f"Username: @{user.username or 'N/A'}\n"
             f"User ID: `{user.id}`\n\n"
-            "An admin will review it and change your Status to **Authorised** in Notion.",
+            "An admin will change your Status to **Authorised** in Notion.",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
-            "Sorry, I could not submit your request right now. "
-            "Please try again later or contact an admin."
+            "Sorry, I could not submit your request right now. Please contact an admin."
         )
 
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    authorised = await is_authorized(update)
+
+    if authorised:
+        await update.message.reply_text(
+            f"✅ You are **Authorised**.\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"User ID: `{user.id}`",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ You are **not authorised** yet.\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"User ID: `{user.id}`\n\n"
+            "Send /request to submit an access request.",
+            parse_mode="Markdown",
+        )
+        
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Let a user check whether they are authorised."""
     user = update.effective_user
@@ -633,14 +674,14 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("faq", faq))
     app.add_handler(CommandHandler("tickers", tickers_cmd))
-    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("request", request_access))   # ← must exist
+    app.add_handler(CommandHandler("request", request_access))
+    app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
+    
 if __name__ == "__main__":
     main()
