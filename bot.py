@@ -301,15 +301,14 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ------------------------------------------------------------
 # Message handling – STRICT
 # ------------------------------------------------------------
+
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
-    Group rules (strict):
-    1. User must be authorised (if auth is configured)
-    2. AND one of:
-       - Bot is @mentioned AND message contains #TICKER
-       - Message contains #TICKER + an intent keyword (summary, snapshot, thesis...)
-       - Message contains #stockpick
-    Private chats: always allowed.
+    Strict group rules:
+    - Private chat → always allow
+    - Group → only reply if:
+        1. Bot is @mentioned AND message contains at least one #TICKER
+        2. OR message contains #stockpick
     """
     msg = update.message
     if not msg or not msg.text:
@@ -323,12 +322,13 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         return True
 
     # --- Authorisation (groups) ---
-    # Comment out the next 2 lines if you want to temporarily disable auth
     if not await is_authorized(update):
         return False
 
     # --- Group trigger rules ---
     bot_username = (context.bot.username or "").lower()
+
+    # Check if bot was @mentioned
     has_mention = False
     if bot_username and msg.entities:
         for entity in msg.entities:
@@ -340,23 +340,17 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 
     hashtag_tickers = extract_hashtag_tickers(text)
     has_stockpick = "#stockpick" in lower
-    has_intent = has_intent_keyword(text)
 
-    # Rule 1: #stockpick is always allowed (for authorised users)
+    # Rule 1: #stockpick → always allow (for authorised users)
     if has_stockpick:
         return True
 
-    # Rule 2: @mention + at least one #TICKER
+    # Rule 2: Must have BOTH @mention AND at least one #TICKER
     if has_mention and hashtag_tickers:
         return True
 
-    # Rule 3: #TICKER + intent keyword (summary / snapshot / thesis etc.)
-    if hashtag_tickers and has_intent:
-        return True
-
-    # Everything else → stay silent
+    # Everything else → stay completely silent
     return False
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await should_reply(update, context):
