@@ -297,55 +297,161 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
+# ------------------------------------------------------------
+# Authorisation (Status = "Authorised" required)
+# ------------------------------------------------------------
+_authorized_cache: dict = {"users": {}, "expires": 0}
+AUTH_CACHE_TTL = 300  # 5 minutes
+
+NOTION_AUTH_DB_ID = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+
+
+async def get_authorized_users() -> dict:
+    """
+    Returns a dict of authorised users:
+    {
+        "usernames": {"john_smith", ...},
+        "user_ids": {"123456789", ...}
+    }
+    Only rows where Status == "Authorised" are included.
+    """
+    if not notion or not NOTION_AUTH_DB_ID:
+        return {"usernames": set(), "user_ids": set()}
+
+    now = time.time()
+    if _authorized_cache["expires"] > now:
+        return _authorized_cache["users"]
+
+    try:
+        usernames = set()
+        user_ids = set()
+        cursor = None
+
+        while True:
+            kwargs = {
+                "database_id": NOTION_AUTH_DB_ID,
+                "page_size": 100,
+                "filter": {
+                    "property": "Status",
+                    "select": {"equals": "Authorised"}
+                }
+            }
+            if cursor:
+                kwargs["start_cursor"] = cursor
+
+            response = notion.databases.query(**kwargs)
+
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+
+                # Username
+                for key in ("Telegram Username", "Username", "TG Username"):
+                    if key in props:
+                        val = _get_plain_text(props[key]).strip().lstrip("@").lower()
+                        if val:
+                            usernames.add(val)
+                        break
+
+                # User ID
+                for key in ("Telegram User ID", "User ID", "Telegram ID", "ID"):
+                    if key in props:
+                        val = _get_plain_text(props[key]).strip()
+                        if val:
+                            user_ids.add(val)
+                        break
+
+            if not response.get("has_more"):
+                break
+            cursor = response.get("next_cursor")
+
+        result = {"usernames": usernames, "user_ids": user_ids}
+        _authorized_cache["users"] = result
+        _authorized_cache["expires"] = now + AUTH_CACHE_TTL
+        logger.info("Loaded %d authorised usernames and %d user IDs", len(usernames), len(user_ids))
+        return result
+
+    except Exception as e:
+        logger.error("Failed to load authorised users: %s", e)
+        return _authorized_cache.get("users", {"usernames": set(), "user_ids": set()})
+
+
+async def is_authorized(update: Update) -> bool:
+    """True only if the user is in the Authorised list (by username or user ID)."""
+    user = update.effective_user
+    if not user:
+        return False
+
+    auth = await get_authorized_users()
+
+    # Check by username
+    if user.username and user.username.lower() in auth["usernames"]:
+        return True
+
+    # Check by numeric user ID
+    if str(user.id) in auth["user_ids"]:
+        return True
+
+    return False
+
+
+async def create_access_request(user) -> bool:
+    """Create a Pending access request in Notion."""
+    if not notion or not NOTION_AUTH_DB_ID:
+        return False
+
+    try:
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": user.full_name or "Unknown"}}]
+            },
+            "Status": {
+                "select": {"name": "Pending"}
+            },
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+        }
+
+        if user.username:
+            properties["Telegram Username"] = {
+                "rich_text": [{"text": {"content": user.username}}]
+            }
+
+        notion.pages.create(
+            parent={"database_id": NOTION_AUTH_DB_ID},
+            properties=properties,
+        )
+        return True
+    except Exception as e:
+        logger.error("Failed to create access request: %s", e)
+        return False
 
 # ------------------------------------------------------------
 # Message handling – STRICT
 # ------------------------------------------------------------
 
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """
-    TEMPORARY DEBUG VERSION – very noisy on purpose
-    """
     msg = update.message
     if not msg or not msg.text:
-        logger.info("DENY – no message or no text")
         return False
 
     text = msg.text
     lower = text.lower()
     chat_type = msg.chat.type
-    user = update.effective_user
-    username = user.username if user else "none"
-
-    logger.info("===== NEW MESSAGE =====")
-    logger.info("chat_type = %s", chat_type)
-    logger.info("from_user = %s", username)
-    logger.info("text = %s", text[:150])
 
     # Private chats always allowed
     if chat_type == "private":
-        logger.info("ALLOW – private chat")
         return True
 
-    # ---- TEMPORARILY DISABLE AUTHORISATION ----
-    # (we will turn it back on later)
-    # ------------------------------------------
+    # --- Authorisation (must be Status = Authorised) ---
+    if not await is_authorized(update):
+        return False
 
+    # --- Trigger rules ---
     bot_username = (context.bot.username or "").lower()
-    logger.info("bot_username = %s", bot_username)
 
-    # Show all entities so we can see what Telegram is sending
-    if msg.entities:
-        for i, entity in enumerate(msg.entities):
-            piece = text[entity.offset : entity.offset + entity.length]
-            logger.info("entity[%d] type=%s  value=%s", i, entity.type, piece)
-    else:
-        logger.info("No entities found in message")
-
-    # Detect mention in two ways (more reliable)
     has_mention = False
     if bot_username:
-        # Method 1: official entity
         if msg.entities:
             for entity in msg.entities:
                 if entity.type == "mention":
@@ -353,27 +459,18 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
                     if mention == f"@{bot_username}":
                         has_mention = True
                         break
-        # Method 2: simple text search (backup)
         if f"@{bot_username}" in lower:
             has_mention = True
 
     hashtag_tickers = extract_hashtag_tickers(text)
     has_stockpick = "#stockpick" in lower
 
-    logger.info("has_mention = %s | hashtag_tickers = %s | has_stockpick = %s",
-                has_mention, hashtag_tickers, has_stockpick)
-
-    # Rule 1: #stockpick
     if has_stockpick:
-        logger.info("ALLOW – #stockpick")
         return True
 
-    # Rule 2: @mention + #TICKER
     if has_mention and hashtag_tickers:
-        logger.info("ALLOW – @mention + #ticker")
         return True
 
-    logger.info("DENY – no matching rule")
     return False
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
