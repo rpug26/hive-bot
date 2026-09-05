@@ -14,7 +14,14 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from notion_client import Client
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,11 +29,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
 )
 
 load_dotenv()
