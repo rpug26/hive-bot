@@ -80,7 +80,6 @@ def _get_plain_text(prop: dict) -> str:
         return sel.get("name", "") if sel else ""
     return ""
 
-
 async def get_authorized_usernames() -> set[str]:
     """Return a set of authorised Telegram usernames (without @)."""
     if not notion or not NOTION_DATABASE_ID:
@@ -122,7 +121,6 @@ async def get_authorized_usernames() -> set[str]:
     except Exception as e:
         logger.error("Failed to load authorised users: %s", e)
         return _authorized_cache["usernames"]
-
 
 async def is_authorized(update: Update) -> bool:
     user = update.effective_user
@@ -190,7 +188,6 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
         return None
 
-
 async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None = None) -> bool:
     if not notion or not NOTION_DATABASE_ID:
         return False
@@ -215,7 +212,6 @@ async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None
         logger.error("Failed to write #stockpick to Notion: %s", e)
         return False
 
-
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -231,7 +227,6 @@ def extract_hashtag_tickers(text: str) -> list[str]:
         if t not in found and t.isalpha():
             found.append(t)
     return found
-
 
 def has_intent_keyword(text: str) -> bool:
     """Return True if the message contains an intent keyword."""
@@ -313,7 +308,7 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def create_access_request(user) -> tuple[bool, str]:
-    """Create a Pending access request. Returns (success, error_message)."""
+    """Create a Pending access request in Notion."""
     if not notion:
         return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
 
@@ -323,12 +318,26 @@ async def create_access_request(user) -> tuple[bool, str]:
 
     try:
         properties = {
-            "Telegram ID Name": {
-                "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+            # Title property
+            "Telegram User ID": {
+                "title": [{"text": {"content": str(user.id)}}]
             },
             "Status": {
                 "select": {"name": "Pending"}
             },
+            "Full Name": {
+                "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+            },
+        }
+
+        if user.username:
+            properties["Username"] = {
+                "rich_text": [{"text": {"content": user.username}}]
+            }
+
+        # Optional: Date Added
+        properties["Date Added"] = {
+            "date": {"start": datetime.now(timezone.utc).date().isoformat()}
         }
 
         notion.pages.create(
@@ -350,21 +359,24 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("You are already authorised. You can use the bot.")
         return
 
-    success, error_msg = await create_access_request(user)
+    success, info = await create_access_request(user)
 
     if success:
         await update.message.reply_text(
-            "✅ Your access request has been submitted.\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"User ID: `{user.id}`\n\n"
-            "An admin will change your Status to *Authorised* in Notion.",
+            "✅ *Access request submitted*\n\n"
+            f"• Name: {user.full_name}\n"
+            f"• Username: @{user.username or 'N/A'}\n"
+            f"• Telegram User ID: `{user.id}`\n\n"
+            "Your request is now *Pending*.\n\n"
+            "⏳ *Next step:*\n"
+            "Please wait for an admin to change your Status to *Authorised* in Notion.\n\n"
+            "Check your status anytime with /status.",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
             "❌ Could not submit your request.\n\n"
-            f"*Error from Notion:*\n`{error_msg}`",
+            f"Error:\n`{info}`",
             parse_mode="Markdown",
         )
 
@@ -444,17 +456,13 @@ AUTH_CACHE_TTL = 300  # 5 minutes
 
 NOTION_AUTH_DB_ID = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
-
 async def get_authorized_users() -> dict:
-    """
-    Returns a dict of authorised users:
-    {
-        "usernames": {"john_smith", ...},
-        "user_ids": {"123456789", ...}
-    }
-    Only rows where Status == "Authorised" are included.
-    """
-    if not notion or not NOTION_AUTH_DB_ID:
+    """Load users where Status == Authorised."""
+    if not notion:
+        return {"usernames": set(), "user_ids": set()}
+
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
         return {"usernames": set(), "user_ids": set()}
 
     now = time.time()
@@ -468,12 +476,12 @@ async def get_authorized_users() -> dict:
 
         while True:
             kwargs = {
-                "database_id": NOTION_AUTH_DB_ID,
+                "database_id": db_id,
                 "page_size": 100,
                 "filter": {
                     "property": "Status",
                     "select": {"equals": "Authorised"}
-                }
+                },
             }
             if cursor:
                 kwargs["start_cursor"] = cursor
@@ -483,21 +491,15 @@ async def get_authorized_users() -> dict:
             for page in response.get("results", []):
                 props = page.get("properties", {})
 
-                # Username
-                for key in ("Telegram Username", "Username", "TG Username"):
-                    if key in props:
-                        val = _get_plain_text(props[key]).strip().lstrip("@").lower()
-                        if val:
-                            usernames.add(val)
-                        break
+                # Title = Telegram User ID
+                uid = _get_plain_text(props.get("Telegram User ID"))
+                if uid:
+                    user_ids.add(uid.strip())
 
-                # User ID
-                for key in ("Telegram User ID", "User ID", "Telegram ID", "ID"):
-                    if key in props:
-                        val = _get_plain_text(props[key]).strip()
-                        if val:
-                            user_ids.add(val)
-                        break
+                # Username
+                uname = _get_plain_text(props.get("Username"))
+                if uname:
+                    usernames.add(uname.strip().lstrip("@").lower())
 
             if not response.get("has_more"):
                 break
@@ -506,14 +508,13 @@ async def get_authorized_users() -> dict:
         result = {"usernames": usernames, "user_ids": user_ids}
         _authorized_cache["users"] = result
         _authorized_cache["expires"] = now + AUTH_CACHE_TTL
-        logger.info("Loaded %d authorised usernames and %d user IDs", len(usernames), len(user_ids))
+        logger.info("Loaded %d authorised usernames, %d user IDs", len(usernames), len(user_ids))
         return result
 
     except Exception as e:
         logger.error("Failed to load authorised users: %s", e)
         return _authorized_cache.get("users", {"usernames": set(), "user_ids": set()})
-
-
+        
 async def is_authorized(update: Update) -> bool:
     """True only if the user is in the Authorised list (by username or user ID)."""
     user = update.effective_user
@@ -636,10 +637,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode="Markdown",
     )
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
-
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Temporary diagnostic."""
@@ -673,7 +672,6 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Error:\n`{e}`", parse_mode="Markdown")
-
 
 # ------------------------------------------------------------
 # Main
