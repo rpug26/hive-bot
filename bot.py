@@ -354,7 +354,23 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
         logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
         return None
 
-async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None = None) -> bool:
+async def save_stockpick_to_notion(
+    text: str,
+    user_name: str,
+    ticker: str | None = None,
+    period_type: str | None = None,
+    period_value: str | None = None,
+    user_id: int | None = None,
+) -> bool:
+    ...
+    # Build Notes
+    notes_parts = []
+    if period_type and period_value:
+        notes_parts.append(f"{period_type}: {period_value}")
+    if user_id:
+        notes_parts.append(f"uid:{user_id}")
+    notes = " | ".join(notes_parts) if notes_parts else ""
+    ...
     if not notion or not NOTION_DATABASE_ID:
         return False
 
@@ -378,6 +394,69 @@ async def save_stockpick_to_notion(text: str, user_name: str, ticker: str | None
         logger.error("Failed to write #stockpick to Notion: %s", e)
         return False
 
+async def has_submitted_this_month(user) -> bool:
+    """
+    Return True if this Telegram user already has a #stockpick
+    in the Hive Stock Picks database for the current calendar month.
+    """
+    if not notion or not user:
+        return False
+
+    db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
+    if not db_id:
+        return False
+
+    try:
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1).date().isoformat()
+
+        # Next month start (for the date filter upper bound)
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        month_end = next_month.date().isoformat()
+
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "and": [
+                    {
+                        "property": "Telegram Date",
+                        "date": {"on_or_after": month_start},
+                    },
+                    {
+                        "property": "Telegram Date",
+                        "date": {"before": month_end},
+                    },
+                ]
+            },
+            page_size=100,
+        )
+
+        results = response.get("results", [])
+        uid_marker = f"uid:{user.id}"
+        user_name = (user.full_name or "").strip().lower()
+
+        for page in results:
+            props = page.get("properties", {})
+
+            # Prefer matching on uid stored in Notes
+            notes = _get_plain_text(props.get("Notes")).lower()
+            if uid_marker in notes:
+                return True
+
+            # Fallback: match Posted By name
+            posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
+            if user_name and posted_by == user_name:
+                return True
+
+        return False
+
+    except Exception as e:
+        logger.error("has_submitted_this_month failed: %s", e)
+        return False  # fail open so a Notion glitch doesn't block everyone
+        
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -398,7 +477,6 @@ def has_intent_keyword(text: str) -> bool:
     """Return True if the message contains an intent keyword."""
     lower = text.lower()
     return any(kw in lower for kw in INTENT_KEYWORDS)
-
 
 def format_reply(ticker: str, data: dict) -> str:
     return (
@@ -758,26 +836,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     clean_text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
     clean_lower = clean_text.lower()
 
-    # 1. #stockpick capture
+    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
     if "#stockpick" in clean_lower:
         user = update.effective_user
+
+        # Must be authorised
+        if await update.message.reply_text(
+                "🔒 Only authorised members can submit a #stockpick.\n\n"
+                "Send /request to ask for access, then wait for an admin to approve you.\n"
+                "Check status anytime with /status."
+            )
+            return
+
+        # One stockpick per calendar month
+        if await update.message.reply_text(
+                f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
+                "Each member may submit only **one** stockpick per month.\n"
+                "Please wait until next month to submit another.",
+                parse_mode="Markdown",
+            )
+            return
+
         user_name = user.full_name if user else "Unknown"
         tickers = extract_hashtag_tickers(clean_text)
         ticker = tickers[0] if tickers else None
 
-        success = await save_stockpick_to_notion(clean_text, user_name, ticker)
+        period_type, period_value = extract_period(clean_text)
+
+        success = await save_stockpick_to_notion(
+            clean_text,
+            user_name,
+            ticker,
+            period_type,
+            period_value,
+            user_id=user.id,          # pass ID so we can store it
+        )
+
         if success:
             reply = "✅ Captured your #stockpick"
             if ticker:
-                reply += f" ({ticker})"
-            reply += " and saved to Notion."
-            await update.message.reply_text(reply)
+                reply += f" (#{ticker})"
+            if period_type and period_value:
+                reply += f"\n📅 {period_type}: *{period_value}*"
+            reply += "\nYour pick has been saved."
+            await update.message.reply_text(reply, parse_mode="Markdown")
         else:
             await update.message.reply_text(
-                "✅ Captured your #stockpick.\n(Could not write to Notion – check logs.)"
+                "✅ Received your #stockpick.\n"
+                "(Could not save it right now – please try again later or contact an admin.)"
             )
-        return
-
+        
     # 2. Ticker lookup – ONLY from hashtags
     tickers = extract_hashtag_tickers(clean_text)
     if tickers:
