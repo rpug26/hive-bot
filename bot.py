@@ -629,6 +629,10 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
 # Command handlers
 # ------------------------------------------------------------
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+
     # Persistent keyboard shortcuts
     if text in ("📋 Menu", "Menu"):
         await menu_cmd(update, context)
@@ -636,10 +640,6 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
     if text in ("📌 My Stockpick", "My Stockpick"):
         await mystockpick_cmd(update, context)
         return
-        
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    text = (update.message.text or "").strip()
 
     # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
     if user and user.id in _awaiting_field:
@@ -706,6 +706,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text,
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
+    )
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the main menu."""
+    await update.message.reply_text(
+        "🐝 *BuzzBot Menu*\n\n"
+        "• /start – Welcome & status\n"
+        "• /status – Check if you are authorised\n"
+        "• /request – Request access\n"
+        "• /snap – How to look up a ticker\n"
+        "• /mystockpick – Your stockpick this month\n"
+        "• /faq – FAQ\n\n"
+        "In the group: `@Bot #TICKER` to look up a stock\n"
+        "Or use `#stockpick your idea` to save one.",
+        parse_mode="Markdown",
+        reply_markup=menu_inline_keyboard() if "menu_inline_keyboard" in dir() else None,
     )
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1096,59 +1112,6 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         return True
 
     return False
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await should_reply(update, context):
-        return
-
-    text = (update.message.text or "").strip()
-    lower = text.lower()
-
-    # Clean bot mention out of the text
-    bot_username = (context.bot.username or "").lower()
-    clean_text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
-    clean_lower = clean_text.lower()
-
-    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
-    if "#stockpick" in clean_lower:
-        user = update.effective_user
-
-        if not await is_authorized(update):
-            await update.message.reply_text(
-                "🔒 Only authorised members can submit a #stockpick.\n\n"
-                "Send /request to ask for access, then wait for an admin to approve you.\n"
-                "Check status anytime with /status."
-            )
-            return
-
-        if await has_submitted_this_month(user):
-            month_name = datetime.now(timezone.utc).strftime("%B")
-
-            # Try to reuse last page id, or look it up
-            page_id = _last_stockpick_page.get(user.id)
-            if not page_id:
-                page_id = await find_this_month_stockpick_page(user)
-                if page_id:
-                    _last_stockpick_page[user.id] = page_id
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("Add Stockpick Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton("Add Next Catalyst", callback_data="sp:Next Catalyst"),
-                ],
-                [
-                    InlineKeyboardButton("Add Target Price", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change My Stockpick", callback_data="sp:Change"),
-                ],
-            ]
-            await update.message.reply_text(
-                f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
-                "Each member may submit only **one** stockpick per month.\n"
-                "You can still add details or change this month’s pick:",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            return
 
 async def find_this_month_stockpick_page(user) -> str | None:
     """Return Notion page id for this user's stockpick in the current month."""
