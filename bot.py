@@ -639,23 +639,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in ("📋 Menu", "Menu"):
         await menu_cmd(update, context)
         return
-    if text in ("📌 My🐝 Stockpick", "My Stockpick"):
+
+    if text in ("📌 My🐝 Stockpick", "📌 My Stockpick", "My Stockpick"):
         await mystockpick_cmd(update, context)
-                    keyboard = [
-                [
-                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
-                ],
-                [
-                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-                ],
-            ]
-            await update.message.reply_text(
-                reply,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
+        return
+
+    # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
+    if user and user.id in _awaiting_field:
+        # ... existing follow-up code ...
+keyboard = [
+    [
+        InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+        InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+    ],
+    [
+        InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+        InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+    ],
+]
+
+await update.message.reply_text(
+    "\n".join(lines),
+    parse_mode="Markdown",
+    reply_markup=InlineKeyboardMarkup(keyboard),
+)
         else:
             await update.message.reply_text(
                 "✅ Received your #stockpick.\n"
