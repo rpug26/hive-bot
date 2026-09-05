@@ -318,7 +318,8 @@ async def create_access_request(user) -> tuple[bool, str]:
     if not notion:
         return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
 
-    if not NOTION_AUTH_DB_ID:
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
         return False, "NOTION_AUTH_DB_ID / NOTION_DATABASE_ID is missing"
 
     try:
@@ -332,7 +333,7 @@ async def create_access_request(user) -> tuple[bool, str]:
         }
 
         notion.pages.create(
-            parent={"database_id": NOTION_AUTH_DB_ID},
+            parent={"database_id": db_id},
             properties=properties,
         )
         return True, "OK"
@@ -341,9 +342,7 @@ async def create_access_request(user) -> tuple[bool, str]:
         logger.error("Failed to create access request: %s", e)
         return False, str(e)
 
-
 async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Allow a user to request access to the bot."""
     user = update.effective_user
     if not user:
         return
@@ -366,8 +365,7 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await update.message.reply_text(
             "❌ Could not submit your request.\n\n"
-            f"*Error from Notion:*\n`{error_msg}`\n\n"
-            f"Database ID used: `{NOTION_AUTH_DB_ID}`",
+            f"*Error from Notion:*\n`{error_msg}`",
             parse_mode="Markdown",
         )
 
@@ -517,39 +515,6 @@ async def is_authorized(update: Update) -> bool:
         return True
 
     return False
-
-
-async def create_access_request(user) -> bool:
-    """Create a Pending access request in Notion."""
-    if not notion or not NOTION_AUTH_DB_ID:
-        return False
-
-    try:
-        properties = {
-            "Name": {
-                "title": [{"text": {"content": user.full_name or "Unknown"}}]
-            },
-            "Status": {
-                "select": {"name": "Pending"}
-            },
-            "Telegram User ID": {
-                "rich_text": [{"text": {"content": str(user.id)}}]
-            },
-        }
-
-        if user.username:
-            properties["Telegram Username"] = {
-                "rich_text": [{"text": {"content": user.username}}]
-            }
-
-        notion.pages.create(
-            parent={"database_id": NOTION_AUTH_DB_ID},
-            properties=properties,
-        )
-        return True
-    except Exception as e:
-        logger.error("Failed to create access request: %s", e)
-        return False
 
 # ------------------------------------------------------------
 # Message handling – STRICT
