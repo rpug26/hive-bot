@@ -850,8 +850,8 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
         reply_markup=_hub_keyboard(),
     )
-    
-    async def show_my_stockpicks(
+
+async def show_my_stockpicks(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
     user = update.effective_user
@@ -972,7 +972,6 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.error("show_my_stockpicks failed: %s", e)
         await msg.reply_text("Could not load your stockpicks right now.")
 
-
 async def show_watchlist(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
@@ -1048,7 +1047,6 @@ async def show_watchlist(
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text("Could not load watchlist right now.")
 
-
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1064,7 +1062,6 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode="Markdown",
             reply_markup=_hub_keyboard(),
         )
-
 
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1100,7 +1097,6 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "🗑 *Delete from watchlist*\n\nSend the ticker only, e.g. `#ALRT`",
             parse_mode="Markdown",
         )
-
 
 async def handle_watchlist_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str
