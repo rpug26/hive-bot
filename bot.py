@@ -653,7 +653,6 @@ def format_reply(ticker: str, data: dict) -> str:
     )
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Persistent keyboard under the chat input."""
     return ReplyKeyboardMarkup(
         [
             [
@@ -688,12 +687,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     text = (update.message.text or "").strip()
 
-    # Persistent keyboard shortcuts
+    # Persistent keyboard shortcuts (match full label from buttons)
     if text in ("📋 Menu", "Menu"):
         await menu_cmd(update, context)
         return
 
-    if text in ("📌 My🐝 Stockpick", "📌 My🐝 Stockpick", "My Stockpick"):
+    if text in (
+        "📌 My Stockpick",
+        "📌 My🐝 Stockpick",
+        "My Stockpick",
+        "My🐝 Stockpick",
+    ):
         await mystockpick_cmd(update, context)
         return
 
@@ -701,19 +705,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await show_watchlist(update, context, edit=False)
         return
 
-    # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
+    # Watchlist follow-up (add / change / delete / list actions)
+    if user and user.id in _awaiting_watchlist:
+        action = _awaiting_watchlist.pop(user.id)
+        await handle_watchlist_text(update, context, action, text)
+        return
+
+    # Stockpick field follow-up
     if user and user.id in _awaiting_field:
         field = _awaiting_field.pop(user.id)
         page_id = _last_stockpick_page.get(user.id)
         if not page_id or not notion:
             await update.message.reply_text("Could not update your stockpick. Please try again.")
             return
-      # Watchlist follow-up (add / change / delete)
-    if user and user.id in _awaiting_watchlist:
-        action = _awaiting_watchlist.pop(user.id)
-        await handle_watchlist_text(update, context, action, text)
-        return
-        
+
         try:
             if field == "Change":
                 props = {
@@ -722,7 +727,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 tickers = extract_hashtag_tickers(text)
                 if tickers:
                     props["Ticker"] = {"rich_text": [{"text": {"content": tickers[0]}}]}
-                    props["Name"] = {"title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]}
+                    props["Name"] = {
+                        "title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]
+                    }
                 notion.pages.update(page_id=page_id, properties=props)
                 await update.message.reply_text("✅ Your stockpick has been updated.")
             else:
@@ -738,13 +745,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
         except Exception as e:
             logger.error("Failed to update stockpick field %s: %s", field, e)
-            await update.message.reply_text("Could not save that update. Please try again later.")
+            await update.message.reply_text(
+                "Could not save that update. Please try again later."
+            )
         return
 
     if not await should_reply(update, context):
         return
 
-    # ... rest of handle_message (stockpick / ticker lookup) ...
+    # ... rest of handle_message (ticker / #stockpick) ...
     
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
