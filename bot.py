@@ -314,26 +314,39 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def create_access_request(user) -> bool:
+    """Create a Pending access request in Notion."""
     if not notion or not NOTION_AUTH_DB_ID:
         logger.error("Notion or NOTION_AUTH_DB_ID missing")
         return False
 
     try:
         properties = {
-            "Name": {
-                "title": [{"text": {"content": f"{user.full_name or 'Unknown'} ({user.id})"}}]
+            # Title property (exact name from your database)
+            "Telegram ID Name": {
+                "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
             },
             "Status": {
                 "select": {"name": "Pending"}
             },
         }
 
+        # Optional fields – only added if the properties exist in your DB
+        if user.username:
+            properties["Telegram Username"] = {
+                "rich_text": [{"text": {"content": user.username}}]
+            }
+
+        properties["Telegram User ID"] = {
+            "rich_text": [{"text": {"content": str(user.id)}}]
+        }
+
         notion.pages.create(
             parent={"database_id": NOTION_AUTH_DB_ID},
             properties=properties,
         )
-        logger.info("Minimal access request created for %s", user.id)
+        logger.info("Access request created for user %s (%s)", user.id, user.username)
         return True
+
     except Exception as e:
         logger.error("Failed to create access request: %s", e)
         return False
