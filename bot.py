@@ -65,6 +65,172 @@ INTENT_KEYWORDS = {
 }
 
 # ------------------------------------------------------------
+# Admin commands (only for authorised admin)
+# ------------------------------------------------------------
+ADMIN_USER_IDS = {1670138803}  # your Telegram user ID
+
+def is_admin(user) -> bool:
+    return bool(user and user.id in ADMIN_USER_IDS)
+
+
+async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List users with Status = Pending."""
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("This command is for admins only.")
+        return
+
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not notion or not db_id:
+        await update.message.reply_text("Notion is not configured.")
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Status",
+                "select": {"equals": "Pending"}
+            },
+            page_size=20,
+        )
+        results = response.get("results", [])
+
+        if not results:
+            await update.message.reply_text("No pending requests.")
+            return
+
+        lines = ["⏳ *Pending access requests:*\n"]
+        for page in results:
+            props = page.get("properties", {})
+            uid = _get_plain_text(props.get("Telegram User ID")) or "—"
+            name = _get_plain_text(props.get("Full Name")) or "—"
+            uname = _get_plain_text(props.get("Username")) or "—"
+            lines.append(f"• `{uid}` — {name} (@{uname})")
+
+        lines.append("\nApprove with:\n`/approve <user_id>`")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error("pending_cmd failed: %s", e)
+        await update.message.reply_text(f"Error loading pending list:\n`{e}`", parse_mode="Markdown")
+
+
+async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Approve a user: /approve <telegram_user_id>"""
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("This command is for admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/approve <telegram_user_id>`", parse_mode="Markdown")
+        return
+
+    target_id = context.args[0].strip()
+
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not notion or not db_id:
+        await update.message.reply_text("Notion is not configured.")
+        return
+
+    try:
+        # Find the page with this Telegram User ID (Title)
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": target_id}
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+
+        if not results:
+            await update.message.reply_text(
+                f"No request found for User ID `{target_id}`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        page_id = results[0]["id"]
+
+        # Update Status → Authorised
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Status": {"select": {"name": "Authorised"}}
+            },
+        )
+
+        # Clear auth cache so the change takes effect immediately
+        _authorized_cache["expires"] = 0
+
+        await update.message.reply_text(
+            f"✅ User `{target_id}` is now *Authorised*.",
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        logger.error("approve_cmd failed: %s", e)
+        await update.message.reply_text(f"Error approving user:\n`{e}`", parse_mode="Markdown")
+
+
+async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Optional: reject a user – /reject <telegram_user_id>"""
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("This command is for admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/reject <telegram_user_id>`", parse_mode="Markdown")
+        return
+
+    target_id = context.args[0].strip()
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+
+    if not notion or not db_id:
+        await update.message.reply_text("Notion is not configured.")
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": target_id}
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+
+        if not results:
+            await update.message.reply_text(
+                f"No request found for User ID `{target_id}`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        page_id = results[0]["id"]
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Status": {"select": {"name": "Rejected"}}
+            },
+        )
+        _authorized_cache["expires"] = 0
+
+        await update.message.reply_text(
+            f"🚫 User `{target_id}` has been *Rejected*.",
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        logger.error("reject_cmd failed: %s", e)
+        await update.message.reply_text(f"Error:\n`{e}`", parse_mode="Markdown")
+        
+# ------------------------------------------------------------
 # Notion helpers
 # ------------------------------------------------------------
 def _get_plain_text(prop: dict) -> str:
@@ -689,6 +855,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("schema", schema_cmd))
+    app.add_handler(CommandHandler("pending", pending_cmd))
+	app.add_handler(CommandHandler("approve", approve_cmd))
+	app.add_handler(CommandHandler("reject", reject_cmd))
 
     logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
