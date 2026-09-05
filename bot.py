@@ -836,12 +836,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     clean_text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
     clean_lower = clean_text.lower()
 
-    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
+     # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
     if "#stockpick" in clean_lower:
         user = update.effective_user
 
         # Must be authorised
-        if await update.message.reply_text(
+        if not await is_authorized(update):
+            await update.message.reply_text(
                 "🔒 Only authorised members can submit a #stockpick.\n\n"
                 "Send /request to ask for access, then wait for an admin to approve you.\n"
                 "Check status anytime with /status."
@@ -849,7 +850,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # One stockpick per calendar month
-        if await update.message.reply_text(
+        if await has_submitted_this_month(user):
+            month_name = datetime.now(timezone.utc).strftime("%B")
+            await update.message.reply_text(
                 f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
                 "Each member may submit only **one** stockpick per month.\n"
                 "Please wait until next month to submit another.",
@@ -869,7 +872,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ticker,
             period_type,
             period_value,
-            user_id=user.id,          # pass ID so we can store it
+            user_id=user.id if user else None,
         )
 
         if success:
@@ -885,6 +888,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "✅ Received your #stockpick.\n"
                 "(Could not save it right now – please try again later or contact an admin.)"
             )
+        return
         
     # 2. Ticker lookup – ONLY from hashtags
     tickers = extract_hashtag_tickers(clean_text)
