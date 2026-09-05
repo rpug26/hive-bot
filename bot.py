@@ -607,7 +607,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """Persistent keyboard under the chat input."""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📋 Menu"), KeyboardButton("📌 My Stockpick")],
+            [KeyboardButton("📋 Menu"), KeyboardButton("📌 My🐝 Stockpick")],
         ],
         resize_keyboard=True,
     )
@@ -622,7 +622,7 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("📊 Snap (ticker help)", callback_data="cmd:snap"),
-                InlineKeyboardButton("📌 My Stockpick", callback_data="cmd:mystockpick"),
+                InlineKeyboardButton("📌 My🐝 Stockpick", callback_data="cmd:mystockpick"),
             ],
         ]
     )
@@ -639,8 +639,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in ("📋 Menu", "Menu"):
         await menu_cmd(update, context)
         return
-    if text in ("📌 My Stockpick", "My Stockpick"):
+    if text in ("📌 My🐝 Stockpick", "My Stockpick"):
         await mystockpick_cmd(update, context)
+                    keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                reply,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            await update.message.reply_text(
+                "✅ Received your #stockpick.\n"
+                "(Could not save it right now – please try again later or contact an admin.)"
+            )
         return
 
     # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
