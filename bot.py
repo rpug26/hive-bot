@@ -656,7 +656,11 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """Persistent keyboard under the chat input."""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📋 Menu"), KeyboardButton("📌 My🐝 Stockpick")],
+            [
+                KeyboardButton("📋 Menu"),
+                KeyboardButton("📌 My Stockpick"),
+                KeyboardButton("👀 My Watchlist"),
+            ],
         ],
         resize_keyboard=True,
     )
@@ -689,8 +693,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    if text in ("📌 My🐝 Stockpick", "📌 My Stockpick", "My Stockpick"):
+    if text in ("📌 My🐝 Stockpick", "📌 My🐝 Stockpick", "My Stockpick"):
         await mystockpick_cmd(update, context)
+        return
+
+    if text in ("👀 My Watchlist", "My Watchlist"):
+        await show_watchlist(update, context, edit=False)
         return
 
     # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
@@ -986,7 +994,7 @@ async def show_watchlist(
             await msg.reply_text(text)
         return
 
-    db_id = os.getenv("NOTION_WATCHLIST_DB_ID")
+    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
     if not notion or not db_id:
         await msg.reply_text(
             "Watchlist is not configured.\n"
@@ -995,19 +1003,30 @@ async def show_watchlist(
         return
 
     try:
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "rich_text": {"equals": str(user.id)},
-            },
-            page_size=30,
-        )
-        results = response.get("results", [])
+        # Prefer filtered query; fall back to unfiltered if filter type fails
+        try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "Telegram User ID",
+                    "rich_text": {"equals": str(user.id)},
+                },
+                page_size=30,
+            )
+        except Exception:
+            response = notion.databases.query(database_id=db_id, page_size=50)
+
+        results = []
+        for page in response.get("results", []):
+            props = page.get("properties", {})
+            owner = _get_plain_text(props.get("Telegram User ID")).strip()
+            if owner and owner != str(user.id):
+                continue
+            results.append(page)
 
         lines = ["👀 *My Watchlist*\n", "`Ticker` | Name | Link\n"]
         if not results:
-            lines.append("_Empty — use Add below._\n")
+            lines.append("_Empty — use **Edit Watchlist** to add tickers._\n")
         else:
             for page in results:
                 props = page.get("properties", {})
@@ -1019,33 +1038,41 @@ async def show_watchlist(
 
         keyboard = [
             [
-                InlineKeyboardButton("➕ Add", callback_data="wl:add"),
-                InlineKeyboardButton("✏️ Change", callback_data="wl:change"),
-                InlineKeyboardButton("🗑 Delete", callback_data="wl:delete"),
+                InlineKeyboardButton("Create New Watchlist", callback_data="wl:create"),
+                InlineKeyboardButton("Edit Watchlist", callback_data="wl:edit_menu"),
             ],
-            [InlineKeyboardButton("« Back to hub", callback_data="hub:home")],
+            [
+                InlineKeyboardButton("Rename Watchlist", callback_data="wl:rename"),
+                InlineKeyboardButton("Delete Watchlist", callback_data="wl:delete_list"),
+            ],
+            [
+                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+                InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
+            ],
         ]
 
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(keyboard)
+        kwargs = dict(
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
         if edit:
-            await msg.edit_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
+            await msg.edit_text(**kwargs)
         else:
-            await msg.reply_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
+            await msg.reply_text(**kwargs)
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
-        await msg.reply_text("Could not load watchlist right now.")
+        err = str(e)[:300]
+        await msg.reply_text(
+            "Could not load watchlist.\n\n"
+            f"`{err}`\n\n"
+            "Check: integration shared with Watchlist DB + NOTION_WATCHLIST_DB_ID.",
+            parse_mode="Markdown",
+        )
 
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1071,6 +1098,59 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     action = (query.data or "").replace("wl:", "")
+
+    # --- List-level actions ---
+    if action == "create":
+        _awaiting_watchlist[user.id] = "create_list"
+        await query.message.reply_text(
+            "🆕 *Create New Watchlist*\n\n"
+            "Send a name for the list, e.g.\n"
+            "`UK AIM Growth`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "rename":
+        _awaiting_watchlist[user.id] = "rename_list"
+        await query.message.reply_text(
+            "✏️ *Rename Watchlist*\n\n"
+            "Send: `Old Name | New Name`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "delete_list":
+        _awaiting_watchlist[user.id] = "delete_list"
+        await query.message.reply_text(
+            "🗑 *Delete Watchlist*\n\n"
+            "Send the list name to delete, e.g. `UK AIM Growth`\n"
+            "This removes **all tickers** in that list.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "edit_menu":
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
+                InlineKeyboardButton("✏️ Change ticker", callback_data="wl:change"),
+            ],
+            [
+                InlineKeyboardButton("🗑 Delete ticker", callback_data="wl:delete"),
+            ],
+            [
+                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+                InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
+            ],
+        ]
+        await query.edit_message_text(
+            "✏️ *Edit Watchlist*\n\nChoose what to change:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # --- Ticker-level actions ---
     if action not in ("add", "change", "delete"):
         return
 
@@ -1078,7 +1158,7 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if action == "add":
         await query.message.reply_text(
-            "➕ *Add to watchlist*\n\n"
+            "➕ *Add ticker*\n\n"
             "Send one line:\n"
             "`#TICKER | Company Name | https://t.me/+invite`\n\n"
             "Example:\n"
@@ -1087,14 +1167,14 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     elif action == "change":
         await query.message.reply_text(
-            "✏️ *Change watchlist item*\n\n"
+            "✏️ *Change ticker*\n\n"
             "Send:\n"
             "`#TICKER | New Name | https://t.me/+newlink`",
             parse_mode="Markdown",
         )
     else:
         await query.message.reply_text(
-            "🗑 *Delete from watchlist*\n\nSend the ticker only, e.g. `#ALRT`",
+            "🗑 *Delete ticker*\n\nSend the ticker only, e.g. `#ALRT`",
             parse_mode="Markdown",
         )
 
@@ -1152,6 +1232,9 @@ async def handle_watchlist_text(
             return
 
         if action == "add":
+            props["List Name"] = {
+    			"rich_text": [{"text": {"content": "Default"}}]
+				}
             props = {
                 "Ticker": {"title": [{"text": {"content": ticker}}]},
                 "Name": {"rich_text": [{"text": {"content": name[:200]}}]},
