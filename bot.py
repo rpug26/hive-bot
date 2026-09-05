@@ -362,34 +362,69 @@ async def save_stockpick_to_notion(
     period_value: str | None = None,
     user_id: int | None = None,
 ) -> bool:
-    ...
-    # Build Notes
-    notes_parts = []
-    if period_type and period_value:
-        notes_parts.append(f"{period_type}: {period_value}")
-    if user_id:
-        notes_parts.append(f"uid:{user_id}")
-    notes = " | ".join(notes_parts) if notes_parts else ""
-    ...
-    if not notion or not NOTION_DATABASE_ID:
+    if not notion:
+        logger.error("Notion client is None – NOTION_TOKEN missing?")
+        return False
+
+    db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
+    if not db_id:
+        logger.error("NOTION_DATABASE_ID is missing")
         return False
 
     try:
+        # Notes: period + uid for monthly limit checks
+        notes_parts = []
+        if period_type and period_value:
+            notes_parts.append(f"{period_type}: {period_value}")
+        if user_id:
+            notes_parts.append(f"uid:{user_id}")
+        notes = " | ".join(notes_parts)
+
+        name = f"#{ticker}" if ticker else text[:80]
+        if period_value:
+            name = f"{name} ({period_value})"
+
         properties = {
-            "Name": {"title": [{"text": {"content": text[:100]}}]},
-            "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
-            "User": {"rich_text": [{"text": {"content": user_name or "Unknown"}}]},
-            "Date": {"date": {"start": datetime.now(timezone.utc).isoformat()}},
-            "Source": {"rich_text": [{"text": {"content": "Telegram"}}]},
+            "Name": {
+                "title": [{"text": {"content": name[:100]}}]
+            },
+            "Message": {
+                "rich_text": [{"text": {"content": text[:2000]}}]
+            },
+            "Posted By": {
+                "rich_text": [{"text": {"content": (user_name or "Unknown")[:200]}}]
+            },
+            "Source Group": {
+                "rich_text": [{"text": {"content": "Telegram"}}]
+            },
+            "Status": {
+                "select": {"name": "New"}
+            },
+            "Telegram Date": {
+                "date": {"start": datetime.now(timezone.utc).date().isoformat()}
+            },
         }
+
         if ticker:
-            properties["Ticker"] = {"rich_text": [{"text": {"content": ticker}}]}
+            properties["Ticker"] = {
+                "rich_text": [{"text": {"content": ticker}}]
+            }
+
+        if notes:
+            properties["Notes"] = {
+                "rich_text": [{"text": {"content": notes[:2000]}}]
+            }
 
         notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
+            parent={"database_id": db_id},
             properties=properties,
         )
+        logger.info(
+            "Saved #stockpick (ticker=%s, period=%s %s)",
+            ticker, period_type, period_value,
+        )
         return True
+
     except Exception as e:
         logger.error("Failed to write #stockpick to Notion: %s", e)
         return False
