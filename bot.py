@@ -313,15 +313,16 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
-async def create_access_request(user) -> bool:
-    """Create a Pending access request in Notion."""
-    if not notion or not NOTION_AUTH_DB_ID:
-        logger.error("Notion or NOTION_AUTH_DB_ID missing")
-        return False
+async def create_access_request(user) -> tuple[bool, str]:
+    """Create a Pending access request. Returns (success, error_message)."""
+    if not notion:
+        return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
+
+    if not NOTION_AUTH_DB_ID:
+        return False, "NOTION_AUTH_DB_ID / NOTION_DATABASE_ID is missing"
 
     try:
         properties = {
-            # Title property (exact name from your database)
             "Telegram ID Name": {
                 "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
             },
@@ -330,28 +331,19 @@ async def create_access_request(user) -> bool:
             },
         }
 
-        # Optional fields – only added if the properties exist in your DB
-        if user.username:
-            properties["Telegram Username"] = {
-                "rich_text": [{"text": {"content": user.username}}]
-            }
-
-        properties["Telegram User ID"] = {
-            "rich_text": [{"text": {"content": str(user.id)}}]
-        }
-
         notion.pages.create(
             parent={"database_id": NOTION_AUTH_DB_ID},
             properties=properties,
         )
-        logger.info("Access request created for user %s (%s)", user.id, user.username)
-        return True
+        return True, "OK"
 
     except Exception as e:
         logger.error("Failed to create access request: %s", e)
-        return False
-            
+        return False, str(e)
+
+
 async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Allow a user to request access to the bot."""
     user = update.effective_user
     if not user:
         return
@@ -360,7 +352,7 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("You are already authorised. You can use the bot.")
         return
 
-    success = await create_access_request(user)
+    success, error_msg = await create_access_request(user)
 
     if success:
         await update.message.reply_text(
@@ -368,20 +360,16 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Name: {user.full_name}\n"
             f"Username: @{user.username or 'N/A'}\n"
             f"User ID: `{user.id}`\n\n"
-            "An admin will change your Status to *Authorised* in Notion.\n"
-            "Check progress anytime with /status.",
+            "An admin will change your Status to *Authorised* in Notion.",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
-            "Sorry, I could not submit your request right now.\n\n"
-            "Possible reasons:\n"
-            "• Notion property names don’t match\n"
-            "• Status option “Pending” doesn’t exist\n"
-            "• Integration not connected to the database\n\n"
-            "Please contact an admin."
+            "❌ Could not submit your request.\n\n"
+            f"*Error from Notion:*\n`{error_msg}`\n\n"
+            f"Database ID used: `{NOTION_AUTH_DB_ID}`",
+            parse_mode="Markdown",
         )
-
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
