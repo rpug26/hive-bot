@@ -294,7 +294,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
-
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "📌 *FAQ*\n\n"
@@ -419,6 +418,23 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Send /request to submit an access request.",
             parse_mode="Markdown",
         )
+        
+async def schema_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Temporary: list properties of the auth database."""
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not notion or not db_id:
+        await update.message.reply_text("Notion or database ID missing.")
+        return
+
+    try:
+        db = notion.databases.retrieve(database_id=db_id)
+        props = db.get("properties", {})
+        lines = ["📋 *Database properties:*\n"]
+        for name, info in props.items():
+            lines.append(f"• `{name}`  ({info.get('type')})")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Error:\n`{e}`", parse_mode="Markdown")        
         
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
