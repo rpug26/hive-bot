@@ -839,11 +839,11 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         keyboard = [
             [
-                InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                InlineKeyboardButton("Add Stockpick Summary", callback_data="sp:Summary"),
+                InlineKeyboardButton("Add Next Catalyst", callback_data="sp:Next Catalyst"),
             ],
             [
-                InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                InlineKeyboardButton("Add Target Price", callback_data="sp:Target Price"),
                 InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
             ],
         ]
