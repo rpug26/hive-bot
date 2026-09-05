@@ -22,6 +22,11 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 
 load_dotenv()
@@ -596,10 +601,42 @@ def format_reply(ticker: str, data: dict) -> str:
         f"_🔋🪫 Powered by: The Hive 🐝 BuzzBot Knowledge Hub. Not financial advice. DYOR._"
     )
 
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Persistent keyboard under the chat input."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📋 Menu"), KeyboardButton("📌 My Stockpick")],
+        ],
+        resize_keyboard=True,
+    )
+
+def menu_inline_keyboard() -> InlineKeyboardMarkup:
+    """Inline buttons for /menu."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🏠 Start", callback_data="cmd:start"),
+                InlineKeyboardButton("❓ FAQ", callback_data="cmd:faq"),
+            ],
+            [
+                InlineKeyboardButton("📊 Snap (ticker help)", callback_data="cmd:snap"),
+                InlineKeyboardButton("📌 My Stockpick", callback_data="cmd:mystockpick"),
+            ],
+        ]
+    )
+
 # ------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------
 
+    # Persistent keyboard shortcuts
+    if text in ("📋 Menu", "Menu"):
+        await menu_cmd(update, context)
+        return
+    if text in ("📌 My Stockpick", "My Stockpick"):
+        await mystockpick_cmd(update, context)
+        return
+        
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     text = (update.message.text or "").strip()
@@ -644,46 +681,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
-
     authorised = await is_authorized(update)
 
     if authorised:
-        await update.message.reply_text(
+        text = (
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
             "✅ You are *Authorised* and can use the bot.\n\n"
-            "In the group use:\n"
-            "• `@Bot #TICKER` to look up a stock\n"
-            "• `#stockpick your idea` to save an idea\n\n"
-            "Type /help for more commands.",
-            parse_mode="Markdown",
+            "Use the buttons below, or in the group:\n"
+            "• `@Bot #KEFI summary` → lookup\n"
+            "• `#KEFI snapshot` → lookup\n"
+            "• `#stockpick my idea...` → save your pick"
         )
     else:
-        await update.message.reply_text(
+        text = (
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
             "❌ You are *not authorised* yet.\n\n"
-            "👉 *Next step:* tap the command below to request access:\n"
-            "/request\n\n"
-            "An admin will review it in Notion and approve you.\n"
-            "You can check your status anytime with /status.",
-            parse_mode="Markdown",
+            "Send /request to ask for access.\n"
+            "Check status with /status."
         )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🐝 *Hive SupportBot commands*\n\n"
-        "/start – Welcome message\n"
-        "/help – This help\n"
-        "/faq – Quick FAQ\n"
-        "/tickers – How to request a ticker\n\n"
-        "*In the group:*\n"
-        "• `@Bot #KEFI summary` → lookup\n"
-        "• `#KEFI snapshot` → lookup\n"
-        "• `#stockpick my idea...` → save to Notion\n"
-        "Normal chat is ignored.",
+        text,
         parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
     )
+
+async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = (query.data or "").replace("cmd:", "")
+
+    # Reuse existing handlers by faking a simple flow
+    class _FakeMsg:
+        def __init__(self, q):
+            self._q = q
+        async def reply_text(self, *a, **k):
+            return await self._q.message.reply_text(*a, **k)
+
+    fake_update = update
+    # Easier: just reply based on command
+    if data == "start":
+        await query.message.reply_text("Send /start to refresh the welcome screen.")
+    elif data == "faq":
+        await faq(update, context)
+    elif data == "snap":
+        await snap_cmd(update, context)
+    elif data == "mystockpick":
+        await mystockpick_cmd(update, context)
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -695,14 +741,89 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
-async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "In the group use:\n"
-        "`@Bot #KEFI summary` or `#KEFI snapshot`\n\n"
-        "I’ll look it up in the live UK AIM Micro-Cap snapshot.",
+        "📊 *Company snapshot*\n\n"
+        "In the group or here, use a hashtag ticker:\n"
+        "• `#KEFI summary`\n"
+        "• `#ALRT snapshot`\n"
+        "• `@Bot #AVCT thesis`\n\n"
+        "I’ll pull the live UK AIM Micro-Cap snapshot.",
         parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
     )
 
+async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+
+    if not await is_authorized(update):
+        await update.message.reply_text(
+            "🔒 Only authorised members can view stockpicks.\n"
+            "Send /request to ask for access."
+        )
+        return
+
+    if not notion:
+        await update.message.reply_text("Data service is not available right now.")
+        return
+
+    db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
+    if not db_id:
+        await update.message.reply_text("Stockpick database is not configured.")
+        return
+
+    try:
+        response = notion.databases.query(database_id=db_id, page_size=50)
+        uid_marker = f"uid:{user.id}"
+        user_name = (user.full_name or "").strip().lower()
+        rows = []
+
+        for page in response.get("results", []):
+            props = page.get("properties", {})
+            notes = _get_plain_text(props.get("Notes")).lower()
+            posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
+            if uid_marker not in notes and posted_by != user_name:
+                continue
+
+            ticker = _get_plain_text(props.get("Ticker")) or "—"
+            status = _get_plain_text(props.get("Status")) or "—"
+            date_prop = props.get("Telegram Date", {}).get("date") or {}
+            date_str = date_prop.get("start", "—")
+            summary = _get_plain_text(props.get("Summary")) or "—"
+            catalyst = _get_plain_text(props.get("Next Catalyst")) or "—"
+            target = _get_plain_text(props.get("Target Price")) or "—"
+            rows.append((date_str, ticker, status, summary, catalyst, target))
+
+        if not rows:
+            await update.message.reply_text(
+                "You have no stockpicks yet.\n"
+                "Post `#stockpick #TICKER your idea` to save one.",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+
+        # Newest first
+        rows.sort(key=lambda r: r[0], reverse=True)
+        lines = ["📌 *My Stockpicks*\n"]
+        for date_str, ticker, status, summary, catalyst, target in rows[:12]:
+            lines.append(
+                f"• *{date_str}* | `#{ticker}` | {status}\n"
+                f"  Summary: {summary[:80]}\n"
+                f"  Catalyst: {catalyst[:60]}\n"
+                f"  Target: {target}\n"
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+    except Exception as e:
+        logger.error("mystockpick_cmd failed: %s", e)
+        await update.message.reply_text("Could not load your stockpicks right now.")
+        
 async def create_access_request(user) -> tuple[bool, str]:
     """Create a Pending access request in Notion."""
     if not notion:
@@ -1012,12 +1133,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             keyboard = [
                 [
-                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                    InlineKeyboardButton("Add Stockpick Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Add Next Catalyst", callback_data="sp:Next Catalyst"),
                 ],
                 [
-                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                    InlineKeyboardButton("Add Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change My Stockpick", callback_data="sp:Change"),
                 ],
             ]
             await update.message.reply_text(
@@ -1186,9 +1307,15 @@ def main() -> None:
 
     # Public commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("faq", faq))
-    app.add_handler(CommandHandler("tickers", tickers_cmd))
+    app.add_handler(CommandHandler("snap", snap_cmd))
+    app.add_handler(CommandHandler("mystockpick", mystockpick_cmd))
+    # keep /help as alias if you want
+    app.add_handler(CommandHandler("help", menu_cmd))
+    app.add_handler(CommandHandler("tickers", snap_cmd))
+    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("request", request_access))
     app.add_handler(CommandHandler("debug", debug_cmd))
@@ -1207,6 +1334,6 @@ def main() -> None:
     logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
     main()
+    
