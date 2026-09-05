@@ -646,32 +646,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
     if user and user.id in _awaiting_field:
-        # ... existing follow-up code ...
-keyboard = [
-    [
-        InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-        InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
-    ],
-    [
-        InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-        InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-    ],
-]
-
-await update.message.reply_text(
-    "\n".join(lines),
-    parse_mode="Markdown",
-    reply_markup=InlineKeyboardMarkup(keyboard),
-)
-        else:
-            await update.message.reply_text(
-                "✅ Received your #stockpick.\n"
-                "(Could not save it right now – please try again later or contact an admin.)"
-            )
-        return
-
-    # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
-    if user and user.id in _awaiting_field:
         field = _awaiting_field.pop(user.id)
         page_id = _last_stockpick_page.get(user.id)
         if not page_id or not notion:
@@ -680,7 +654,6 @@ await update.message.reply_text(
 
         try:
             if field == "Change":
-                # Update main Message (+ optional ticker/period in Notes)
                 props = {
                     "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
                 }
@@ -697,7 +670,10 @@ await update.message.reply_text(
                         field: {"rich_text": [{"text": {"content": text[:2000]}}]}
                     },
                 )
-                await update.message.reply_text(f"✅ Added **{field}** to your stockpick.", parse_mode="Markdown")
+                await update.message.reply_text(
+                    f"✅ Added **{field}** to your stockpick.",
+                    parse_mode="Markdown",
+                )
         except Exception as e:
             logger.error("Failed to update stockpick field %s: %s", field, e)
             await update.message.reply_text("Could not save that update. Please try again later.")
@@ -705,7 +681,8 @@ await update.message.reply_text(
 
     if not await should_reply(update, context):
         return
-    # ... rest of handle_message unchanged ...
+
+    # ... rest of handle_message (stockpick / ticker lookup) ...
     
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -860,11 +837,22 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"  Target: {target}\n"
             )
 
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
-        )
+		keyboard = [
+    		[
+        		InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+        		InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+    		],
+    		[
+        		InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+        		InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+    		],
+		]
+
+		await update.message.reply_text(
+		    "\n".join(lines),
+    		parse_mode="Markdown",
+    		reply_markup=InlineKeyboardMarkup(keyboard),
+		)
     except Exception as e:
         logger.error("mystockpick_cmd failed: %s", e)
         await update.message.reply_text("Could not load your stockpicks right now.")
