@@ -1015,7 +1015,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ticker = tickers[0] if tickers else None
         period_type, period_value = extract_period(clean_text)
 
-                page_id = await save_stockpick_to_notion(
+        page_id = await save_stockpick_to_notion(
             clean_text,
             user_name,
             ticker,
