@@ -831,6 +831,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (update.message.text or "").strip()
     lower = text.lower()
 
+MONTH_HASHTAGS = {
+    "january": "January", "jan": "January",
+    "february": "February", "feb": "February",
+    "march": "March", "mar": "March",
+    "april": "April", "apr": "April",
+    "may": "May",
+    "june": "June", "jun": "June",
+    "july": "July", "jul": "July",
+    "august": "August", "aug": "August",
+    "september": "September", "sep": "September", "sept": "September",
+    "october": "October", "oct": "October",
+    "november": "November", "nov": "November",
+    "december": "December", "dec": "December",
+}
+
+def extract_period(text: str):
+    """Returns (period_type, period_value) e.g. ("Monthly", "September") or ("Annual", "2027")."""
+    if not text:
+        return None, None
+    tags = re.findall(r"#(\w+)", text.lower())
+    month = None
+    year = None
+    for tag in tags:
+        if tag in MONTH_HASHTAGS:
+            month = MONTH_HASHTAGS[tag]
+        elif re.fullmatch(r"20[2-9]\d", tag):
+            year = tag
+    if month:
+        return "Monthly", month
+    if year:
+        return "Annual", year
+    return None, None
+    
     # Clean bot mention out of the text
     bot_username = (context.bot.username or "").lower()
     clean_text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
