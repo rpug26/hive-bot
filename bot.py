@@ -457,6 +457,39 @@ async def has_submitted_this_month(user) -> bool:
         logger.error("has_submitted_this_month failed: %s", e)
         return False  # fail open so a Notion glitch doesn't block everyone
         
+MONTH_HASHTAGS = {
+    "january": "January", "jan": "January",
+    "february": "February", "feb": "February",
+    "march": "March", "mar": "March",
+    "april": "April", "apr": "April",
+    "may": "May",
+    "june": "June", "jun": "June",
+    "july": "July", "jul": "July",
+    "august": "August", "aug": "August",
+    "september": "September", "sep": "September", "sept": "September",
+    "october": "October", "oct": "October",
+    "november": "November", "nov": "November",
+    "december": "December", "dec": "December",
+}
+
+def extract_period(text: str):
+    """Returns (period_type, period_value) e.g. ("Monthly", "September") or ("Annual", "2027")."""
+    if not text:
+        return None, None
+    tags = re.findall(r"#(\w+)", text.lower())
+    month = None
+    year = None
+    for tag in tags:
+        if tag in MONTH_HASHTAGS:
+            month = MONTH_HASHTAGS[tag]
+        elif re.fullmatch(r"20[2-9]\d", tag):
+            year = tag
+    if month:
+        return "Monthly", month
+    if year:
+        return "Annual", year
+    return None, None
+    
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -831,49 +864,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (update.message.text or "").strip()
     lower = text.lower()
 
-MONTH_HASHTAGS = {
-    "january": "January", "jan": "January",
-    "february": "February", "feb": "February",
-    "march": "March", "mar": "March",
-    "april": "April", "apr": "April",
-    "may": "May",
-    "june": "June", "jun": "June",
-    "july": "July", "jul": "July",
-    "august": "August", "aug": "August",
-    "september": "September", "sep": "September", "sept": "September",
-    "october": "October", "oct": "October",
-    "november": "November", "nov": "November",
-    "december": "December", "dec": "December",
-}
-
-def extract_period(text: str):
-    """Returns (period_type, period_value) e.g. ("Monthly", "September") or ("Annual", "2027")."""
-    if not text:
-        return None, None
-    tags = re.findall(r"#(\w+)", text.lower())
-    month = None
-    year = None
-    for tag in tags:
-        if tag in MONTH_HASHTAGS:
-            month = MONTH_HASHTAGS[tag]
-        elif re.fullmatch(r"20[2-9]\d", tag):
-            year = tag
-    if month:
-        return "Monthly", month
-    if year:
-        return "Annual", year
-    return None, None
-    
     # Clean bot mention out of the text
     bot_username = (context.bot.username or "").lower()
     clean_text = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE).strip()
     clean_lower = clean_text.lower()
 
-     # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
+    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
     if "#stockpick" in clean_lower:
         user = update.effective_user
 
-        # Must be authorised
         if not await is_authorized(update):
             await update.message.reply_text(
                 "🔒 Only authorised members can submit a #stockpick.\n\n"
@@ -882,7 +881,6 @@ def extract_period(text: str):
             )
             return
 
-        # One stockpick per calendar month
         if await has_submitted_this_month(user):
             month_name = datetime.now(timezone.utc).strftime("%B")
             await update.message.reply_text(
@@ -896,7 +894,6 @@ def extract_period(text: str):
         user_name = user.full_name if user else "Unknown"
         tickers = extract_hashtag_tickers(clean_text)
         ticker = tickers[0] if tickers else None
-
         period_type, period_value = extract_period(clean_text)
 
         success = await save_stockpick_to_notion(
@@ -922,7 +919,7 @@ def extract_period(text: str):
                 "(Could not save it right now – please try again later or contact an admin.)"
             )
         return
-        
+
     # 2. Ticker lookup – ONLY from hashtags
     tickers = extract_hashtag_tickers(clean_text)
     if tickers:
@@ -947,7 +944,7 @@ def extract_period(text: str):
         "Or use `#stockpick` to save an idea.",
         parse_mode="Markdown",
     )
-
+    
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
