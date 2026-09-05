@@ -65,6 +65,8 @@ CACHE_TTL_SECONDS = 600  # 10 minutes
 _last_stockpick_page: dict[int, str] = {}
 # user_id -> waiting field name ("Summary" | "Next Catalyst" | "Target Price" | "Change")
 _awaiting_field: dict[int, str] = {}
+# user_id -> "add" | "change" | "delete"
+_awaiting_watchlist: dict[int, str] = {}
 
 _authorized_cache: dict = {"usernames": set(), "expires": 0}
 AUTH_CACHE_TTL = 300  # 5 minutes
@@ -552,20 +554,38 @@ async def stockpick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not data.startswith("sp:"):
         return
 
-    field = data[3:]  # Summary | Next Catalyst | Target Price | Change
+    field = data[3:]
     page_id = _last_stockpick_page.get(user.id)
     if not page_id:
-        await query.edit_message_text(
-            "No recent stockpick found. Submit one with #stockpick first."
+        await query.message.reply_text(
+            "No recent stockpick found. Submit one with #stockpick first, "
+            "or open 📌 My Stockpicks."
         )
         return
+
+    # Lock past months (admins can still edit)
+    if not is_admin(user) and notion:
+        try:
+            page = notion.pages.retrieve(page_id=page_id)
+            props = page.get("properties", {})
+            date_prop = (props.get("Telegram Date") or {}).get("date") or {}
+            date_str = date_prop.get("start", "")
+            if date_str and not _is_current_month(date_str):
+                await query.message.reply_text(
+                    "🔒 That stockpick is from a **previous month** and is locked.\n"
+                    "Only this month’s pick can be changed (or ask an admin).",
+                    parse_mode="Markdown",
+                )
+                return
+        except Exception as e:
+            logger.warning("Could not verify stockpick month: %s", e)
 
     _awaiting_field[user.id] = field
 
     if field == "Change":
         await query.message.reply_text(
-            "Send your **new** stockpick text now (you can include #TICKER and #September / #2027).\n"
-            "This will update your pick for this month.",
+            "Send your **new** stockpick text now (include #TICKER).\n"
+            "This updates **this month’s** pick only.",
             parse_mode="Markdown",
         )
     else:
@@ -590,6 +610,35 @@ def extract_hashtag_tickers(text: str) -> list[str]:
             found.append(t)
     return found
 
+def _is_current_month(date_str: str) -> bool:
+    if not date_str or date_str == "—":
+        return False
+    try:
+        d = datetime.fromisoformat(date_str[:10]).date()
+        now = datetime.now(timezone.utc).date()
+        return d.year == now.year and d.month == now.month
+    except Exception:
+        return False
+
+
+def _hub_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+            ],
+            [
+                InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                InlineKeyboardButton("Change (this month)", callback_data="sp:Change"),
+            ],
+            [
+                InlineKeyboardButton("📌 My Stockpicks", callback_data="hub:mypicks"),
+                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+            ],
+        ]
+    )
+    
 def has_intent_keyword(text: str) -> bool:
     """Return True if the message contains an intent keyword."""
     lower = text.lower()
@@ -651,7 +700,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not page_id or not notion:
             await update.message.reply_text("Could not update your stockpick. Please try again.")
             return
-
+      # Watchlist follow-up (add / change / delete)
+    if user and user.id in _awaiting_watchlist:
+        action = _awaiting_watchlist.pop(user.id)
+        await handle_watchlist_text(update, context, action, text)
+        return
+        
         try:
             if field == "Change":
                 props = {
@@ -782,18 +836,38 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not await is_authorized(update):
         await update.message.reply_text(
-            "🔒 Only authorised members can view stockpicks.\n"
+            "🔒 Only authorised members can use this.\n"
             "Send /request to ask for access."
         )
         return
 
-    if not notion:
-        await update.message.reply_text("Data service is not available right now.")
+    await update.message.reply_text(
+        "📌 *My Stockpick hub*\n\n"
+        "• Edit **this month’s** pick with the buttons below\n"
+        "• Open **My Stockpicks** for your full history\n"
+        "• Open **My Watchlist** to manage tickers\n\n"
+        "_Past months’ stockpicks are locked (admin can still change them)._",
+        parse_mode="Markdown",
+        reply_markup=_hub_keyboard(),
+    )
+    
+    async def show_my_stockpicks(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+) -> None:
+    user = update.effective_user
+    msg = update.callback_query.message if update.callback_query else update.message
+
+    if not await is_authorized(update):
+        text = "🔒 Authorised members only."
+        if edit:
+            await msg.edit_text(text)
+        else:
+            await msg.reply_text(text)
         return
 
     db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
-    if not db_id:
-        await update.message.reply_text("Stockpick database is not configured.")
+    if not notion or not db_id:
+        await msg.reply_text("Stockpick database is not configured.")
         return
 
     try:
@@ -809,53 +883,334 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if uid_marker not in notes and posted_by != user_name:
                 continue
 
-            ticker = _get_plain_text(props.get("Ticker")) or "—"
-            status = _get_plain_text(props.get("Status")) or "—"
-            date_prop = props.get("Telegram Date", {}).get("date") or {}
+            date_prop = (props.get("Telegram Date") or {}).get("date") or {}
             date_str = date_prop.get("start", "—")
-            summary = _get_plain_text(props.get("Summary")) or "—"
-            catalyst = _get_plain_text(props.get("Next Catalyst")) or "—"
-            target = _get_plain_text(props.get("Target Price")) or "—"
-            rows.append((date_str, ticker, status, summary, catalyst, target))
+            rows.append(
+                {
+                    "page_id": page["id"],
+                    "date": date_str,
+                    "ticker": _get_plain_text(props.get("Ticker")) or "—",
+                    "summary": _get_plain_text(props.get("Summary")) or "—",
+                    "catalyst": _get_plain_text(props.get("Next Catalyst")) or "—",
+                    "target": _get_plain_text(props.get("Target Price")) or "—",
+                    "current": _is_current_month(date_str),
+                }
+            )
 
         if not rows:
-            await update.message.reply_text(
+            text = (
                 "You have no stockpicks yet.\n"
-                "Post `#stockpick #TICKER your idea` to save one.",
-                reply_markup=main_reply_keyboard(),
+                "Post `#stockpick #TICKER your idea` in the group."
             )
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data="hub:home")]]
+            )
+            if edit:
+                await msg.edit_text(text, reply_markup=kb)
+            else:
+                await msg.reply_text(text, reply_markup=kb)
             return
 
-        # Newest first
-        rows.sort(key=lambda r: r[0], reverse=True)
-        lines = ["📌 *My Stockpicks*\n"]
-        for date_str, ticker, status, summary, catalyst, target in rows[:12]:
+        rows.sort(key=lambda r: r["date"], reverse=True)
+        lines = [
+            "📌 *My Stockpicks*\n",
+            "_🔒 = previous month (locked). Only this month can be edited._\n",
+        ]
+        for r in rows[:12]:
+            lock = "" if r["current"] else " 🔒"
             lines.append(
-                f"• *{date_str}* | `#{ticker}` | {status}\n"
-                f"  Summary: {summary[:80]}\n"
-                f"  Catalyst: {catalyst[:60]}\n"
-                f"  Target: {target}\n"
+                f"• *{r['date']}* | `#{r['ticker']}`{lock}\n"
+                f"  Summary: {r['summary'][:80]}\n"
+                f"  Catalyst: {r['catalyst'][:60]}\n"
+                f"  Target: {r['target']}\n"
             )
+
+        current = next((r for r in rows if r["current"]), None)
+        keyboard = []
+        if current:
+            _last_stockpick_page[user.id] = current["page_id"]
+            keyboard.extend(
+                [
+                    [
+                        InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                        InlineKeyboardButton(
+                            "Next Catalyst", callback_data="sp:Next Catalyst"
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Target Price", callback_data="sp:Target Price"
+                        ),
+                        InlineKeyboardButton(
+                            "Change (this month)", callback_data="sp:Change"
+                        ),
+                    ],
+                ]
+            )
+        elif is_admin(user) and rows:
+            _last_stockpick_page[user.id] = rows[0]["page_id"]
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "Admin: edit latest", callback_data="sp:Change"
+                    )
+                ]
+            )
+
+        keyboard.append(
+            [InlineKeyboardButton("« Back to hub", callback_data="hub:home")]
+        )
+
+        text = "\n".join(lines)
+        markup = InlineKeyboardMarkup(keyboard)
+        if edit:
+            await msg.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await msg.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+    except Exception as e:
+        logger.error("show_my_stockpicks failed: %s", e)
+        await msg.reply_text("Could not load your stockpicks right now.")
+
+
+async def show_watchlist(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+) -> None:
+    user = update.effective_user
+    msg = update.callback_query.message if update.callback_query else update.message
+
+    if not await is_authorized(update):
+        text = "🔒 Authorised members only."
+        if edit:
+            await msg.edit_text(text)
+        else:
+            await msg.reply_text(text)
+        return
+
+    db_id = os.getenv("NOTION_WATCHLIST_DB_ID")
+    if not notion or not db_id:
+        await msg.reply_text(
+            "Watchlist is not configured.\n"
+            "Admin: set NOTION_WATCHLIST_DB_ID in Railway."
+        )
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "rich_text": {"equals": str(user.id)},
+            },
+            page_size=30,
+        )
+        results = response.get("results", [])
+
+        lines = ["👀 *My Watchlist*\n", "`Ticker` | Name | Link\n"]
+        if not results:
+            lines.append("_Empty — use Add below._\n")
+        else:
+            for page in results:
+                props = page.get("properties", {})
+                ticker = _get_plain_text(props.get("Ticker")) or "—"
+                name = _get_plain_text(props.get("Name")) or "—"
+                url = ((props.get("Group Link") or {}).get("url") or "").strip()
+                link_txt = f"[link]({url})" if url else "—"
+                lines.append(f"• `#{ticker}` | {name} | {link_txt}")
 
         keyboard = [
             [
-                InlineKeyboardButton("Add Stockpick Summary", callback_data="sp:Summary"),
-                InlineKeyboardButton("Add Next Catalyst", callback_data="sp:Next Catalyst"),
+                InlineKeyboardButton("➕ Add", callback_data="wl:add"),
+                InlineKeyboardButton("✏️ Change", callback_data="wl:change"),
+                InlineKeyboardButton("🗑 Delete", callback_data="wl:delete"),
             ],
-            [
-                InlineKeyboardButton("Add Target Price", callback_data="sp:Target Price"),
-                InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-            ],
+            [InlineKeyboardButton("« Back to hub", callback_data="hub:home")],
         ]
 
-        await update.message.reply_text(
-            "\n".join(lines),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        text = "\n".join(lines)
+        markup = InlineKeyboardMarkup(keyboard)
+        if edit:
+            await msg.edit_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        else:
+            await msg.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+
     except Exception as e:
-        logger.error("mystockpick_cmd failed: %s", e)
-        await update.message.reply_text("Could not load your stockpicks right now.")
+        logger.error("show_watchlist failed: %s", e)
+        await msg.reply_text("Could not load watchlist right now.")
+
+
+async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "hub:watchlist":
+        await show_watchlist(update, context, edit=True)
+    elif data == "hub:mypicks":
+        await show_my_stockpicks(update, context, edit=True)
+    elif data == "hub:home":
+        await query.edit_message_text(
+            "📌 *My Stockpick hub*\n\nChoose an option:",
+            parse_mode="Markdown",
+            reply_markup=_hub_keyboard(),
+        )
+
+
+async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not user:
+        return
+
+    action = (query.data or "").replace("wl:", "")
+    if action not in ("add", "change", "delete"):
+        return
+
+    _awaiting_watchlist[user.id] = action
+
+    if action == "add":
+        await query.message.reply_text(
+            "➕ *Add to watchlist*\n\n"
+            "Send one line:\n"
+            "`#TICKER | Company Name | https://t.me/+invite`\n\n"
+            "Example:\n"
+            "`#ALRT | Defence Holdings | https://t.me/+abc123`",
+            parse_mode="Markdown",
+        )
+    elif action == "change":
+        await query.message.reply_text(
+            "✏️ *Change watchlist item*\n\n"
+            "Send:\n"
+            "`#TICKER | New Name | https://t.me/+newlink`",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.message.reply_text(
+            "🗑 *Delete from watchlist*\n\nSend the ticker only, e.g. `#ALRT`",
+            parse_mode="Markdown",
+        )
+
+
+async def handle_watchlist_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str
+) -> None:
+    user = update.effective_user
+    db_id = os.getenv("NOTION_WATCHLIST_DB_ID")
+    if not notion or not db_id or not user:
+        await update.message.reply_text("Watchlist is not available right now.")
+        return
+
+    tickers = extract_hashtag_tickers(text)
+    ticker = tickers[0] if tickers else None
+
+    try:
+        if action == "delete":
+            if not ticker:
+                await update.message.reply_text("Send a ticker like `#ALRT`.")
+                return
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "and": [
+                        {
+                            "property": "Telegram User ID",
+                            "rich_text": {"equals": str(user.id)},
+                        },
+                        {"property": "Ticker", "title": {"equals": ticker}},
+                    ]
+                },
+                page_size=5,
+            )
+            results = response.get("results", [])
+            if not results:
+                await update.message.reply_text(
+                    f"No watchlist item `#{ticker}` found.", parse_mode="Markdown"
+                )
+                return
+            for page in results:
+                notion.pages.update(page_id=page["id"], archived=True)
+            await update.message.reply_text(
+                f"🗑 Removed `#{ticker}` from your watchlist.", parse_mode="Markdown"
+            )
+            return
+
+        parts = [p.strip() for p in text.split("|")]
+        name = parts[1] if len(parts) > 1 else ""
+        link = parts[2] if len(parts) > 2 else ""
+
+        if not ticker:
+            await update.message.reply_text(
+                "Include a ticker, e.g. `#ALRT | Name | https://t.me/+...`"
+            )
+            return
+
+        if action == "add":
+            props = {
+                "Ticker": {"title": [{"text": {"content": ticker}}]},
+                "Name": {"rich_text": [{"text": {"content": name[:200]}}]},
+                "Telegram User ID": {
+                    "rich_text": [{"text": {"content": str(user.id)}}]
+                },
+            }
+            if link.startswith("http"):
+                props["Group Link"] = {"url": link}
+            if user.username:
+                props["Username"] = {
+                    "rich_text": [{"text": {"content": user.username}}]
+                }
+            notion.pages.create(parent={"database_id": db_id}, properties=props)
+            await update.message.reply_text(
+                f"✅ Added `#{ticker}` to your watchlist.", parse_mode="Markdown"
+            )
+            return
+
+        # change
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "and": [
+                    {
+                        "property": "Telegram User ID",
+                        "rich_text": {"equals": str(user.id)},
+                    },
+                    {"property": "Ticker", "title": {"equals": ticker}},
+                ]
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            await update.message.reply_text(
+                f"No watchlist item `#{ticker}` found.", parse_mode="Markdown"
+            )
+            return
+        props = {}
+        if name:
+            props["Name"] = {"rich_text": [{"text": {"content": name[:200]}}]}
+        if link.startswith("http"):
+            props["Group Link"] = {"url": link}
+        if props:
+            notion.pages.update(page_id=results[0]["id"], properties=props)
+        await update.message.reply_text(
+            f"✅ Updated `#{ticker}`.", parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error("handle_watchlist_text failed: %s", e)
+        await update.message.reply_text(
+            "Could not update watchlist. Check Notion property names / types."
+        )
         
 async def create_access_request(user) -> tuple[bool, str]:
     """Create a Pending access request in Notion."""
@@ -1295,12 +1650,13 @@ def main() -> None:
     app.add_handler(CommandHandler("help", menu_cmd))
     app.add_handler(CommandHandler("tickers", snap_cmd))
     app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
+    app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("request", request_access))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("schema", schema_cmd))
-    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
     
     # Admin commands
     app.add_handler(CommandHandler("pending", pending_cmd))
