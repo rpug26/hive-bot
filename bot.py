@@ -14,11 +14,12 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from notion_client import Client
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -52,6 +53,11 @@ if not notion:
 # ------------------------------------------------------------
 _ticker_cache: dict[str, dict] = {}
 CACHE_TTL_SECONDS = 600  # 10 minutes
+
+# user_id -> last stockpick Notion page_id this month
+_last_stockpick_page: dict[int, str] = {}
+# user_id -> waiting field name ("Summary" | "Next Catalyst" | "Target Price" | "Change")
+_awaiting_field: dict[int, str] = {}
 
 _authorized_cache: dict = {"usernames": set(), "expires": 0}
 AUTH_CACHE_TTL = 300  # 5 minutes
@@ -415,7 +421,7 @@ async def save_stockpick_to_notion(
                 "rich_text": [{"text": {"content": notes[:2000]}}]
             }
 
-        notion.pages.create(
+        page = notion.pages.create(
             parent={"database_id": db_id},
             properties=properties,
         )
@@ -423,8 +429,11 @@ async def save_stockpick_to_notion(
             "Saved #stockpick (ticker=%s, period=%s %s)",
             ticker, period_type, period_value,
         )
-        return True
-
+        return page.get("id")   # return page id instead of True
+    except Exception as e:
+        logger.error("Failed to write #stockpick to Notion: %s", e)
+        return None             # return None instead of False
+        
     except Exception as e:
         logger.error("Failed to write #stockpick to Notion: %s", e)
         return False
@@ -525,6 +534,39 @@ def extract_period(text: str):
         return "Annual", year
     return None, None
     
+async def stockpick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    if not user:
+        return
+
+    data = query.data or ""
+    if not data.startswith("sp:"):
+        return
+
+    field = data[3:]  # Summary | Next Catalyst | Target Price | Change
+    page_id = _last_stockpick_page.get(user.id)
+    if not page_id:
+        await query.edit_message_text(
+            "No recent stockpick found. Submit one with #stockpick first."
+        )
+        return
+
+    _awaiting_field[user.id] = field
+
+    if field == "Change":
+        await query.message.reply_text(
+            "Send your **new** stockpick text now (you can include #TICKER and #September / #2027).\n"
+            "This will update your pick for this month.",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.message.reply_text(
+            f"Send your **{field}** now and I’ll add it to your stockpick.",
+            parse_mode="Markdown",
+        )
+        
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
@@ -557,6 +599,48 @@ def format_reply(ticker: str, data: dict) -> str:
 # ------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+
+    # --- Follow-up: user is adding Summary / Catalyst / Target / Change ---
+    if user and user.id in _awaiting_field:
+        field = _awaiting_field.pop(user.id)
+        page_id = _last_stockpick_page.get(user.id)
+        if not page_id or not notion:
+            await update.message.reply_text("Could not update your stockpick. Please try again.")
+            return
+
+        try:
+            if field == "Change":
+                # Update main Message (+ optional ticker/period in Notes)
+                props = {
+                    "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
+                }
+                tickers = extract_hashtag_tickers(text)
+                if tickers:
+                    props["Ticker"] = {"rich_text": [{"text": {"content": tickers[0]}}]}
+                    props["Name"] = {"title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]}
+                notion.pages.update(page_id=page_id, properties=props)
+                await update.message.reply_text("✅ Your stockpick has been updated.")
+            else:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={
+                        field: {"rich_text": [{"text": {"content": text[:2000]}}]}
+                    },
+                )
+                await update.message.reply_text(f"✅ Added **{field}** to your stockpick.", parse_mode="Markdown")
+        except Exception as e:
+            logger.error("Failed to update stockpick field %s: %s", field, e)
+            await update.message.reply_text("Could not save that update. Please try again later.")
+        return
+
+    if not await should_reply(update, context):
+        return
+    # ... rest of handle_message unchanged ...
+    
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
@@ -1031,7 +1115,8 @@ def main() -> None:
     app.add_handler(CommandHandler("request", request_access))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("schema", schema_cmd))
-
+    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    
     # Admin commands
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
