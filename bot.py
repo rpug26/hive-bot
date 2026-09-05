@@ -837,22 +837,22 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"  Target: {target}\n"
             )
 
-		keyboard = [
-    		[
-        		InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-        		InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
-    		],
-    		[
-        		InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-        		InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-    		],
-		]
+        keyboard = [
+            [
+                InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+            ],
+            [
+                InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+            ],
+        ]
 
-		await update.message.reply_text(
-		    "\n".join(lines),
-    		parse_mode="Markdown",
-    		reply_markup=InlineKeyboardMarkup(keyboard),
-		)
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     except Exception as e:
         logger.error("mystockpick_cmd failed: %s", e)
         await update.message.reply_text("Could not load your stockpicks right now.")
