@@ -254,14 +254,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
 
-    # Check authorisation
     authorised = await is_authorized(update)
 
     if authorised:
         await update.message.reply_text(
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
-            "✅ You are **Authorised** and can use the bot.\n\n"
+            "✅ You are *Authorised* and can use the bot.\n\n"
             "In the group use:\n"
             "• `@Bot #TICKER` to look up a stock\n"
             "• `#stockpick your idea` to save an idea\n\n"
@@ -272,11 +271,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
-            "❌ You are **not authorised** yet.\n\n"
-            "To request access, please send:\n"
-            "`/request`\n\n"
-            "An admin will review your request and approve it in Notion.\n"
-            "You can also check your status anytime with `/status`.",
+            "❌ You are *not authorised* yet.\n\n"
+            "👉 *Next step:* tap the command below to request access:\n"
+            "/request\n\n"
+            "An admin will review it in Notion and approve you.\n"
+            "You can check your status anytime with /status.",
             parse_mode="Markdown",
         )
 
@@ -306,7 +305,6 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
-
 async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "In the group use:\n"
@@ -315,6 +313,69 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode="Markdown",
     )
 
+async def create_access_request(user) -> bool:
+    """Create a Pending access request in Notion."""
+    if not notion or not NOTION_AUTH_DB_ID:
+        logger.error("Notion or NOTION_AUTH_DB_ID missing")
+        return False
+
+    try:
+        # Base properties – adjust names if yours are different
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+            },
+            "Status": {
+                "select": {"name": "Pending"}
+            },
+        }
+
+        # Telegram Username (Text / rich_text)
+        if user.username:
+            properties["Telegram Username"] = {
+                "rich_text": [{"text": {"content": user.username}}]
+            }
+
+        # Telegram User ID – try as rich_text first (most common)
+        properties["Telegram User ID"] = {
+            "rich_text": [{"text": {"content": str(user.id)}}]
+        }
+
+        notion.pages.create(
+            parent={"database_id": NOTION_AUTH_DB_ID},
+            properties=properties,
+        )
+        logger.info("Access request created for user %s (%s)", user.id, user.username)
+        return True
+
+    except Exception as e:
+        logger.error("Failed to create access request: %s", e)
+        # One retry with alternative property names if the first attempt fails
+        try:
+            properties = {
+                "Name": {
+                    "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+                },
+                "Status": {
+                    "select": {"name": "Pending"}
+                },
+                "Username": {
+                    "rich_text": [{"text": {"content": user.username or ""}}]
+                },
+                "User ID": {
+                    "rich_text": [{"text": {"content": str(user.id)}}]
+                },
+            }
+            notion.pages.create(
+                parent={"database_id": NOTION_AUTH_DB_ID},
+                properties=properties,
+            )
+            logger.info("Access request created on retry for user %s", user.id)
+            return True
+        except Exception as e2:
+            logger.error("Retry also failed: %s", e2)
+            return False
+            
 async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
@@ -332,12 +393,18 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Name: {user.full_name}\n"
             f"Username: @{user.username or 'N/A'}\n"
             f"User ID: `{user.id}`\n\n"
-            "An admin will change your Status to **Authorised** in Notion.",
+            "An admin will change your Status to *Authorised* in Notion.\n"
+            "Check progress anytime with /status.",
             parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
-            "Sorry, I could not submit your request right now. Please contact an admin."
+            "Sorry, I could not submit your request right now.\n\n"
+            "Possible reasons:\n"
+            "• Notion property names don’t match\n"
+            "• Status option “Pending” doesn’t exist\n"
+            "• Integration not connected to the database\n\n"
+            "Please contact an admin."
         )
 
 
