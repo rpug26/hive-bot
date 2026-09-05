@@ -1002,13 +1002,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if await has_submitted_this_month(user):
             month_name = datetime.now(timezone.utc).strftime("%B")
+
+            # Try to reuse last page id, or look it up
+            page_id = _last_stockpick_page.get(user.id)
+            if not page_id:
+                page_id = await find_this_month_stockpick_page(user)
+                if page_id:
+                    _last_stockpick_page[user.id] = page_id
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
             await update.message.reply_text(
                 f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
                 "Each member may submit only **one** stockpick per month.\n"
-                "Please wait until next month to submit another.",
+                "You can still add details or change this month’s pick:",
                 parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
             return
+
+async def find_this_month_stockpick_page(user) -> str | None:
+    """Return Notion page id for this user's stockpick in the current month."""
+    if not notion or not user:
+        return None
+    db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
+    if not db_id:
+        return None
+    try:
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1).date().isoformat()
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        month_end = next_month.date().isoformat()
+
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "and": [
+                    {"property": "Telegram Date", "date": {"on_or_after": month_start}},
+                    {"property": "Telegram Date", "date": {"before": month_end}},
+                ]
+            },
+            page_size=100,
+        )
+        uid_marker = f"uid:{user.id}"
+        user_name = (user.full_name or "").strip().lower()
+
+        for page in response.get("results", []):
+            props = page.get("properties", {})
+            notes = _get_plain_text(props.get("Notes")).lower()
+            if uid_marker in notes:
+                return page["id"]
+            posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
+            if user_name and posted_by == user_name:
+                return page["id"]
+        return None
+    except Exception as e:
+        logger.error("find_this_month_stockpick_page failed: %s", e)
+        return None
 
         user_name = user.full_name if user else "Unknown"
         tickers = extract_hashtag_tickers(clean_text)
