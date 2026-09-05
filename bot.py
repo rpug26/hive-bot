@@ -1015,7 +1015,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ticker = tickers[0] if tickers else None
         period_type, period_value = extract_period(clean_text)
 
-        success = await save_stockpick_to_notion(
+                page_id = await save_stockpick_to_notion(
             clean_text,
             user_name,
             ticker,
@@ -1024,14 +1024,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             user_id=user.id if user else None,
         )
 
-        if success:
+        if page_id:
+            _last_stockpick_page[user.id] = page_id
+
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
             if period_type and period_value:
                 reply += f"\n📅 {period_type}: *{period_value}*"
-            reply += "\nYour pick has been saved."
-            await update.message.reply_text(reply, parse_mode="Markdown")
+            reply += "\nYour pick has been saved.\n\nWhat would you like to do next?"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                reply,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         else:
             await update.message.reply_text(
                 "✅ Received your #stockpick.\n"
