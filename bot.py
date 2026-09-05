@@ -690,6 +690,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("schema", schema_cmd))
 
     logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
