@@ -314,67 +314,29 @@ async def tickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def create_access_request(user) -> bool:
-    """Create a Pending access request in Notion."""
     if not notion or not NOTION_AUTH_DB_ID:
         logger.error("Notion or NOTION_AUTH_DB_ID missing")
         return False
 
     try:
-        # Base properties – adjust names if yours are different
         properties = {
             "Name": {
-                "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+                "title": [{"text": {"content": f"{user.full_name or 'Unknown'} ({user.id})"}}]
             },
             "Status": {
                 "select": {"name": "Pending"}
             },
         }
 
-        # Telegram Username (Text / rich_text)
-        if user.username:
-            properties["Telegram Username"] = {
-                "rich_text": [{"text": {"content": user.username}}]
-            }
-
-        # Telegram User ID – try as rich_text first (most common)
-        properties["Telegram User ID"] = {
-            "rich_text": [{"text": {"content": str(user.id)}}]
-        }
-
         notion.pages.create(
             parent={"database_id": NOTION_AUTH_DB_ID},
             properties=properties,
         )
-        logger.info("Access request created for user %s (%s)", user.id, user.username)
+        logger.info("Minimal access request created for %s", user.id)
         return True
-
     except Exception as e:
         logger.error("Failed to create access request: %s", e)
-        # One retry with alternative property names if the first attempt fails
-        try:
-            properties = {
-                "Name": {
-                    "title": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
-                },
-                "Status": {
-                    "select": {"name": "Pending"}
-                },
-                "Username": {
-                    "rich_text": [{"text": {"content": user.username or ""}}]
-                },
-                "User ID": {
-                    "rich_text": [{"text": {"content": str(user.id)}}]
-                },
-            }
-            notion.pages.create(
-                parent={"database_id": NOTION_AUTH_DB_ID},
-                properties=properties,
-            )
-            logger.info("Access request created on retry for user %s", user.id)
-            return True
-        except Exception as e2:
-            logger.error("Retry also failed: %s", e2)
-            return False
+        return False
             
 async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
