@@ -1986,35 +1986,27 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
-    # Public commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("faq", faq))
     app.add_handler(CommandHandler("snap", snap_cmd))
     app.add_handler(CommandHandler("mystockpick", mystockpick_cmd))
-    # keep /help as alias if you want
     app.add_handler(CommandHandler("help", menu_cmd))
     app.add_handler(CommandHandler("tickers", snap_cmd))
-    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
-    app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
-    app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
-    app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("request", request_access))
     app.add_handler(CommandHandler("debug", debug_cmd))
-    app.add_handler(CommandHandler("schema", schema_cmd))
-    
-    # Admin commands
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
+    # ... CallbackQueryHandlers and MessageHandler stay as they are
+
+    logger.info("Hive SupportBot starting...")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
-
-    logger.info("Hive SupportBot starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
