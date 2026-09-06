@@ -1660,7 +1660,7 @@ async def status_cmd(
         return
 
     # 1) Live Telegram group check (True/False + reason)
-	in_group, group_detail = await is_group_member(context, user.id)
+    in_group, group_detail = await is_group_member(context, user.id)
 
     # 2) Optional: update Notion "Group Member" field
     try:
@@ -1671,7 +1671,7 @@ async def status_cmd(
     # 3) Full access rule (group + Notion)
     authorised = await is_authorized(update, context)
 
-    # 4) Notion Authorised only (separate from group)
+    # 4) Notion Authorised only
     in_notion = False
     auth = await get_authorized_users()
     if user.username and user.username.lower() in auth.get("usernames", set()):
