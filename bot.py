@@ -343,7 +343,73 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | Non
    	     "Join the group first, then send /request if you need access."
     	)
     	return
-    
+
+    async def sync_group_member_to_notion(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+) -> bool | None:
+    """
+    Check Telegram group membership and update Notion.
+    Returns True/False for member status, or None if check not possible.
+    """
+    if not user or not notion:
+        return None
+
+    group_id = os.getenv("TELEGRAM_GROUP_ID")
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not group_id or not db_id:
+        return None
+
+    # 1) Telegram membership
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=int(group_id),
+            user_id=user.id,
+        )
+        is_member = member.status in (
+            "creator",
+            "administrator",
+            "member",
+            "restricted",
+        )
+    except Exception as e:
+        logger.warning("get_chat_member failed for %s: %s", user.id, e)
+        return None
+
+    status_label = "Yes" if is_member else "No"
+
+    # 2) Find row by Telegram User ID (Title)
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            # No row yet – optional: create a Pending row with membership
+            return is_member
+
+        page_id = results[0]["id"]
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Group Member": {"select": {"name": status_label}},
+            },
+        )
+        logger.info(
+            "Updated Notion Group Member=%s for user %s",
+            status_label,
+            user.id,
+        )
+    except Exception as e:
+        logger.error("Failed to update Group Member in Notion: %s", e)
+
+    return is_member
+        
 async def get_ticker_from_notion(ticker: str) -> dict | None:
     if not notion or not NOTION_TICKERS_DB_ID:
         return None
