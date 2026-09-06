@@ -88,7 +88,16 @@ ADMIN_USER_IDS = {1670138803}  # your Telegram user ID
 def is_admin(user) -> bool:
     return bool(user and user.id in ADMIN_USER_IDS)
 
-
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Chat title: {chat.title if chat else 'N/A'}\n"
+        f"Chat type: {chat.type if chat else 'N/A'}\n"
+        f"Chat ID: {chat.id if chat else 'N/A'}\n"
+        f"Your user ID: {user.id if user else 'N/A'}"
+    )
+    
 async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List users with Status = Pending."""
     user = update.effective_user
@@ -304,21 +313,39 @@ async def get_authorized_usernames() -> set[str]:
         logger.error("Failed to load authorised users: %s", e)
         return _authorized_cache["usernames"]
 
-async def is_group_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """True if user is in the configured Hive group."""
-    group_id = os.getenv("TELEGRAM_GROUP_ID")
+async def is_group_member(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> tuple[bool, str]:
+    """
+    Returns (is_member, detail).
+    detail is 'yes', 'no', or an error reason.
+    """
+    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
     if not group_id:
-        # If not configured, do not block on membership
-        return True
+        return True, "TELEGRAM_GROUP_ID not set (skipped)"
+
+    try:
+        chat_id = int(group_id)
+    except ValueError:
+        return False, f"Invalid TELEGRAM_GROUP_ID: {group_id}"
+
     try:
         member = await context.bot.get_chat_member(
-            chat_id=int(group_id),
+            chat_id=chat_id,
             user_id=user_id,
         )
-        return member.status in ("creator", "administrator", "member", "restricted")
+        status = member.status  # creator / administrator / member / restricted / left / kicked
+        if status in ("creator", "administrator", "member", "restricted"):
+            return True, f"status={status}"
+        return False, f"status={status}"
     except Exception as e:
-        logger.warning("Group membership check failed for %s: %s", user_id, e)
-        return False
+        logger.warning(
+            "get_chat_member failed chat_id=%s user_id=%s err=%s",
+            group_id,
+            user_id,
+            e,
+        )
+        return False, f"error: {e}"
         
 async def is_authorized(
     update: Update, context: ContextTypes.DEFAULT_TYPE | None = None
@@ -327,12 +354,11 @@ async def is_authorized(
     if not user:
         return False
 
-    # 1) Must be in the Telegram group (if TELEGRAM_GROUP_ID is set)
-    if context is not None:
-        if not await is_group_member(context, user.id):
-            return False
+	if context is not None:
+    	in_group, _detail = await is_group_member(context, user.id)
+    	if not in_group:
+     	   return False
 
-    # 2) Must be Authorised in Notion
     auth = await get_authorized_users()
     if user.username and user.username.lower() in auth.get("usernames", set()):
         return True
@@ -1633,14 +1659,19 @@ async def status_cmd(
     if not user:
         return
 
-    # Live group check + write to Notion
-    in_group = await sync_group_member_to_notion(context, user)
-    if in_group is None:
-        in_group = await is_group_member(context, user.id)
+    # 1) Live Telegram group check (True/False + reason)
+	in_group, group_detail = await is_group_member(context, user.id)
 
-    # Must pass context so group membership is enforced
+    # 2) Optional: update Notion "Group Member" field
+    try:
+        await sync_group_member_to_notion(context, user)
+    except Exception as e:
+        logger.warning("sync_group_member_to_notion failed: %s", e)
+
+    # 3) Full access rule (group + Notion)
     authorised = await is_authorized(update, context)
 
+    # 4) Notion Authorised only (separate from group)
     in_notion = False
     auth = await get_authorized_users()
     if user.username and user.username.lower() in auth.get("usernames", set()):
@@ -1656,7 +1687,8 @@ async def status_cmd(
         f"Telegram User ID: {user.id}",
         "",
         f"Group member: {'Yes' if in_group else 'No'}",
-        f"Group Authorised: {'Yes' if in_notion else 'No'}",
+        f"Group check detail: {group_detail}",
+        f"Notion Authorised: {'Yes' if in_notion else 'No'}",
         "",
     ]
 
@@ -1667,7 +1699,7 @@ async def status_cmd(
             "You can use the bot because:",
             "1) Valid Telegram user ID",
             "2) You are a member of The Hive group",
-            "3) Status is Authorised",
+            "3) Status is Authorised in Notion",
         ]
     else:
         lines += [
@@ -1676,32 +1708,14 @@ async def status_cmd(
             "Access requires all of:",
             "1) Valid Telegram user ID",
             "2) Membership of The Hive group",
-            "3) Status = Authorised in Group Access",
-            "",
+            "3) Status = Authorised in Notion",
         ]
         if not in_group:
-            lines.append("- Join The Hive group first, group link: https://t.me/+kqnqJM9XaNAzZTU8")
+            lines.append("- Group check failed — see Group check detail above.")
         if not in_notion:
             lines.append("- Send /request and wait for admin approval.")
 
     await update.message.reply_text("\n".join(lines))
-        
-async def schema_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Temporary: list properties of the auth database."""
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not notion or not db_id:
-        await update.message.reply_text("Notion or database ID missing.")
-        return
-
-    try:
-        db = notion.databases.retrieve(database_id=db_id)
-        props = db.get("properties", {})
-        lines = ["📋 *Database properties:*\n"]
-        for name, info in props.items():
-            lines.append(f"• `{name}`  ({info.get('type')})")
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"Error:\n`{e}`", parse_mode="Markdown")        
         
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
