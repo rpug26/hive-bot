@@ -67,7 +67,7 @@ _last_stockpick_page: dict[int, str] = {}
 _awaiting_field: dict[int, str] = {}
 # user_id -> "add" | "change" | "delete"
 _awaiting_watchlist: dict[int, str] = {}
-
+_active_watchlist_name: dict[int, str] = {}
 _authorized_cache: dict = {"usernames": set(), "expires": 0}
 AUTH_CACHE_TTL = 300  # 5 minutes
 
@@ -1202,22 +1202,77 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown",
         )
 
+# Active list name per user (in-memory)
+_active_watchlist_name: dict[int, str] = {}
+
 async def handle_watchlist_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str
 ) -> None:
     user = update.effective_user
-    db_id = os.getenv("NOTION_WATCHLIST_DB_ID")
+    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
     if not notion or not db_id or not user:
         await update.message.reply_text("Watchlist is not available right now.")
         return
 
+    text = (text or "").strip()
     tickers = extract_hashtag_tickers(text)
     ticker = tickers[0] if tickers else None
 
     try:
+        # ----- Create list (name only) -----
+        if action == "create_list":
+            list_name = text.strip()
+            if not list_name or len(list_name) > 80:
+                await update.message.reply_text(
+                    "Please send a short list name, e.g. UK AIM Growth"
+                )
+                return
+            _active_watchlist_name[user.id] = list_name
+            await update.message.reply_text(
+                f"List set to: {list_name}\n\n"
+                "Next: open My Watchlist → Edit Watchlist → Add ticker\n"
+                "Format:\n"
+                "#TICKER | Company Name | https://t.me/+invite"
+            )
+            return
+
+        # ----- Rename list (memory only for now) -----
+        if action == "rename_list":
+            parts = [p.strip() for p in text.split("|")]
+            if len(parts) < 2:
+                await update.message.reply_text("Send: Old Name | New Name")
+                return
+            _active_watchlist_name[user.id] = parts[1]
+            await update.message.reply_text(
+                f"Active list renamed to: {parts[1]}"
+            )
+            return
+
+        # ----- Delete list (archive all rows for this user; optional filter by name later) -----
+        if action == "delete_list":
+            list_name = text.strip()
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "Telegram User ID",
+                    "rich_text": {"equals": str(user.id)},
+                },
+                page_size=50,
+            )
+            count = 0
+            for page in response.get("results", []):
+                notion.pages.update(page_id=page["id"], archived=True)
+                count += 1
+            _active_watchlist_name.pop(user.id, None)
+            await update.message.reply_text(
+                f"Removed {count} watchlist item(s) for your account."
+            )
+            return
+
+        # ----- Delete one ticker -----
         if action == "delete":
             if not ticker:
-                await update.message.reply_text("Send a ticker like `#ALRT`.")
+                await update.message.reply_text("Send a ticker like #ALRT")
                 return
             response = notion.databases.query(
                 database_id=db_id,
@@ -1234,34 +1289,28 @@ async def handle_watchlist_text(
             )
             results = response.get("results", [])
             if not results:
-                await update.message.reply_text(
-                    f"No watchlist item `#{ticker}` found.", parse_mode="Markdown"
-                )
+                await update.message.reply_text(f"No item #{ticker} found.")
                 return
             for page in results:
                 notion.pages.update(page_id=page["id"], archived=True)
-            await update.message.reply_text(
-                f"🗑 Removed `#{ticker}` from your watchlist.", parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"Removed #{ticker} from your watchlist.")
             return
 
+        # ----- Add / Change ticker -----
         parts = [p.strip() for p in text.split("|")]
         name = parts[1] if len(parts) > 1 else ""
         link = parts[2] if len(parts) > 2 else ""
 
         if not ticker:
             await update.message.reply_text(
-                "Include a ticker, e.g. `#ALRT | Name | https://t.me/+...`"
+                "Include a ticker, e.g. #ALRT | Name | https://t.me/+..."
             )
             return
 
         if action == "add":
-            props["List Name"] = {
-    			"rich_text": [{"text": {"content": "Default"}}]
-				}
             props = {
                 "Ticker": {"title": [{"text": {"content": ticker}}]},
-                "Name": {"rich_text": [{"text": {"content": name[:200]}}]},
+                "Name": {"rich_text": [{"text": {"content": (name or ticker)[:200]}}]},
                 "Telegram User ID": {
                     "rich_text": [{"text": {"content": str(user.id)}}]
                 },
@@ -1272,47 +1321,57 @@ async def handle_watchlist_text(
                 props["Username"] = {
                     "rich_text": [{"text": {"content": user.username}}]
                 }
+            # Optional: only if you added a List Name property in Notion
+            list_name = _active_watchlist_name.get(user.id, "Default")
+            # Uncomment if List Name column exists:
+            # props["List Name"] = {
+            #     "rich_text": [{"text": {"content": list_name[:100]}}]
+            # }
+
             notion.pages.create(parent={"database_id": db_id}, properties=props)
             await update.message.reply_text(
-                f"✅ Added `#{ticker}` to your watchlist.", parse_mode="Markdown"
+                f"Added #{ticker} to watchlist ({list_name})."
             )
             return
 
-        # change
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "and": [
-                    {
-                        "property": "Telegram User ID",
-                        "rich_text": {"equals": str(user.id)},
-                    },
-                    {"property": "Ticker", "title": {"equals": ticker}},
-                ]
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            await update.message.reply_text(
-                f"No watchlist item `#{ticker}` found.", parse_mode="Markdown"
+        if action == "change":
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "and": [
+                        {
+                            "property": "Telegram User ID",
+                            "rich_text": {"equals": str(user.id)},
+                        },
+                        {"property": "Ticker", "title": {"equals": ticker}},
+                    ]
+                },
+                page_size=1,
             )
+            results = response.get("results", [])
+            if not results:
+                await update.message.reply_text(f"No item #{ticker} found.")
+                return
+            props = {}
+            if name:
+                props["Name"] = {
+                    "rich_text": [{"text": {"content": name[:200]}}]
+                }
+            if link.startswith("http"):
+                props["Group Link"] = {"url": link}
+            if props:
+                notion.pages.update(page_id=results[0]["id"], properties=props)
+            await update.message.reply_text(f"Updated #{ticker}.")
             return
-        props = {}
-        if name:
-            props["Name"] = {"rich_text": [{"text": {"content": name[:200]}}]}
-        if link.startswith("http"):
-            props["Group Link"] = {"url": link}
-        if props:
-            notion.pages.update(page_id=results[0]["id"], properties=props)
+
         await update.message.reply_text(
-            f"✅ Updated `#{ticker}`.", parse_mode="Markdown"
+            f"Unknown watchlist action: {action}. Open My Watchlist and try again."
         )
 
     except Exception as e:
-        logger.error("handle_watchlist_text failed: %s", e)
+        logger.error("handle_watchlist_text failed (%s): %s", action, e)
         await update.message.reply_text(
-            "Could not update watchlist. Check Notion property names / types."
+            f"Could not update watchlist.\nError: {str(e)[:300]}"
         )
         
 async def create_access_request(user) -> tuple[bool, str]:
