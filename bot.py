@@ -1656,7 +1656,7 @@ async def status_cmd(
         f"Telegram User ID: {user.id}",
         "",
         f"Group member: {'Yes' if in_group else 'No'}",
-        f"Notion Authorised: {'Yes' if in_notion else 'No'}",
+        f"Group Authorised: {'Yes' if in_notion else 'No'}",
         "",
     ]
 
@@ -1676,7 +1676,7 @@ async def status_cmd(
             "Access requires all of:",
             "1) Valid Telegram user ID",
             "2) Membership of The Hive group",
-            "3) Status = Authorised in Notion",
+            "3) Status = Authorised in Group Access",
             "",
         ]
         if not in_group:
