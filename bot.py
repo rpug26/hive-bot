@@ -200,6 +200,41 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error("approve_cmd failed: %s", e)
         await update.message.reply_text(f"Error approving user:\n`{e}`", parse_mode="Markdown")
 
+def access_required_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📩 Request access", callback_data="access:request"
+                )
+            ],
+            [
+                InlineKeyboardButton("📋 Status", callback_data="access:status")
+            ],
+        ]
+    )
+
+async def reply_access_required(update: Update, *, edit: bool = False) -> None:
+    text = (
+        "🔒 *Authorised members only*\n\n"
+        "My Watchlist and My Stockpick need admin approval.\n\n"
+        "Tap **Request access** below (or send /request).\n"
+        "An admin will be notified to review your request."
+    )
+    markup = access_required_keyboard()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+        
 async def notify_admins_of_request(
     context: ContextTypes.DEFAULT_TYPE,
     user,
@@ -1199,7 +1234,9 @@ async def show_my_stockpicks(
     msg = update.callback_query.message if update.callback_query else update.message
 
     if not await is_authorized(update):
-        text = "🔒 Authorised members only."
+        await reply_access_required(update, edit=edit)
+        return
+        
         if edit:
             await msg.edit_text(text)
         else:
@@ -1325,7 +1362,9 @@ async def show_watchlist(
         return
 
     if not await is_authorized(update):
-        text = "Authorised members only."
+        await reply_access_required(update, edit=edit)
+        return
+        
         if edit:
             await msg.edit_text(text)
         else:
@@ -1792,6 +1831,7 @@ async def create_access_request(
         logger.error("Failed to create access request: %s", e)
         return False, str(e)
 
+    msg = update.effective_message  # works for message and callback
 async def request_access(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1877,6 +1917,7 @@ async def request_access(
         "Check progress anytime with /status."
     )
 
+    msg = update.effective_message  # works for message and callback
 async def status_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2169,6 +2210,20 @@ async def find_this_month_stockpick_page(user) -> str | None:
         parse_mode="Markdown",
     )
     
+async def access_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "access:request":
+        # Reuse the same /request flow (notifies admins)
+        await request_access(update, context)
+        return
+
+    if data == "access:status":
+        await status_cmd(update, context)
+        return
+        
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
@@ -2231,7 +2286,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
-
+    app.add_handler(CallbackQueryHandler(access_button, pattern=r"^access:"))
+    
     # Text messages + reply keyboard buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
