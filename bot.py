@@ -200,41 +200,6 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error("approve_cmd failed: %s", e)
         await update.message.reply_text(f"Error approving user:\n`{e}`", parse_mode="Markdown")
 
-def access_required_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "📩 Request access", callback_data="access:request"
-                )
-            ],
-            [
-                InlineKeyboardButton("📋 Status", callback_data="access:status")
-            ],
-        ]
-    )
-
-async def reply_access_required(update: Update, *, edit: bool = False) -> None:
-    text = (
-        "🔒 *Authorised members only*\n\n"
-        "My Watchlist and My Stockpick need admin approval.\n\n"
-        "Tap **Request access** below (or send /request).\n"
-        "An admin will be notified to review your request."
-    )
-    markup = access_required_keyboard()
-    if edit and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=markup
-        )
-    elif update.message:
-        await update.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=markup
-        )
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=markup
-        )
-        
 async def notify_admins_of_request(
     context: ContextTypes.DEFAULT_TYPE,
     user,
@@ -435,7 +400,9 @@ async def is_authorized(
     if not user:
         return False
 
-    if context is not None:
+    # Must still be in The Hive group (when configured)
+    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
+    if group_id and context is not None:
         in_group, _detail = await is_group_member(context, user.id)
         if not in_group:
             return False
@@ -496,7 +463,7 @@ async def sync_group_member_to_notion(
         notion.pages.update(
             page_id=results[0]["id"],
             properties={
-                "Group Member": {"select": {"name": status_label}},
+                "Group Member": {"checkbox": is_member}
             },
         )
         logger.info(
@@ -1009,7 +976,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
     if "#stockpick" in clean_lower:
-        if not await is_authorized(update):
+        if not await is_authorized(update, context):
             await update.message.reply_text(
                 "🔒 Only authorised members can submit a #stockpick.\n\n"
                 "Send /request to ask for access, then wait for an admin to approve you.\n"
@@ -1117,7 +1084,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
-    authorised = await is_authorized(update)
+    authorised = await is_authorized(update, context))
 
     if authorised:
         text = (
@@ -1210,7 +1177,7 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user:
         return
 
-    if not await is_authorized(update):
+    if not await is_authorized(update, context):
         await update.message.reply_text(
             "🔒 Only authorised members can use this.\n"
             "Send /request to ask for access."
@@ -1233,10 +1200,8 @@ async def show_my_stockpicks(
     user = update.effective_user
     msg = update.callback_query.message if update.callback_query else update.message
 
-    if not await is_authorized(update):
-        await reply_access_required(update, edit=edit)
-        return
-        
+    if not await is_authorized(update, context):
+        text = "🔒 Authorised members only."
         if edit:
             await msg.edit_text(text)
         else:
@@ -1361,10 +1326,8 @@ async def show_watchlist(
     if not msg or not user:
         return
 
-    if not await is_authorized(update):
-        await reply_access_required(update, edit=edit)
-        return
-        
+    if not await is_authorized(update, context):
+        text = "Authorised members only."
         if edit:
             await msg.edit_text(text)
         else:
@@ -1831,7 +1794,6 @@ async def create_access_request(
         logger.error("Failed to create access request: %s", e)
         return False, str(e)
 
-    msg = update.effective_message  # works for message and callback
 async def request_access(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1917,7 +1879,6 @@ async def request_access(
         "Check progress anytime with /status."
     )
 
-    msg = update.effective_message  # works for message and callback
 async def status_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -2210,19 +2171,93 @@ async def find_this_month_stockpick_page(user) -> str | None:
         parse_mode="Markdown",
     )
     
-async def access_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+from telegram.ext import ChatMemberHandler
+from telegram import ChatMemberUpdated, ChatMember
 
-    if data == "access:request":
-        # Reuse the same /request flow (notifies admins)
-        await request_access(update, context)
+
+def _extract_status_change(
+    update: ChatMemberUpdated,
+) -> tuple[str | None, str | None]:
+    """Return (old_status, new_status)."""
+    old = update.old_chat_member.status if update.old_chat_member else None
+    new = update.new_chat_member.status if update.new_chat_member else None
+    return old, new
+
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """When someone leaves/is kicked from the Hive group → mark Group Member = No."""
+    result = update.chat_member or update.my_chat_member
+    if not result:
         return
 
-    if data == "access:status":
-        await status_cmd(update, context)
+    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
+    if not group_id:
         return
+
+    try:
+        if str(result.chat.id) != str(int(group_id)):
+            return
+    except ValueError:
+        return
+
+    old_status, new_status = _extract_status_change(result)
+    left_statuses = {"left", "kicked"}
+    member_statuses = {"member", "administrator", "creator", "restricted"}
+
+    user = result.new_chat_member.user if result.new_chat_member else None
+    if not user or user.is_bot:
+        return
+
+    # Left or kicked
+    if new_status in left_statuses and old_status in member_statuses | {None}:
+        await mark_group_member_in_notion(user, is_member=False)
+        logger.info("User %s left group → Group Member = No", user.id)
+        return
+
+    # Joined / re-joined
+    if new_status in member_statuses and old_status in left_statuses | {None}:
+        await mark_group_member_in_notion(user, is_member=True)
+        logger.info("User %s joined group → Group Member = Yes", user.id)
+
+async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
+    """Update Group Member (and optionally Status) in the auth database."""
+    if not notion:
+        return
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            # No row yet – optional: create one with Group Member only
+            return
+
+        page_id = results[0]["id"]
+        props = {
+            # Adjust property name if yours is different (e.g. "Group Member")
+            "Group Member": {
+                "select": {"name": "Yes" if is_member else "No"}
+            },
+        }
+
+        # Optional: auto-revoke Authorised when they leave
+        if not is_member:
+            props["Status"] = {"select": {"name": "Pending"}}
+            # or use "Blocked" / "Rejected" if you prefer
+
+        notion.pages.update(page_id=page_id, properties=props)
+        _authorized_cache["expires"] = 0
+    except Exception as e:
+        logger.error("mark_group_member_in_notion failed for %s: %s", user.id, e)
         
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
@@ -2286,14 +2321,17 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
-    app.add_handler(CallbackQueryHandler(access_button, pattern=r"^access:"))
-    
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+
     # Text messages + reply keyboard buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     logger.info("Hive SupportBot starting...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
