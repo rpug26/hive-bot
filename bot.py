@@ -1084,7 +1084,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
-    authorised = await is_authorized(update, context))
+    authorised = await is_authorized(update, context)
 
     if authorised:
         text = (
