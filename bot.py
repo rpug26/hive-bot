@@ -1627,30 +1627,65 @@ async def request_access(
             f"Could not submit your request.\n\nError: {info}"
         )
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def status_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     user = update.effective_user
     if not user:
         return
 
-    authorised = await is_authorized(update)
+    # Live group check + write to Notion
+    in_group = await sync_group_member_to_notion(context, user)
+    if in_group is None:
+        in_group = await is_group_member(context, user.id)
+
+    # Must pass context so group membership is enforced
+    authorised = await is_authorized(update, context)
+
+    in_notion = False
+    auth = await get_authorized_users()
+    if user.username and user.username.lower() in auth.get("usernames", set()):
+        in_notion = True
+    if str(user.id) in auth.get("user_ids", set()):
+        in_notion = True
+
+    lines = [
+        "Access status",
+        "",
+        f"Name: {user.full_name}",
+        f"Username: @{user.username or 'N/A'}",
+        f"Telegram User ID: {user.id}",
+        "",
+        f"Group member: {'Yes' if in_group else 'No'}",
+        f"Notion Authorised: {'Yes' if in_notion else 'No'}",
+        "",
+    ]
 
     if authorised:
-        await update.message.reply_text(
-            f"✅ You are **Authorised**.\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"User ID: `{user.id}`",
-            parse_mode="Markdown",
-        )
+        lines += [
+            "Result: ACCESS GRANTED",
+            "",
+            "You can use the bot because:",
+            "1) Valid Telegram user ID",
+            "2) You are a member of The Hive group",
+            "3) Status is Authorised",
+        ]
     else:
-        await update.message.reply_text(
-            f"❌ You are **not authorised** yet.\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"User ID: `{user.id}`\n\n"
-            "Send /request to submit an access request.",
-            parse_mode="Markdown",
-        )
+        lines += [
+            "Result: ACCESS DENIED",
+            "",
+            "Access requires all of:",
+            "1) Valid Telegram user ID",
+            "2) Membership of The Hive group",
+            "3) Status = Authorised in Notion",
+            "",
+        ]
+        if not in_group:
+            lines.append("- Join The Hive group first, group link: https://t.me/+kqnqJM9XaNAzZTU8")
+        if not in_notion:
+            lines.append("- Send /request and wait for admin approval.")
+
+    await update.message.reply_text("\n".join(lines))
         
 async def schema_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Temporary: list properties of the auth database."""
