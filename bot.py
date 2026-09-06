@@ -1838,7 +1838,7 @@ async def request_access(
             "1) Valid Telegram user ID\n"
             "2) Be a member of The Hive group\n"
             "3) Admin approval (Status = Authorised)\n\n"
-            "Next step: join The Hive group, then send /request again."
+            "Next step: join The Hive group https://t.me/+kqnqJM9XaNAzZTU8, then send /request again."
         )
         return
         
