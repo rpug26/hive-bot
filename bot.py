@@ -340,7 +340,6 @@ async def is_authorized(
         return True
     return False
 
-
 async def sync_group_member_to_notion(
     context: ContextTypes.DEFAULT_TYPE,
     user,
@@ -1770,24 +1769,6 @@ async def get_authorized_users() -> dict:
     except Exception as e:
         logger.error("Failed to load authorised users: %s", e)
         return _authorized_cache.get("users", {"usernames": set(), "user_ids": set()})
-        
-async def is_authorized(update: Update) -> bool:
-    """True only if the user is in the Authorised list (by username or user ID)."""
-    user = update.effective_user
-    if not user:
-        return False
-
-    auth = await get_authorized_users()
-
-    # Check by username
-    if user.username and user.username.lower() in auth["usernames"]:
-        return True
-
-    # Check by numeric user ID
-    if str(user.id) in auth["user_ids"]:
-        return True
-
-    return False
 
 # ------------------------------------------------------------
 # Message handling – STRICT
@@ -1807,8 +1788,8 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
         return True
 
     # --- Authorisation (must be Status = Authorised) ---
-    if not await is_authorized(update):
-        return False
+	if not await is_authorized(update, context):
+ 	   return False
 
     # --- Trigger rules ---
     bot_username = (context.bot.username or "").lower()
