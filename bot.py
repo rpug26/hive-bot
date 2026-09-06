@@ -1227,12 +1227,24 @@ async def handle_watchlist_text(
                     "Please send a short list name, e.g. UK AIM Growth"
                 )
                 return
+
             _active_watchlist_name[user.id] = list_name
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
+                    InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+                ],
+                [
+                    InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
+                ],
+            ]
+
             await update.message.reply_text(
-                f"List set to: {list_name}\n\n"
-                "Next: open My Watchlist → Edit Watchlist → Add ticker\n"
-                "Format:\n"
-                "#TICKER | Company Name | https://t.me/+invite"
+                f"List set to: *{list_name}*\n\n"
+                "Next step: add your first ticker.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
             return
 
