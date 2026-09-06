@@ -2013,71 +2013,79 @@ async def request_access(
         "Check progress anytime with /status."
     )
 
-async def status_cmd(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
 
-    # 1) Live Telegram group check (True/False + reason)
+    msg = update.effective_message
+    authorised = await is_authorized(update, context)
     in_group, group_detail = await is_group_member(context, user.id)
 
-    # 2) Optional: update Notion "Group Member" field
-    try:
-        await sync_group_member_to_notion(context, user)
-    except Exception as e:
-        logger.warning("sync_group_member_to_notion failed: %s", e)
+    # Look up Notion row for this user (Date Added / join proxy)
+    member_since = None
+    notion_status = None
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
-    # 3) Full access rule (group + Notion)
-    authorised = await is_authorized(update, context)
+    if notion and db_id:
+        try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "Telegram User ID",
+                    "title": {"equals": str(user.id)},
+                },
+                page_size=1,
+            )
+            results = response.get("results", [])
+            if results:
+                props = results[0].get("properties", {})
+                notion_status = _get_plain_text(props.get("Status")) or None
 
-    # 4) Notion Authorised only
-    in_notion = False
-    auth = await get_authorized_users()
-    if user.username and user.username.lower() in auth.get("usernames", set()):
-        in_notion = True
-    if str(user.id) in auth.get("user_ids", set()):
-        in_notion = True
+                # Prefer Date Added; fall back to other date-style fields if you rename later
+                date_prop = (
+                    props.get("Date Added")
+                    or props.get("Joined")
+                    or props.get("Member Since")
+                )
+                if date_prop and date_prop.get("type") == "date":
+                    start = (date_prop.get("date") or {}).get("start")
+                    if start:
+                        # start is "YYYY-MM-DD" or datetime
+                        try:
+                            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                            member_since = dt.strftime("%B %Y")  # e.g. September 2026
+                        except Exception:
+                            member_since = start[:7]  # YYYY-MM fallback
+        except Exception as e:
+            logger.error("status_cmd Notion lookup failed: %s", e)
 
     lines = [
-        "Access status",
-        "",
-        f"Name: {user.full_name}",
-        f"Username: @{user.username or 'N/A'}",
-        f"Telegram User ID: {user.id}",
-        "",
-        f"Group member: {'Yes' if in_group else 'No'}",
-        f"Group check detail: {group_detail}",
-        f"Notion Authorised: {'Yes' if in_notion else 'No'}",
-        "",
+        "📋 *Your access status*\n",
+        f"• Name: {user.full_name}",
+        f"• Username: @{user.username or 'N/A'}",
+        f"• Telegram ID: `{user.id}`",
+        f"• Group member: {'Yes' if in_group else 'No'}",
     ]
 
-    if authorised:
-        lines += [
-            "Result: ACCESS GRANTED",
-            "",
-            "You can use the bot because:",
-            "1) Valid Telegram user ID",
-            "2) You are a member of The Hive group",
-            "3) Status is Authorised in Notion",
-        ]
-    else:
-        lines += [
-            "Result: ACCESS DENIED",
-            "",
-            "Access requires all of:",
-            "1) Valid Telegram user ID",
-            "2) Membership of The Hive group",
-            "3) Status = Authorised in Notion",
-        ]
-        if not in_group:
-            lines.append("- Group check failed — see Group check detail above.")
-        if not in_notion:
-            lines.append("- Send /request and wait for admin approval.")
+    if member_since:
+        lines.append(f"• Member of the group since: *{member_since}*")
+    elif in_group:
+        lines.append("• Member of the group since: _not recorded yet_")
 
-    await update.message.reply_text("\n".join(lines))
-        
+    if notion_status:
+        lines.append(f"• Admin status: *{notion_status}*")
+    else:
+        lines.append("• Admin status: _no record_")
+
+    if authorised:
+        lines.append("\n✅ *Result: ACCESS GRANTED*")
+    else:
+        lines.append("\n❌ *Result: NOT AUTHORISED*")
+        lines.append("Send /request to ask for access.")
+
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+    
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
 # ------------------------------------------------------------
