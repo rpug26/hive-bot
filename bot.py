@@ -1000,20 +1000,20 @@ async def show_my_stockpicks(
         await msg.reply_text("Could not load your stockpicks right now.")
 
 async def show_watchlist(
-        if update.callback_query:
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
+) -> None:
+    user = update.effective_user
+
+    if update.callback_query:
         msg = update.callback_query.message
     else:
         msg = update.message
 
     if not msg:
         return
-    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
-) -> None:
-    user = update.effective_user
-    msg = update.callback_query.message if update.callback_query else update.message
 
     if not await is_authorized(update):
-        text = "🔒 Authorised members only."
+        text = "Authorised members only."
         if edit:
             await msg.edit_text(text)
         else:
