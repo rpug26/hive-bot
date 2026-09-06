@@ -701,8 +701,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await mystockpick_cmd(update, context)
         return
 
-    if text in ("👀 My Watchlist", "My Watchlist"):
-        await show_watchlist(update, context, edit=False)
+    # My Watchlist (tolerate emoji variants)
+    if text in ("👀 My Watchlist", "My Watchlist") or (
+        "watchlist" in text.lower() and len(text) < 40
+    ):
+        try:
+            await show_watchlist(update, context, edit=False)
+        except Exception as e:
+            logger.error("My Watchlist button failed: %s", e)
+            await update.message.reply_text(
+                f"Could not open watchlist.\n`{e}`",
+                parse_mode="Markdown",
+            )
         return
 
     # Watchlist follow-up (add / change / delete / list actions)
@@ -990,6 +1000,13 @@ async def show_my_stockpicks(
         await msg.reply_text("Could not load your stockpicks right now.")
 
 async def show_watchlist(
+        if update.callback_query:
+        msg = update.callback_query.message
+    else:
+        msg = update.message
+
+    if not msg:
+        return
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
     user = update.effective_user
@@ -1033,17 +1050,22 @@ async def show_watchlist(
                 continue
             results.append(page)
 
-        lines = ["👀 *My Watchlist*\n", "`Ticker` | Name | Link\n"]
+        lines = [
+            "My Watchlist",
+            "",
+            "Ticker | Name | Link",
+            "",
+        ]
         if not results:
-            lines.append("_Empty — use **Edit Watchlist** to add tickers._\n")
+            lines.append("Empty — use Edit Watchlist to add tickers.")
         else:
             for page in results:
                 props = page.get("properties", {})
-                ticker = _get_plain_text(props.get("Ticker")) or "—"
-                name = _get_plain_text(props.get("Name")) or "—"
+                ticker = _get_plain_text(props.get("Ticker")) or "-"
+                name = _get_plain_text(props.get("Name")) or "-"
                 url = ((props.get("Group Link") or {}).get("url") or "").strip()
-                link_txt = f"[link]({url})" if url else "—"
-                lines.append(f"• `#{ticker}` | {name} | {link_txt}")
+                link_txt = url if url else "-"
+                lines.append(f"#{ticker} | {name} | {link_txt}")
 
         keyboard = [
             [
@@ -1062,27 +1084,20 @@ async def show_watchlist(
 
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(keyboard)
-        kwargs = dict(
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
+
         if edit:
-            await msg.edit_text(**kwargs)
+            await msg.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         else:
-            await msg.reply_text(**kwargs)
+            await msg.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
-        err = str(e)[:300]
         await msg.reply_text(
             "Could not load watchlist.\n\n"
-            f"`{err}`\n\n"
-            "Check: integration shared with Watchlist DB + NOTION_WATCHLIST_DB_ID.",
-            parse_mode="Markdown",
+            f"Error: {str(e)[:300]}\n\n"
+            "Check: integration shared with Watchlist DB + NOTION_WATCHLIST_DB_ID."
         )
-
+        
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
