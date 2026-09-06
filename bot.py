@@ -320,7 +320,9 @@ async def is_group_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> b
         logger.warning("Group membership check failed for %s: %s", user_id, e)
         return False
         
-async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
+async def is_authorized(
+    update: Update, context: ContextTypes.DEFAULT_TYPE | None = None
+) -> bool:
     user = update.effective_user
     if not user:
         return False
@@ -332,25 +334,20 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | Non
 
     # 2) Must be Authorised in Notion
     auth = await get_authorized_users()
-    if user.username and user.username.lower() in auth["usernames"]:
+    if user.username and user.username.lower() in auth.get("usernames", set()):
         return True
-    if str(user.id) in auth["user_ids"]:
+    if str(user.id) in auth.get("user_ids", set()):
         return True
     return False
-	if not await is_group_member(context, user.id):
- 	   await update.message.reply_text(
-  	      "This bot is only for members of The Hive group.\n"
-   	     "Join the group first, then send /request if you need access."
-    	)
-    	return
 
-    async def sync_group_member_to_notion(
+
+async def sync_group_member_to_notion(
     context: ContextTypes.DEFAULT_TYPE,
     user,
 ) -> bool | None:
     """
-    Check Telegram group membership and update Notion.
-    Returns True/False for member status, or None if check not possible.
+    Check Telegram group membership and update Notion "Group Member".
+    Returns True/False, or None if check not possible.
     """
     if not user or not notion:
         return None
@@ -360,7 +357,6 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | Non
     if not group_id or not db_id:
         return None
 
-    # 1) Telegram membership
     try:
         member = await context.bot.get_chat_member(
             chat_id=int(group_id),
@@ -378,7 +374,6 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | Non
 
     status_label = "Yes" if is_member else "No"
 
-    # 2) Find row by Telegram User ID (Title)
     try:
         response = notion.databases.query(
             database_id=db_id,
@@ -390,12 +385,10 @@ async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | Non
         )
         results = response.get("results", [])
         if not results:
-            # No row yet – optional: create a Pending row with membership
             return is_member
 
-        page_id = results[0]["id"]
         notion.pages.update(
-            page_id=page_id,
+            page_id=results[0]["id"],
             properties={
                 "Group Member": {"select": {"name": status_label}},
             },
@@ -1541,7 +1534,9 @@ async def handle_watchlist_text(
             f"Could not update watchlist.\nError: {str(e)[:300]}"
         )
         
-async def create_access_request(user) -> tuple[bool, str]:
+async def create_access_request(
+    user, *, is_group_member_flag: bool | None = None
+) -> tuple[bool, str]:
     """Create a Pending access request in Notion."""
     if not notion:
         return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
@@ -1552,15 +1547,19 @@ async def create_access_request(user) -> tuple[bool, str]:
 
     try:
         properties = {
-            # Title property
             "Telegram User ID": {
                 "title": [{"text": {"content": str(user.id)}}]
             },
-            "Status": {
-                "select": {"name": "Pending"}
-            },
+            "Status": {"select": {"name": "Pending"}},
             "Full Name": {
-                "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+                "rich_text": [
+                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
+                ]
+            },
+            "Date Added": {
+                "date": {
+                    "start": datetime.now(timezone.utc).date().isoformat()
+                }
             },
         }
 
@@ -1569,10 +1568,10 @@ async def create_access_request(user) -> tuple[bool, str]:
                 "rich_text": [{"text": {"content": user.username}}]
             }
 
-        # Optional: Date Added
-        properties["Date Added"] = {
-            "date": {"start": datetime.now(timezone.utc).date().isoformat()}
-        }
+        if is_group_member_flag is not None:
+            properties["Group Member"] = {
+                "select": {"name": "Yes" if is_group_member_flag else "No"}
+            }
 
         notion.pages.create(
             parent={"database_id": db_id},
@@ -1584,63 +1583,51 @@ async def create_access_request(user) -> tuple[bool, str]:
         logger.error("Failed to create access request: %s", e)
         return False, str(e)
 
-async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def request_access(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     user = update.effective_user
     if not user:
         return
 
-    if await is_authorized(update):
-        await update.message.reply_text("You are already authorised. You can use the bot.")
+    if await is_authorized(update, context):
+        await update.message.reply_text(
+            "You are already authorised. You can use the bot."
+        )
         return
 
-    success, info = await create_access_request(user)
+    # Membership check (and used for Notion)
+    in_group = await is_group_member(context, user.id)
+    if os.getenv("TELEGRAM_GROUP_ID") and not in_group:
+        await update.message.reply_text(
+            "This bot is only for members of The Hive group.\n"
+            "Join the group first, then send /request again."
+        )
+        return
+
+    success, info = await create_access_request(
+        user, is_group_member_flag=in_group
+    )
 
     if success:
+        # Ensure Group Member is synced (in case row already existed)
+        await sync_group_member_to_notion(context, user)
         await update.message.reply_text(
-            "✅ *Access request submitted*\n\n"
-            f"• Name: {user.full_name}\n"
-            f"• Username: @{user.username or 'N/A'}\n"
-            f"• Telegram User ID: `{user.id}`\n\n"
-            "Your request is now *Pending*.\n\n"
-            "⏳ *Next step:*\n"
-            "Please wait for an admin to change your Status to *Authorised* in Notion.\n\n"
-            "Check your status anytime with /status.",
-            parse_mode="Markdown",
+            "Access request submitted\n\n"
+            f"Name: {user.full_name}\n"
+            f"Username: @{user.username or 'N/A'}\n"
+            f"Telegram User ID: {user.id}\n"
+            f"Group member: {'Yes' if in_group else 'No'}\n\n"
+            "Status is now Pending.\n"
+            "An admin will set Status to Authorised in Notion.\n"
+            "Check anytime with /status."
         )
     else:
         await update.message.reply_text(
-            "❌ Could not submit your request.\n\n"
-            f"Error:\n`{info}`",
-            parse_mode="Markdown",
+            f"Could not submit your request.\n\nError: {info}"
         )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user:
-        return
-
-    authorised = await is_authorized(update)
-
-    if authorised:
-        await update.message.reply_text(
-            f"✅ You are **Authorised**.\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"User ID: `{user.id}`",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ You are **not authorised** yet.\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"User ID: `{user.id}`\n\n"
-            "Send /request to submit an access request.",
-            parse_mode="Markdown",
-        )
-        
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Let a user check whether they are authorised."""
     user = update.effective_user
     if not user:
         return
