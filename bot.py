@@ -610,6 +610,45 @@ def extract_hashtag_tickers(text: str) -> list[str]:
             found.append(t)
     return found
 
+MAX_WATCHLISTS = 3
+
+async def _fetch_user_watchlist_pages(user_id: int) -> list[dict]:
+    """All Notion rows for this Telegram user."""
+    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
+    if not notion or not db_id:
+        return []
+
+    response = notion.databases.query(
+        database_id=db_id,
+        filter={
+            "property": "Telegram User ID",
+            "rich_text": {"equals": str(user_id)},
+        },
+        page_size=100,
+    )
+    return response.get("results", [])
+
+def _list_names_from_pages(pages: list[dict]) -> list[str]:
+    names = []
+    for page in pages:
+        props = page.get("properties", {})
+        n = _get_plain_text(props.get("List Name")).strip() or "Default"
+        if n not in names:
+            names.append(n)
+    return names[:MAX_WATCHLISTS]
+
+def _tab_keyboard(list_names: list[str], active: str) -> list[list]:
+    """One row of tab buttons (max 3)."""
+    row = []
+    for name in list_names:
+        label = f"[{name}]" if name == active else name
+        # callback data must stay short
+        safe = name[:40]
+        row.append(
+            InlineKeyboardButton(label, callback_data=f"wl:tab:{safe}")
+        )
+    return [row] if row else []
+    
 def _is_current_month(date_str: str) -> bool:
     if not date_str or date_str == "—":
         return False
@@ -1003,13 +1042,11 @@ async def show_watchlist(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
     user = update.effective_user
-
     if update.callback_query:
         msg = update.callback_query.message
     else:
         msg = update.message
-
-    if not msg:
+    if not msg or not user:
         return
 
     if not await is_authorized(update):
@@ -1029,62 +1066,65 @@ async def show_watchlist(
         return
 
     try:
-        # Prefer filtered query; fall back to unfiltered if filter type fails
-        try:
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "property": "Telegram User ID",
-                    "rich_text": {"equals": str(user.id)},
-                },
-                page_size=30,
-            )
-        except Exception:
-            response = notion.databases.query(database_id=db_id, page_size=50)
+        pages = await _fetch_user_watchlist_pages(user.id)
+        list_names = _list_names_from_pages(pages)
 
-        results = []
-        for page in response.get("results", []):
+        # Active tab
+        active = _active_watchlist_name.get(user.id)
+        if not active or active not in list_names:
+            active = list_names[0] if list_names else "Default"
+            _active_watchlist_name[user.id] = active
+
+        # Rows for active list only
+        rows = []
+        for page in pages:
             props = page.get("properties", {})
-            owner = _get_plain_text(props.get("Telegram User ID")).strip()
-            if owner and owner != str(user.id):
+            ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+            if ln != active:
                 continue
-            results.append(page)
+            ticker = _get_plain_text(props.get("Ticker")) or "-"
+            name = _get_plain_text(props.get("Name")) or "-"
+            url = ((props.get("Group Link") or {}).get("url") or "").strip()
+            rows.append((ticker, name, url or "-"))
 
         lines = [
-            "My Watchlist",
+            f"My Watchlist  ({len(list_names)}/{MAX_WATCHLISTS})",
+            f"Active: {active}",
             "",
             "Ticker | Name | Link",
             "",
         ]
-        if not results:
+        if not rows:
             lines.append("Empty — use Edit Watchlist to add tickers.")
         else:
-            for page in results:
-                props = page.get("properties", {})
-                ticker = _get_plain_text(props.get("Ticker")) or "-"
-                name = _get_plain_text(props.get("Name")) or "-"
-                url = ((props.get("Group Link") or {}).get("url") or "").strip()
-                link_txt = url if url else "-"
-                lines.append(f"#{ticker} | {name} | {link_txt}")
+            for ticker, name, url in rows:
+                lines.append(f"#{ticker} | {name} | {url}")
 
-        keyboard = [
+        keyboard = []
+        # Tabs
+        keyboard.extend(_tab_keyboard(list_names, active))
+        # Manage
+        keyboard.append(
             [
-                InlineKeyboardButton("Create New Watchlist", callback_data="wl:create"),
-                InlineKeyboardButton("Edit Watchlist", callback_data="wl:edit_menu"),
-            ],
+                InlineKeyboardButton("Create New", callback_data="wl:create"),
+                InlineKeyboardButton("Edit list", callback_data="wl:edit_menu"),
+            ]
+        )
+        keyboard.append(
             [
-                InlineKeyboardButton("Rename Watchlist", callback_data="wl:rename"),
-                InlineKeyboardButton("Delete Watchlist", callback_data="wl:delete_list"),
-            ],
+                InlineKeyboardButton("Rename", callback_data="wl:rename"),
+                InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
+            ]
+        )
+        keyboard.append(
             [
-                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
-                InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
-            ],
-        ]
+                InlineKeyboardButton("Refresh", callback_data="hub:watchlist"),
+                InlineKeyboardButton("Back to Hub", callback_data="hub:home"),
+            ]
+        )
 
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(keyboard)
-
         if edit:
             await msg.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
         else:
@@ -1092,11 +1132,7 @@ async def show_watchlist(
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
-        await msg.reply_text(
-            "Could not load watchlist.\n\n"
-            f"Error: {str(e)[:300]}\n\n"
-            "Check: integration shared with Watchlist DB + NOTION_WATCHLIST_DB_ID."
-        )
+        await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1220,64 +1256,77 @@ async def handle_watchlist_text(
 
     try:
         # ----- Create list (name only) -----
-        if action == "create_list":
-            list_name = text.strip()
-            if not list_name or len(list_name) > 80:
-                await update.message.reply_text(
-                    "Please send a short list name, e.g. UK AIM Growth"
-                )
-                return
-
-            _active_watchlist_name[user.id] = list_name
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
-                    InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
-                ],
-                [
-                    InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
-                ],
-            ]
-
+            if action == "add":
+            list_name = _active_watchlist_name.get(user.id, "Default")
+            props = {
+                "Ticker": {"title": [{"text": {"content": ticker}}]},
+                "Name": {"rich_text": [{"text": {"content": (name or ticker)[:200]}}]},
+                "Telegram User ID": {
+                    "rich_text": [{"text": {"content": str(user.id)}}]
+                },
+                "List Name": {
+                    "rich_text": [{"text": {"content": list_name[:100]}}]
+                },
+            }
+            if link.startswith("http"):
+                props["Group Link"] = {"url": link}
+            if user.username:
+                props["Username"] = {
+                    "rich_text": [{"text": {"content": user.username}}]
+                }
+            notion.pages.create(parent={"database_id": db_id}, properties=props)
             await update.message.reply_text(
-                f"List set to: *{list_name}*\n\n"
-                "Next step: add your first ticker.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                f"Added #{ticker} to list: {list_name}"
             )
             return
 
         # ----- Rename list (memory only for now) -----
-        if action == "rename_list":
-            parts = [p.strip() for p in text.split("|")]
-            if len(parts) < 2:
-                await update.message.reply_text("Send: Old Name | New Name")
+            if action == "rename_list":
+            new_name = text.strip()
+            if not new_name or len(new_name) > 80:
+                await update.message.reply_text("Send a short new name.")
                 return
-            _active_watchlist_name[user.id] = parts[1]
+            old = _active_watchlist_name.get(user.id, "Default")
+            pages = await _fetch_user_watchlist_pages(user.id)
+            n = 0
+            for page in pages:
+                props = page.get("properties", {})
+                ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+                if ln != old:
+                    continue
+                notion.pages.update(
+                    page_id=page["id"],
+                    properties={
+                        "List Name": {
+                            "rich_text": [{"text": {"content": new_name[:100]}}]
+                        }
+                    },
+                )
+                n += 1
+            _active_watchlist_name[user.id] = new_name
             await update.message.reply_text(
-                f"Active list renamed to: {parts[1]}"
+                f"Renamed '{old}' → '{new_name}' ({n} items)."
             )
             return
 
         # ----- Delete list (archive all rows for this user; optional filter by name later) -----
         if action == "delete_list":
-            list_name = text.strip()
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "property": "Telegram User ID",
-                    "rich_text": {"equals": str(user.id)},
-                },
-                page_size=50,
-            )
-            count = 0
-            for page in response.get("results", []):
+            if text.strip().upper() != "YES":
+                await update.message.reply_text("Cancelled. Send YES to confirm delete.")
+                return
+            active = _active_watchlist_name.get(user.id, "Default")
+            pages = await _fetch_user_watchlist_pages(user.id)
+            n = 0
+            for page in pages:
+                props = page.get("properties", {})
+                ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+                if ln != active:
+                    continue
                 notion.pages.update(page_id=page["id"], archived=True)
-                count += 1
+                n += 1
             _active_watchlist_name.pop(user.id, None)
             await update.message.reply_text(
-                f"Removed {count} watchlist item(s) for your account."
+                f"Deleted list '{active}' ({n} items)."
             )
             return
 
