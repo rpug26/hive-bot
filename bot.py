@@ -1705,15 +1705,41 @@ async def create_access_request(
                 "rich_text": [{"text": {"content": user.username}}]
             }
 
-        if is_group_member_flag is not None:
-            properties["Group Member"] = {
-                "select": {"name": "Yes" if is_group_member_flag else "No"}
-            }
-
+        # Only include Group Member if we know the value.
+        # If the property does not exist, first create without it, then try update.
         notion.pages.create(
             parent={"database_id": db_id},
             properties=properties,
         )
+
+        # Best-effort: set Group Member after create
+        if is_group_member_flag is not None:
+            try:
+                response = notion.databases.query(
+                    database_id=db_id,
+                    filter={
+                        "property": "Telegram User ID",
+                        "title": {"equals": str(user.id)},
+                    },
+                    page_size=1,
+                )
+                results = response.get("results", [])
+                if results:
+                    notion.pages.update(
+                        page_id=results[0]["id"],
+                        properties={
+                            "Group Member": {
+                                "select": {
+                                    "name": "Yes" if is_group_member_flag else "No"
+                                }
+                            }
+                        },
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Could not set Group Member (property may be missing): %s", e
+                )
+
         return True, "OK"
 
     except Exception as e:
