@@ -247,6 +247,140 @@ async def notify_admins_of_request(
         except Exception as e:
             logger.error("Failed to notify admin %s: %s", admin_id, e)
             
+async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    if not is_admin(user):
+        await query.answer("Admins only.", show_alert=True)
+        return
+
+    data = query.data or ""
+    parts = data.split(":")
+    # admin:pending | admin:approve:123 | admin:reject:123
+    if len(parts) < 2:
+        return
+
+    action = parts[1]
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+
+    # ----- List all pending -----
+    if action == "pending":
+        if not notion or not db_id:
+            await query.message.reply_text("Notion is not configured.")
+            return
+        try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "Status",
+                    "select": {"equals": "Pending"},
+                },
+                page_size=20,
+            )
+            results = response.get("results", [])
+            if not results:
+                await query.message.reply_text("No pending requests.")
+                return
+
+            lines = ["⏳ *Pending access requests:*\n"]
+            rows = []
+            for page in results:
+                props = page.get("properties", {})
+                uid = _get_plain_text(props.get("Telegram User ID")) or "—"
+                name = _get_plain_text(props.get("Full Name")) or "—"
+                uname = _get_plain_text(props.get("Username")) or "—"
+                lines.append(f"• `{uid}` — {name} (@{uname})")
+                if uid.isdigit():
+                    rows.append(
+                        [
+                            InlineKeyboardButton(
+                                f"✅ {uid}", callback_data=f"admin:approve:{uid}"
+                            ),
+                            InlineKeyboardButton(
+                                f"🚫 {uid}", callback_data=f"admin:reject:{uid}"
+                            ),
+                        ]
+                    )
+
+            lines.append("\nTap a button to Approve / Reject:")
+            await query.message.reply_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+            )
+        except Exception as e:
+            logger.error("admin pending list failed: %s", e)
+            await query.message.reply_text(f"Error loading pending list:\n`{e}`", parse_mode="Markdown")
+        return
+
+    # ----- Approve / Reject one user -----
+    if action not in ("approve", "reject") or len(parts) < 3:
+        return
+
+    target_id = parts[2].strip()
+    if not notion or not db_id:
+        await query.message.reply_text("Notion is not configured.")
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": target_id},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            await query.message.reply_text(f"No request found for `{target_id}`.")
+            return
+
+        page_id = results[0]["id"]
+        new_status = "Authorised" if action == "approve" else "Rejected"
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Status": {"select": {"name": new_status}}},
+        )
+        _authorized_cache["expires"] = 0
+
+        if action == "approve":
+            await query.message.reply_text(
+                f"✅ User `{target_id}` is now *Authorised*.",
+                parse_mode="Markdown",
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "✅ Your access request was *approved*.\n\n"
+                        "Send /start to begin using the bot."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        else:
+            await query.message.reply_text(
+                f"🚫 User `{target_id}` has been *Rejected*.",
+                parse_mode="Markdown",
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "Your access request was not approved.\n"
+                        "Contact a Hive admin if you think this is a mistake."
+                    ),
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("admin_button failed: %s", e)
+        await query.message.reply_text(f"Error: {e}")
+        
 async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Optional: reject a user – /reject <telegram_user_id>"""
     user = update.effective_user
@@ -2322,6 +2456,11 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
+    app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
+    app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
+    app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))  # ← add this
 
     # Text messages + reply keyboard buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
