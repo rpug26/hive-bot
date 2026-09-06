@@ -1986,6 +1986,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("faq", faq))
@@ -1999,15 +2000,23 @@ def main() -> None:
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
-    # ... CallbackQueryHandlers and MessageHandler stay as they are
+
+    # Inline buttons (must be before run_polling)
+    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
+    app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
+    app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
+
+    # Text messages + reply keyboard buttons
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     logger.info("Hive SupportBot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
-    # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
 
 if __name__ == "__main__":
     main()
+
+
     
