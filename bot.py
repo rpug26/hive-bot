@@ -354,10 +354,10 @@ async def is_authorized(
     if not user:
         return False
 
-	if context is not None:
-    	in_group, _detail = await is_group_member(context, user.id)
-    	if not in_group:
-     	   return False
+    if context is not None:
+        in_group, _detail = await is_group_member(context, user.id)
+        if not in_group:
+            return False
 
     auth = await get_authorized_users()
     if user.username and user.username.lower() in auth.get("usernames", set()):
