@@ -919,7 +919,119 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await should_reply(update, context):
         return
 
-    # ... rest of handle_message (ticker / #stockpick) ...
+    # Clean bot mention out of the text
+    bot_username = (context.bot.username or "").lower()
+    clean_text = re.sub(
+        rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE
+    ).strip()
+    clean_lower = clean_text.lower()
+
+    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
+    if "#stockpick" in clean_lower:
+        if not await is_authorized(update):
+            await update.message.reply_text(
+                "🔒 Only authorised members can submit a #stockpick.\n\n"
+                "Send /request to ask for access, then wait for an admin to approve you.\n"
+                "Check status anytime with /status."
+            )
+            return
+
+        if await has_submitted_this_month(user):
+            month_name = datetime.now(timezone.utc).strftime("%B")
+            page_id = _last_stockpick_page.get(user.id)
+            if not page_id:
+                page_id = await find_this_month_stockpick_page(user)
+                if page_id:
+                    _last_stockpick_page[user.id] = page_id
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
+                "Each member may submit only **one** stockpick per month.\n"
+                "You can still add details or change this month’s pick:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        user_name = user.full_name if user else "Unknown"
+        tickers = extract_hashtag_tickers(clean_text)
+        ticker = tickers[0] if tickers else None
+        period_type, period_value = extract_period(clean_text)
+
+        page_id = await save_stockpick_to_notion(
+            clean_text,
+            user_name,
+            ticker,
+            period_type,
+            period_value,
+            user_id=user.id if user else None,
+        )
+
+        if page_id:
+            _last_stockpick_page[user.id] = page_id
+            reply = "✅ Captured your #stockpick"
+            if ticker:
+                reply += f" (#{ticker})"
+            if period_type and period_value:
+                reply += f"\n📅 {period_type}: *{period_value}*"
+            reply += "\nYour pick has been saved.\n\nWhat would you like to do next?"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                reply,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            await update.message.reply_text(
+                "✅ Received your #stockpick.\n"
+                "(Could not save it right now – please try again later or contact an admin.)"
+            )
+        return
+
+    # 2. Ticker lookup – ONLY from hashtags
+    tickers = extract_hashtag_tickers(clean_text)
+    if tickers:
+        for t in tickers:
+            data = await get_ticker_from_notion(t)
+            if data:
+                await update.message.reply_text(
+                    format_reply(t, data),
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"I don’t have *#{t}* in the current UK AIM Micro-Cap snapshot.",
+                    parse_mode="Markdown",
+                )
+        return
+
+    # 3. Pure @mention with no #ticker
+    await update.message.reply_text(
+        "Hi! To look up a ticker use:\n"
+        "`@Bot #KEFI summary` or `#KEFI snapshot`\n"
+        "Or use `#stockpick` to save an idea.",
+        parse_mode="Markdown",
+    )
     
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
