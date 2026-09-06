@@ -200,7 +200,53 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.error("approve_cmd failed: %s", e)
         await update.message.reply_text(f"Error approving user:\n`{e}`", parse_mode="Markdown")
 
-
+async def notify_admins_of_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    *,
+    in_group: bool,
+) -> None:
+    """DM all admins with a new access request + Approve/Reject buttons."""
+    text = (
+        "🔔 *New access request*\n\n"
+        f"• Name: {user.full_name or '—'}\n"
+        f"• Username: @{user.username or 'N/A'}\n"
+        f"• Telegram ID: `{user.id}`\n"
+        f"• Group member: {'Yes' if in_group else 'No'}\n"
+        f"• Status: *Pending*\n\n"
+        "Review with the buttons below, or use:\n"
+        f"`/approve {user.id}`\n"
+        f"`/reject {user.id}`\n"
+        "`/pending` for the full list"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Approve", callback_data=f"admin:approve:{user.id}"
+                ),
+                InlineKeyboardButton(
+                    "🚫 Reject", callback_data=f"admin:reject:{user.id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 All pending", callback_data="admin:pending"
+                ),
+            ],
+        ]
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.error("Failed to notify admin %s: %s", admin_id, e)
+            
 async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Optional: reject a user – /reject <telegram_user_id>"""
     user = update.effective_user
@@ -1793,7 +1839,10 @@ async def request_access(
             "Next step: join The Hive group, then send /request again."
         )
         return
-
+        
+    # Notify admins
+    await notify_admins_of_request(context, user, in_group=in_group)
+    
     # Submit Pending request
     success, info = await create_access_request(
         user, is_group_member_flag=in_group
