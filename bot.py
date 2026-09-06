@@ -304,14 +304,46 @@ async def get_authorized_usernames() -> set[str]:
         logger.error("Failed to load authorised users: %s", e)
         return _authorized_cache["usernames"]
 
-async def is_authorized(update: Update) -> bool:
-    user = update.effective_user
-    if not user or not user.username:
+async def is_group_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """True if user is in the configured Hive group."""
+    group_id = os.getenv("TELEGRAM_GROUP_ID")
+    if not group_id:
+        # If not configured, do not block on membership
+        return True
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=int(group_id),
+            user_id=user_id,
+        )
+        return member.status in ("creator", "administrator", "member", "restricted")
+    except Exception as e:
+        logger.warning("Group membership check failed for %s: %s", user_id, e)
         return False
-    authorized = await get_authorized_usernames()
-    return user.username.lower() in authorized
+        
+async def is_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
 
+    # 1) Must be in the Telegram group (if TELEGRAM_GROUP_ID is set)
+    if context is not None:
+        if not await is_group_member(context, user.id):
+            return False
 
+    # 2) Must be Authorised in Notion
+    auth = await get_authorized_users()
+    if user.username and user.username.lower() in auth["usernames"]:
+        return True
+    if str(user.id) in auth["user_ids"]:
+        return True
+    return False
+	if not await is_group_member(context, user.id):
+ 	   await update.message.reply_text(
+  	      "This bot is only for members of The Hive group.\n"
+   	     "Join the group first, then send /request if you need access."
+    	)
+    	return
+    
 async def get_ticker_from_notion(ticker: str) -> dict | None:
     if not notion or not NOTION_TICKERS_DB_ID:
         return None
