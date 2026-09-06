@@ -1787,9 +1787,9 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if chat_type == "private":
         return True
 
-    # --- Authorisation (must be Status = Authorised) ---
-	if not await is_authorized(update, context):
- 	   return False
+    # --- Authorisation (group + Notion Authorised) ---
+    if not await is_authorized(update, context):
+        return False
 
     # --- Trigger rules ---
     bot_username = (context.bot.username or "").lower()
