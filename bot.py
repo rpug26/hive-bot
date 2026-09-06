@@ -1727,42 +1727,80 @@ async def request_access(
     if not user:
         return
 
+    # Current checks
+    in_group, group_detail = await is_group_member(context, user.id)
+
+    auth = await get_authorized_users()
+    in_notion = False
+    if user.username and user.username.lower() in auth.get("usernames", set()):
+        in_notion = True
+    if str(user.id) in auth.get("user_ids", set()):
+        in_notion = True
+
+    has_valid_id = bool(user.id)
+
+    # Already fully authorised
     if await is_authorized(update, context):
         await update.message.reply_text(
-            "You are already authorised. You can use the bot."
+            "Access status\n\n"
+            f"Telegram User ID: {user.id}  OK\n"
+            f"Group member: Yes\n"
+            f"Admin authorised: Yes\n\n"
+            "Result: ACCESS GRANTED\n"
+            "You already have full access."
         )
         return
 
-    # Membership check (and used for Notion)
-    in_group = await is_group_member(context, user.id)
+    # Must be in the group first
     if os.getenv("TELEGRAM_GROUP_ID") and not in_group:
         await update.message.reply_text(
-            "This bot is only for members of The Hive group.\n"
-            "Join the group first, then send /request again."
+            "Access status\n\n"
+            f"Telegram User ID: {user.id}  {'OK' if has_valid_id else 'Missing'}\n"
+            f"Group member: No\n"
+            f"Detail: {group_detail}\n"
+            f"Admin authorised: {'Yes' if in_notion else 'No'}\n\n"
+            "Result: ACCESS DENIED\n\n"
+            "To get access you need all 3:\n"
+            "1) Valid Telegram user ID\n"
+            "2) Be a member of The Hive group\n"
+            "3) Admin approval (Status = Authorised)\n\n"
+            "Next step: join The Hive group, then send /request again."
         )
         return
 
+    # Submit Pending request
     success, info = await create_access_request(
         user, is_group_member_flag=in_group
     )
 
-    if success:
-        # Ensure Group Member is synced (in case row already existed)
+    if not success:
+        await update.message.reply_text(
+            "Could not submit your request.\n\n"
+            f"Error: {info}"
+        )
+        return
+
+    try:
         await sync_group_member_to_notion(context, user)
-        await update.message.reply_text(
-            "Access request submitted\n\n"
-            f"Name: {user.full_name}\n"
-            f"Username: @{user.username or 'N/A'}\n"
-            f"Telegram User ID: {user.id}\n"
-            f"Group member: {'Yes' if in_group else 'No'}\n\n"
-            "Status is now Pending.\n"
-            "An admin will set Status to Authorised in Notion.\n"
-            "Check anytime with /status."
-        )
-    else:
-        await update.message.reply_text(
-            f"Could not submit your request.\n\nError: {info}"
-        )
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        "Access request submitted\n\n"
+        f"Name: {user.full_name}\n"
+        f"Username: @{user.username or 'N/A'}\n"
+        f"Telegram User ID: {user.id}  OK\n"
+        f"Group member: {'Yes' if in_group else 'No'}\n"
+        f"Admin authorised: No (Pending)\n\n"
+        "Result: WAITING FOR ADMIN\n\n"
+        "You already have:\n"
+        "1) Valid Telegram user ID\n"
+        f"2) Group membership: {'Yes' if in_group else 'No'}\n\n"
+        "Still required:\n"
+        "3) Admin approval in Notion (Status = Authorised)\n\n"
+        "An admin will review your request.\n"
+        "Check progress anytime with /status."
+    )
 
 async def status_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
