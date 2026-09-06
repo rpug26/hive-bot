@@ -842,25 +842,25 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     text = (update.message.text or "").strip()
+    lower = text.lower()
 
-    # Persistent keyboard shortcuts (match full label from buttons)
-    if text in ("📋 Menu", "Menu"):
+    # --- Persistent keyboard shortcuts (robust match) ---
+    if text in ("📋 Menu", "Menu") or lower == "menu":
         await menu_cmd(update, context)
         return
 
-    if text in (
-        "📌 My Stockpick",
-        "📌 My🐝 Stockpick",
-        "My Stockpick",
-        "My🐝 Stockpick",
-    ):
-        await mystockpick_cmd(update, context)
+    if "my stockpick" in lower or "my🐝 stockpick" in lower:
+        try:
+            await mystockpick_cmd(update, context)
+        except Exception as e:
+            logger.error("My Stockpick button failed: %s", e)
+            await update.message.reply_text(
+                f"Could not open My Stockpick.\n`{e}`",
+                parse_mode="Markdown",
+            )
         return
 
-    # My Watchlist (tolerate emoji variants)
-    if text in ("👀 My Watchlist", "My Watchlist") or (
-        "watchlist" in text.lower() and len(text) < 40
-    ):
+    if "watchlist" in lower and len(text) < 40:
         try:
             await show_watchlist(update, context, edit=False)
         except Exception as e:
