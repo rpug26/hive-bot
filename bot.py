@@ -2328,7 +2328,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("Hive SupportBot starting...")
-        app.run_polling(
+    app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
