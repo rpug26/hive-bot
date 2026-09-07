@@ -1287,16 +1287,13 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "...your faq text...",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
         "• Use `#stockpick` in the group to log ideas.\n"
         "• Contact a human admin in The Hive group if something looks wrong.",
         parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
     )
 
 async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
