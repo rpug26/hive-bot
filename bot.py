@@ -675,18 +675,30 @@ async def save_stockpick_to_notion(
     period_type: str | None = None,
     period_value: str | None = None,
     user_id: int | None = None,
-) -> bool:
+):
+    """
+    Save a #stockpick into Hive Stock Picks.
+    Returns (page_id, error_message). page_id is None on failure.
+    """
     if not notion:
-        logger.error("Notion client is None – NOTION_TOKEN missing?")
-        return False
+        msg = "Notion client is None – NOTION_TOKEN missing?"
+        logger.error(msg)
+        return None, msg
 
-    db_id = os.getenv("NOTION_DATABASE_ID") or os.getenv("NOTION_STOCKPICKS_DB_ID")
-    if not db_id:
-        logger.error("NOTION_DATABASE_ID is missing")
-        return False
+    # Prefer dedicated stockpicks DB — never write picks into AIM research DB
+    db_id = (
+        os.getenv("NOTION_STOCKPICKS_DB_ID")
+        or os.getenv("NOTION_DATABASE_ID")
+        or "9095ded4ad6a4b25988719a77baba12f"
+    )
+    db_id = db_id.strip().replace("-", "")
+    # Notion accepts ids with or without dashes; keep dashed form for API
+    if len(db_id) == 32:
+        db_id = f"{db_id[:8]}-{db_id[8:12]}-{db_id[12:16]}-{db_id[16:20]}-{db_id[20:]}"
+
+    logger.info("Saving #stockpick to database_id=%s", db_id)
 
     try:
-        # Notes: period + uid for monthly limit checks
         notes_parts = []
         if period_type and period_value:
             notes_parts.append(f"{period_type}: {period_value}")
@@ -699,21 +711,15 @@ async def save_stockpick_to_notion(
             name = f"{name} ({period_value})"
 
         properties = {
-            "Name": {
-                "title": [{"text": {"content": name[:100]}}]
-            },
-            "Message": {
-                "rich_text": [{"text": {"content": text[:2000]}}]
-            },
+            "Name": {"title": [{"text": {"content": name[:100]}}]},
+            "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
             "Posted By": {
                 "rich_text": [{"text": {"content": (user_name or "Unknown")[:200]}}]
             },
             "Source Group": {
                 "rich_text": [{"text": {"content": "Telegram"}}]
             },
-            "Status": {
-                "select": {"name": "New"}
-            },
+            "Status": {"select": {"name": "New"}},
             "Telegram Date": {
                 "date": {"start": datetime.now(timezone.utc).date().isoformat()}
             },
@@ -721,7 +727,7 @@ async def save_stockpick_to_notion(
 
         if ticker:
             properties["Ticker"] = {
-                "rich_text": [{"text": {"content": ticker}}]
+                "rich_text": [{"text": {"content": ticker[:50]}}]
             }
 
         if notes:
@@ -733,18 +739,16 @@ async def save_stockpick_to_notion(
             parent={"database_id": db_id},
             properties=properties,
         )
+        page_id = page.get("id")
         logger.info(
-            "Saved #stockpick (ticker=%s, period=%s %s)",
-            ticker, period_type, period_value,
+            "Saved #stockpick page_id=%s ticker=%s",
+            page_id, ticker,
         )
-        return page.get("id")   # return page id instead of True
+        return page_id, None
     except Exception as e:
-        logger.error("Failed to write #stockpick to Notion: %s", e)
-        return None             # return None instead of False
-        
-    except Exception as e:
-        logger.error("Failed to write #stockpick to Notion: %s", e)
-        return False
+        msg = str(e)
+        logger.error("Failed to write #stockpick to Notion: %s", msg)
+        return None, msg
 
 async def has_submitted_this_month(user) -> bool:
     """
@@ -1153,7 +1157,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ticker = tickers[0] if tickers else None
         period_type, period_value = extract_period(clean_text)
 
-        page_id = await save_stockpick_to_notion(
+        page_id, save_error = await save_stockpick_to_notion(
             clean_text,
             user_name,
             ticker,
@@ -1189,7 +1193,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             await update.message.reply_text(
                 "✅ Received your #stockpick.\n"
-                "(Could not save it right now – please try again later or contact an admin.)"
+                f"(Could not save it right now.)\n\n"
+                f"Error: `{save_error or 'unknown'}`\n\n"
+                "Admin: check NOTION_STOCKPICKS_DB_ID + integration sharing.",
+                parse_mode="Markdown",
             )
         return
 
