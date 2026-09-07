@@ -897,15 +897,16 @@ async def stockpick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # Helpers
 # ------------------------------------------------------------
 def extract_hashtag_tickers(text: str) -> list[str]:
-    """Only extract tickers that appear as #TICKER (2-5 letters)."""
+    """Extract hashtag tickers: 1-5 chars, letters and/or digits (e.g. KEFI, 80M, RRR)."""
     if not text:
         return []
-    # Strict: must be a hashtag
-    matches = re.findall(r"#([A-Za-z]{2,5})\b", text)
+    # Letters and digits, 1–5 characters after #
+    matches = re.findall(r"#([A-Za-z0-9]{1,5})\b", text)
     found = []
     for m in matches:
         t = m.upper()
-        if t not in found and t.isalpha():
+        # Skip pure noise / common non-tickers if needed
+        if t not in found:
             found.append(t)
     return found
 
