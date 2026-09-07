@@ -2090,7 +2090,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
-    
+    )
+
+
+# ------------------------------------------------------------
+# Authorisation ...
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
 # ------------------------------------------------------------
