@@ -690,12 +690,14 @@ async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
     if not notion or not ticker:
         return []
 
-    db_id = (
-        (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip()
-        or (os.getenv("NOTION_DATABASE_ID") or "").strip()
-        or "9095ded4-ad6a-4b25-9887-19a77baba12f"
-    )
-    # Normalise UUID
+    # Prefer dedicated stockpicks DB only
+    db_id = (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip()
+    if not db_id:
+        db_id = "9095ded4-ad6a-4b25-9887-19a77baba12f"
+        logger.warning(
+            "NOTION_STOCKPICKS_DB_ID missing – using default Hive Stock Picks id"
+        )
+
     raw = db_id.replace("-", "")
     if len(raw) == 32:
         db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
@@ -704,37 +706,51 @@ async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
 
+    filters_to_try = [
+        {"property": "Ticker", "rich_text": {"equals": ticker}},
+        {"property": "Ticker", "rich_text": {"contains": ticker}},
+        {"property": "Stockpick & Month", "title": {"contains": ticker}},
+        {"property": "Message", "rich_text": {"contains": f"#{ticker}"}},
+    ]
+
     try:
-        cursor = None
-        while True:
-            kwargs = {
-                "database_id": db_id,
-                "page_size": 100,
-                "filter": {
-                    "property": "Ticker",
-                    "rich_text": {"equals": ticker},
-                },
-            }
-            if cursor:
-                kwargs["start_cursor"] = cursor
-
-            response = notion.databases.query(**kwargs)
-            for page in response.get("results", []):
-                props = page.get("properties", {})
-                posted_by = _get_plain_text(props.get("Posted By")).strip()
-                if not posted_by:
-                    continue
-                key = posted_by.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                names.append(posted_by)
-
-            if not response.get("has_more"):
+        results = []
+        for f in filters_to_try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter=f,
+                page_size=100,
+            )
+            results = response.get("results", [])
+            if results:
+                logger.info(
+                    "Stockpickers filter hit for %s via %s (%d rows)",
+                    ticker,
+                    f.get("property"),
+                    len(results),
+                )
                 break
-            cursor = response.get("next_cursor")
+
+        for page in results:
+            props = page.get("properties", {})
+            posted_by = _get_plain_text(props.get("Posted By")).strip()
+            if not posted_by:
+                # fallback: title
+                posted_by = _get_plain_text(props.get("Stockpick & Month")).strip()
+            if not posted_by:
+                continue
+            key = posted_by.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(posted_by)
+
+        if not names:
+            logger.info(
+                "No stockpickers found for %s in db %s", ticker, db_id
+            )
     except Exception as e:
-        logger.error("Stockpickers lookup failed for %s: %s", ticker, e)
+        logger.error("Stockpickers lookup failed for %s db=%s: %s", ticker, db_id, e)
 
     return names
     
@@ -1066,9 +1082,9 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
 
     if stockpickers:
         quoted = ", ".join(f'"{n}"' for n in stockpickers)
-        text += f"\n*#{ticker} Hive Stockpicker:* {quoted}\n"
+        text += f"\n*#{ticker} This Month Hive Stockpicker:* {quoted}\n"
     else:
-        text += f"\n*#{ticker} Hive Stockpicker:* _None yet_\n"
+        text += f"\n*#{ticker} This Month Hive Stockpicker:* _None yet_\n"
 
     text += (
         "\n_🔋🪫 Powered by: The Hive 🐝 BuzzBot Knowledge Hub. "
