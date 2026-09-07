@@ -610,73 +610,60 @@ async def sync_group_member_to_notion(
 
     return is_member
         
-async def get_ticker_from_notion(ticker: str) -> dict | None:
-    """Look up a ticker in UK AIM Micro-Cap (NOTION_TICKERS_DB_ID)."""
+async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
+    """
+    Return unique Posted By names from Hive Stock Picks for this ticker.
+    """
     if not notion or not ticker:
-        return None
+        return []
 
-    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
-    if not db_id:
-        logger.error("NOTION_TICKERS_DB_ID is missing")
-        return None
+    db_id = (
+        (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip()
+        or (os.getenv("NOTION_DATABASE_ID") or "").strip()
+        or "9095ded4-ad6a-4b25-9887-19a77baba12f"
+    )
+    # Normalise UUID
+    raw = db_id.replace("-", "")
+    if len(raw) == 32:
+        db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
 
     ticker = ticker.upper().strip()
-
-    # Cache
-    cached = _ticker_cache.get(ticker)
-    if cached and cached.get("expires", 0) > time.time():
-        return cached.get("data")
+    names: list[str] = []
+    seen: set[str] = set()
 
     try:
-        filters_to_try = [
-            {"property": "Ticker", "title": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"contains": ticker}},
-        ]
+        cursor = None
+        while True:
+            kwargs = {
+                "database_id": db_id,
+                "page_size": 100,
+                "filter": {
+                    "property": "Ticker",
+                    "rich_text": {"equals": ticker},
+                },
+            }
+            if cursor:
+                kwargs["start_cursor"] = cursor
 
-        results = []
-        for f in filters_to_try:
-            response = notion.databases.query(
-                database_id=db_id,
-                filter=f,
-                page_size=5,
-            )
-            results = response.get("results", [])
-            if results:
+            response = notion.databases.query(**kwargs)
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                posted_by = _get_plain_text(props.get("Posted By")).strip()
+                if not posted_by:
+                    continue
+                key = posted_by.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(posted_by)
+
+            if not response.get("has_more"):
                 break
-
-        if not results:
-            logger.info("No Notion page found for ticker: %s", ticker)
-            return None
-
-        props = results[0]["properties"]
-
-        def find_prop(*names):
-            for name in names:
-                if name in props:
-                    val = _get_plain_text(props[name])
-                    if val:
-                        return val
-            return ""
-
-        data = {
-            "company": find_prop("Company", "Name", "Company Name"),
-            "summary": find_prop(
-                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
-            ),
-            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
-            "company_overview": find_prop("Company Overview", "Investment Thesis"),
-        }
-
-        _ticker_cache[ticker] = {
-            "data": data,
-            "expires": time.time() + CACHE_TTL_SECONDS,
-        }
-        return data
-
+            cursor = response.get("next_cursor")
     except Exception as e:
-        logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
-        return None
+        logger.error("Stockpickers lookup failed for %s: %s", ticker, e)
+
+    return names
     
 async def save_stockpick_to_notion(
     text: str,
@@ -1100,31 +1087,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 props = {
                     "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
                 }
-                tickers = extract_hashtag_tickers(text)
-                if tickers:
-                    props["Ticker"] = {"rich_text": [{"text": {"content": tickers[0]}}]}
-                    props["Name"] = {
-                        "title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]
-                    }
-                notion.pages.update(page_id=page_id, properties=props)
-                await update.message.reply_text("✅ Your stockpick has been updated.")
-            else:
-                notion.pages.update(
-                    page_id=page_id,
-                    properties={
-                        field: {"rich_text": [{"text": {"content": text[:2000]}}]}
-                    },
-                )
-                await update.message.reply_text(
-                    f"✅ Added **{field}** to your stockpick.",
-                    parse_mode="Markdown",
-                )
-        except Exception as e:
-            logger.error("Failed to update stockpick field %s: %s", field, e)
-            await update.message.reply_text(
-                "Could not save that update. Please try again later."
-            )
-        return
+                    tickers = extract_hashtag_tickers(clean_text)
+                        if tickers:
+                            for t in tickers:
+                                try:
+                                    data = await get_ticker_from_notion(t)
+                                if data:
+                                try:
+                                    stockpickers = await get_stockpickers_for_ticker(t)
+                                except Exception as e:
+                                    logger.error("stockpickers failed for %s: %s", t, e)
+                                    stockpickers = []
+                                    body = format_reply(t, data, stockpickers)
+                                try:
+                                    await update.message.reply_text(body, parse_mode="Markdown")
+                                except Exception:
+                                    await update.message.reply_text(body)
+                            else:
+                                await update.message.reply_text(
+                                    f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot."
+                                )
+                        except Exception as e:
+                            logger.error("Ticker lookup path failed for %s: %s", t, e)
+                            await update.message.reply_text(
+                                f"Lookup failed for #{t}. Please try again.\n`{e}`"
+                            )
+                    return
 
     if not await should_reply(update, context):
         return
