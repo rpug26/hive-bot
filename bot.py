@@ -610,64 +610,61 @@ async def sync_group_member_to_notion(
 
     return is_member
         
-async def get_ticker_from_notion(ticker: str) -> dict | None:
-    if not notion or not NOTION_TICKERS_DB_ID:
-        return None
+async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
+    """
+    Return unique Posted By names from Hive Stock Picks for this ticker.
+    """
+    if not notion or not ticker:
+        return []
+
+    db_id = (
+        os.getenv("NOTION_STOCKPICKS_DB_ID")
+        or os.getenv("NOTION_DATABASE_ID")
+        or "9095ded4-ad6a-4b25-9887-19a77baba12f"
+    )
+    db_id = db_id.strip()
+    if len(db_id.replace("-", "")) == 32 and "-" not in db_id:
+        d = db_id.replace("-", "")
+        db_id = f"{d[:8]}-{d[8:12]}-{d[12:16]}-{d[16:20]}-{d[20:]}"
 
     ticker = ticker.upper().strip()
-
-    cached = _ticker_cache.get(ticker)
-    if cached and cached["expires"] > time.time():
-        return cached["data"]
+    names: list[str] = []
+    seen: set[str] = set()
 
     try:
-        filters_to_try = [
-            {"property": "Ticker", "title": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"equals": ticker}},
-            {"property": "Ticker", "rich_text": {"contains": ticker}},
-        ]
+        cursor = None
+        while True:
+            kwargs = {
+                "database_id": db_id,
+                "page_size": 100,
+                "filter": {
+                    "property": "Ticker",
+                    "rich_text": {"equals": ticker},
+                },
+            }
+            if cursor:
+                kwargs["start_cursor"] = cursor
 
-        results = []
-        for f in filters_to_try:
-            response = notion.databases.query(
-                database_id=NOTION_TICKERS_DB_ID,
-                filter=f,
-                page_size=5,
-            )
-            results = response.get("results", [])
-            if results:
+            response = notion.databases.query(**kwargs)
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                posted_by = _get_plain_text(props.get("Posted By")).strip()
+                if not posted_by:
+                    continue
+                key = posted_by.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(posted_by)
+
+            if not response.get("has_more"):
                 break
-
-        if not results:
-            logger.info("No Notion page found for ticker: %s", ticker)
-            return None
-
-        props = results[0]["properties"]
-
-        def find_prop(*names):
-            for name in names:
-                if name in props:
-                    val = _get_plain_text(props[name])
-                    if val:
-                        return val
-            return ""
-
-        data = {
-            "company": find_prop("Company", "Name", "Company Name"),
-            "summary": find_prop("Summary & Next Catalyst", "Summary", "Overview", "Thesis"),
-            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
-        }
-
-        _ticker_cache[ticker] = {
-            "data": data,
-            "expires": time.time() + CACHE_TTL_SECONDS,
-        }
-        return data
-
+            cursor = response.get("next_cursor")
     except Exception as e:
-        logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
-        return None
+        logger.error("Stockpickers lookup failed for %s: %s", ticker, e)
 
+    return names
+    
 async def save_stockpick_to_notion(
     text: str,
     user_name: str,
@@ -987,13 +984,24 @@ def has_intent_keyword(text: str) -> bool:
     lower = text.lower()
     return any(kw in lower for kw in INTENT_KEYWORDS)
 
-def format_reply(ticker: str, data: dict) -> str:
-    return (
+def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None) -> str:
+    text = (
         f"🔖📑 *#{ticker}* – {data.get('company') or 'N/A'}\n\n"
         f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
-        f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n\n"
-        f"_🔋🪫 Powered by: The Hive 🐝 BuzzBot Knowledge Hub. Not financial advice. DYOR._"
+        f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
     )
+
+    if stockpickers:
+        quoted = ", ".join(f'"{n}"' for n in stockpickers)
+        text += f"\n*#{ticker} Hive Stockpicker:* {quoted}\n"
+    else:
+        text += f"\n*#{ticker} Hive Stockpicker:* _None yet_\n"
+
+    text += (
+        "\n_🔋🪫 Powered by: The Hive 🐝 BuzzBot Knowledge Hub. "
+        "Not financial advice. DYOR._"
+    )
+    return text
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -1206,8 +1214,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for t in tickers:
             data = await get_ticker_from_notion(t)
             if data:
+                stockpickers = await get_stockpickers_for_ticker(t)
                 await update.message.reply_text(
-                    format_reply(t, data),
+                    format_reply(t, data, stockpickers),
                     parse_mode="Markdown",
                 )
             else:
