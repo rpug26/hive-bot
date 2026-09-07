@@ -1476,13 +1476,23 @@ async def show_my_stockpicks(
         response = notion.databases.query(database_id=db_id, page_size=50)
         uid_marker = f"uid:{user.id}"
         user_name = (user.full_name or "").strip().lower()
+        username = (user.username or "").strip().lower()
         rows = []
 
         for page in response.get("results", []):
             props = page.get("properties", {})
             notes = _get_plain_text(props.get("Notes")).lower()
             posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
-            if uid_marker not in notes and posted_by != user_name:
+            message = _get_plain_text(props.get("Message")).lower()
+
+            is_mine = (
+                uid_marker in notes
+                or (user_name and posted_by == user_name)
+                or (username and username in posted_by)
+                or (username and f"@{username}" in posted_by)
+                or (user_name and user_name in posted_by)
+            )
+            if not is_mine:
                 continue
 
             date_prop = (props.get("Telegram Date") or {}).get("date") or {}
