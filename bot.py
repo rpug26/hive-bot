@@ -610,6 +610,79 @@ async def sync_group_member_to_notion(
 
     return is_member
         
+async def get_ticker_from_notion(ticker: str) -> dict | None:
+    """Look up a ticker in UK AIM Micro-Cap (NOTION_TICKERS_DB_ID)."""
+    if not notion or not ticker:
+        return None
+
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
+    if not db_id:
+        logger.error("NOTION_TICKERS_DB_ID is missing")
+        return None
+
+    # Normalise UUID if needed
+    raw = db_id.replace("-", "")
+    if len(raw) == 32 and "-" not in db_id:
+        db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+
+    ticker = ticker.upper().strip()
+
+    # Cache
+    cached = _ticker_cache.get(ticker)
+    if cached and cached.get("expires", 0) > time.time():
+        return cached.get("data")
+
+    try:
+        filters_to_try = [
+            {"property": "Ticker", "title": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"contains": ticker}},
+        ]
+
+        results = []
+        for f in filters_to_try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter=f,
+                page_size=5,
+            )
+            results = response.get("results", [])
+            if results:
+                break
+
+        if not results:
+            logger.info("No Notion page found for ticker: %s", ticker)
+            return None
+
+        props = results[0]["properties"]
+
+        def find_prop(*names):
+            for name in names:
+                if name in props:
+                    val = _get_plain_text(props[name])
+                    if val:
+                        return val
+            return ""
+
+        data = {
+            "company": find_prop("Company", "Name", "Company Name"),
+            "summary": find_prop(
+                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
+            ),
+            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
+            "company_overview": find_prop("Company Overview", "Investment Thesis"),
+        }
+
+        _ticker_cache[ticker] = {
+            "data": data,
+            "expires": time.time() + CACHE_TTL_SECONDS,
+        }
+        return data
+
+    except Exception as e:
+        logger.error("Notion ticker lookup failed for %s: %s", e)
+        return None
+        
 async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
     """
     Return unique Posted By names from Hive Stock Picks for this ticker.
