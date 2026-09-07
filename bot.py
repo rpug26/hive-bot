@@ -1041,7 +1041,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (update.message.text or "").strip()
     lower = text.lower()
 
-    # --- Persistent keyboard shortcuts (robust match) ---
+    # --- Persistent keyboard shortcuts ---
     if text in ("📋 Menu", "Menu") or lower == "menu":
         await menu_cmd(update, context)
         return
@@ -1068,13 +1068,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         return
 
-    # Watchlist follow-up (add / change / delete / list actions)
+    # Watchlist follow-up
     if user and user.id in _awaiting_watchlist:
         action = _awaiting_watchlist.pop(user.id)
         await handle_watchlist_text(update, context, action, text)
         return
 
-        # Stockpick field follow-up
+    # Stockpick field follow-up
     if user and user.id in _awaiting_field:
         field = _awaiting_field.pop(user.id)
         page_id = _last_stockpick_page.get(user.id)
@@ -1091,13 +1091,131 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         "rich_text": [{"text": {"content": text[:2000]}}]
                     },
                 }
-                
-    # 1. #stockpick capture – AUTHORISED + ONE PER MONTH
-    if "#stockpick" in clean_lower:
-        # ... keep your existing #stockpick block unchanged ...
+                tickers = extract_hashtag_tickers(text)
+                if tickers:
+                    props["Ticker"] = {
+                        "rich_text": [{"text": {"content": tickers[0]}}]
+                    }
+                    props["Stockpick & Month"] = {
+                        "title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]
+                    }
+                notion.pages.update(page_id=page_id, properties=props)
+                await update.message.reply_text("✅ Your stockpick has been updated.")
+            else:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={
+                        field: {
+                            "rich_text": [{"text": {"content": text[:2000]}}]
+                        }
+                    },
+                )
+                await update.message.reply_text(
+                    f"✅ Added **{field}** to your stockpick.",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            logger.error("Failed to update stockpick field %s: %s", field, e)
+            await update.message.reply_text(
+                "Could not save that update. Please try again later."
+            )
         return
 
-    # 2. Ticker lookup – ONLY from hashtags
+    if not await should_reply(update, context):
+        return
+
+    bot_username = (context.bot.username or "").lower()
+    clean_text = re.sub(
+        rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE
+    ).strip()
+    clean_lower = clean_text.lower()
+
+    # 1. #stockpick capture
+    if "#stockpick" in clean_lower:
+        if not await is_authorized(update, context):
+            await update.message.reply_text(
+                "🔒 Only authorised members can submit a #stockpick.\n\n"
+                "Send /request to ask for access, then wait for an admin to approve you.\n"
+                "Check status anytime with /status."
+            )
+            return
+
+        if await has_submitted_this_month(user):
+            month_name = datetime.now(timezone.utc).strftime("%B")
+            page_id = _last_stockpick_page.get(user.id)
+            if not page_id:
+                page_id = await find_this_month_stockpick_page(user)
+                if page_id:
+                    _last_stockpick_page[user.id] = page_id
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
+                "Each member may submit only **one** stockpick per month.\n"
+                "You can still add details or change this month’s pick:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        user_name = user.full_name if user else "Unknown"
+        tickers = extract_hashtag_tickers(clean_text)
+        ticker = tickers[0] if tickers else None
+        period_type, period_value = extract_period(clean_text)
+
+        page_id, save_error = await save_stockpick_to_notion(
+            clean_text,
+            user_name,
+            ticker,
+            period_type,
+            period_value,
+            user_id=user.id if user else None,
+        )
+
+        if page_id:
+            _last_stockpick_page[user.id] = page_id
+            reply = "✅ Captured your #stockpick"
+            if ticker:
+                reply += f" (#{ticker})"
+            if period_type and period_value:
+                reply += f"\n📅 {period_type}: *{period_value}*"
+            reply += "\nYour pick has been saved.\n\nWhat would you like to do next?"
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
+            await update.message.reply_text(
+                reply,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        else:
+            await update.message.reply_text(
+                "✅ Received your #stockpick.\n"
+                f"(Could not save it right now.)\n\n"
+                f"Error: `{save_error or 'unknown'}`\n\n"
+                "Admin: check NOTION_STOCKPICKS_DB_ID + integration sharing.",
+                parse_mode="Markdown",
+            )
+        return
+
+    # 2. Ticker lookup
     tickers = extract_hashtag_tickers(clean_text)
     if tickers:
         for t in tickers:
@@ -1111,9 +1229,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         stockpickers = []
                     body = format_reply(t, data, stockpickers)
                     try:
-                        await update.message.reply_text(
-                            body, parse_mode="Markdown"
-                        )
+                        await update.message.reply_text(body, parse_mode="Markdown")
                     except Exception:
                         await update.message.reply_text(body)
                 else:
