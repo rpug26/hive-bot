@@ -610,60 +610,73 @@ async def sync_group_member_to_notion(
 
     return is_member
         
-async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
-    """
-    Return unique Posted By names from Hive Stock Picks for this ticker.
-    """
+async def get_ticker_from_notion(ticker: str) -> dict | None:
+    """Look up a ticker in UK AIM Micro-Cap (NOTION_TICKERS_DB_ID)."""
     if not notion or not ticker:
-        return []
+        return None
 
-    db_id = (
-        os.getenv("NOTION_STOCKPICKS_DB_ID")
-        or os.getenv("NOTION_DATABASE_ID")
-        or "9095ded4-ad6a-4b25-9887-19a77baba12f"
-    )
-    db_id = db_id.strip()
-    if len(db_id.replace("-", "")) == 32 and "-" not in db_id:
-        d = db_id.replace("-", "")
-        db_id = f"{d[:8]}-{d[8:12]}-{d[12:16]}-{d[16:20]}-{d[20:]}"
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
+    if not db_id:
+        logger.error("NOTION_TICKERS_DB_ID is missing")
+        return None
 
     ticker = ticker.upper().strip()
-    names: list[str] = []
-    seen: set[str] = set()
+
+    # Cache
+    cached = _ticker_cache.get(ticker)
+    if cached and cached.get("expires", 0) > time.time():
+        return cached.get("data")
 
     try:
-        cursor = None
-        while True:
-            kwargs = {
-                "database_id": db_id,
-                "page_size": 100,
-                "filter": {
-                    "property": "Ticker",
-                    "rich_text": {"equals": ticker},
-                },
-            }
-            if cursor:
-                kwargs["start_cursor"] = cursor
+        filters_to_try = [
+            {"property": "Ticker", "title": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"equals": ticker}},
+            {"property": "Ticker", "rich_text": {"contains": ticker}},
+        ]
 
-            response = notion.databases.query(**kwargs)
-            for page in response.get("results", []):
-                props = page.get("properties", {})
-                posted_by = _get_plain_text(props.get("Posted By")).strip()
-                if not posted_by:
-                    continue
-                key = posted_by.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                names.append(posted_by)
-
-            if not response.get("has_more"):
+        results = []
+        for f in filters_to_try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter=f,
+                page_size=5,
+            )
+            results = response.get("results", [])
+            if results:
                 break
-            cursor = response.get("next_cursor")
-    except Exception as e:
-        logger.error("Stockpickers lookup failed for %s: %s", ticker, e)
 
-    return names
+        if not results:
+            logger.info("No Notion page found for ticker: %s", ticker)
+            return None
+
+        props = results[0]["properties"]
+
+        def find_prop(*names):
+            for name in names:
+                if name in props:
+                    val = _get_plain_text(props[name])
+                    if val:
+                        return val
+            return ""
+
+        data = {
+            "company": find_prop("Company", "Name", "Company Name"),
+            "summary": find_prop(
+                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
+            ),
+            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
+            "company_overview": find_prop("Company Overview", "Investment Thesis"),
+        }
+
+        _ticker_cache[ticker] = {
+            "data": data,
+            "expires": time.time() + CACHE_TTL_SECONDS,
+        }
+        return data
+
+    except Exception as e:
+        logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
+        return None
     
 async def save_stockpick_to_notion(
     text: str,
@@ -2221,6 +2234,11 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if has_stockpick:
         return True
 
+    # Allow #TICKER + intent word (snapshot / summary / thesis / …)
+    if hashtag_tickers and has_intent_keyword(text):
+        return True
+
+    # Allow @Bot + #TICKER
     if has_mention and hashtag_tickers:
         return True
 
