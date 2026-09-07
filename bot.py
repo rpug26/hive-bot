@@ -711,7 +711,7 @@ async def save_stockpick_to_notion(
             name = f"{name} ({period_value})"
 
         properties = {
-            "Name": {"title": [{"text": {"content": name[:100]}}]},
+            "Stockpick & Month": {"title": [{"text": {"content": name[:100]}}]},
             "Message": {"rich_text": [{"text": {"content": text[:2000]}}]},
             "Posted By": {
                 "rich_text": [{"text": {"content": (user_name or "Unknown")[:200]}}]
