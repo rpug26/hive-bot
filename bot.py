@@ -999,7 +999,9 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("👀 My Watchlist"),
             ],
         ],
-        resize_keyboard=True,
+        resize_keyboard=True,   # fits mobile screens
+        is_persistent=True,     # always available at the bottom
+        one_time_keyboard=False,
     )
 
 def menu_inline_keyboard() -> InlineKeyboardMarkup:
@@ -1246,7 +1248,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the main menu."""
     await update.message.reply_text(
         "🐝 *BuzzBot Menu*\n\n"
         "• /start – Welcome & status\n"
@@ -1258,9 +1259,9 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "In the group: `@Bot #TICKER` to look up a stock\n"
         "Or use `#stockpick your idea` to save one.",
         parse_mode="Markdown",
-        reply_markup=menu_inline_keyboard() if "menu_inline_keyboard" in dir() else None,
+        reply_markup=main_reply_keyboard(),
     )
-
+    
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1286,6 +1287,10 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
+        "...your faq text...",
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
+    )
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
@@ -2084,7 +2089,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("\n❌ *Result: NOT AUTHORISED*")
         lines.append("Send /request to ask for access.")
 
-    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+    await msg.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
     
 # ------------------------------------------------------------
 # Authorisation (Status = "Authorised" required)
