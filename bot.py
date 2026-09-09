@@ -662,24 +662,9 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                 ticker, db_id, last_err,
             )
             return None
-            
-        data = {
-            "company": find_prop("Company", "Name", "Company Name"),
-            "summary": find_prop(
-                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
-            ),
-            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
-            "company_overview": find_prop("Company Overview", "Investment Thesis"),
-        }
-
-        _ticker_cache[ticker] = {
-            "data": data,
-            "expires": time.time() + CACHE_TTL_SECONDS,
-        }
-        return data
 
     except Exception as e:
-        logger.error("Notion ticker lookup failed for %s: %s", e)
+        logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
         return None
         
 async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
