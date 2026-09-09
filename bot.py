@@ -637,11 +637,9 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             {"property": "Ticker", "title": {"equals": ticker}},
             {"property": "Ticker", "rich_text": {"equals": ticker}},
             {"property": "Ticker", "rich_text": {"contains": ticker}},
-            {"property": "Name", "title": {"equals": ticker}},
         ]
 
         results = []
-        last_err = None
         for f in filters_to_try:
             try:
                 response = notion.databases.query(
@@ -653,15 +651,40 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                 if results:
                     break
             except Exception as fe:
-                last_err = fe
                 logger.warning("Ticker filter failed %s: %s", f, fe)
 
         if not results:
-            logger.info(
-                "No Notion page for ticker=%s db=%s last_err=%s",
-                ticker, db_id, last_err,
-            )
+            logger.info("No Notion page for ticker=%s db=%s", ticker, db_id)
             return None
+
+        # --- THIS BLOCK WAS MISSING ---
+        props = results[0]["properties"]
+
+        def find_prop(*names):
+            for name in names:
+                if name in props:
+                    val = _get_plain_text(props[name])
+                    if val:
+                        return val
+            return ""
+
+        data = {
+            "company": find_prop("Company", "Name", "Company Name"),
+            "summary": find_prop(
+                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
+            ),
+            "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
+            "company_overview": find_prop("Company Overview", "Investment Thesis"),
+            "status": find_prop("Status"),
+        }
+
+        _ticker_cache[ticker] = {
+            "data": data,
+            "expires": time.time() + CACHE_TTL_SECONDS,
+        }
+        logger.info("Found ticker %s – company=%s", ticker, data.get("company"))
+        return data
+        # --- END ---
 
     except Exception as e:
         logger.error("Notion ticker lookup failed for %s: %s", ticker, e)
