@@ -637,33 +637,32 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             {"property": "Ticker", "title": {"equals": ticker}},
             {"property": "Ticker", "rich_text": {"equals": ticker}},
             {"property": "Ticker", "rich_text": {"contains": ticker}},
+            {"property": "Name", "title": {"equals": ticker}},
         ]
 
         results = []
+        last_err = None
         for f in filters_to_try:
-            response = notion.databases.query(
-                database_id=db_id,
-                filter=f,
-                page_size=5,
-            )
-            results = response.get("results", [])
-            if results:
-                break
+            try:
+                response = notion.databases.query(
+                    database_id=db_id,
+                    filter=f,
+                    page_size=5,
+                )
+                results = response.get("results", [])
+                if results:
+                    break
+            except Exception as fe:
+                last_err = fe
+                logger.warning("Ticker filter failed %s: %s", f, fe)
 
         if not results:
-            logger.info("No Notion page found for ticker: %s", ticker)
+            logger.info(
+                "No Notion page for ticker=%s db=%s last_err=%s",
+                ticker, db_id, last_err,
+            )
             return None
-
-        props = results[0]["properties"]
-
-        def find_prop(*names):
-            for name in names:
-                if name in props:
-                    val = _get_plain_text(props[name])
-                    if val:
-                        return val
-            return ""
-
+            
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
             "summary": find_prop(
