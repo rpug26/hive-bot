@@ -534,11 +534,19 @@ async def is_authorized(
     if not user:
         return False
 
+    # Admins always authorised
+    if is_admin(user):
+        return True
+
     # Must still be in The Hive group (when configured)
     group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
     if group_id and context is not None:
-        in_group, _detail = await is_group_member(context, user.id)
+        in_group, detail = await is_group_member(context, user.id)
         if not in_group:
+            logger.info(
+                "Auth denied for %s – not in group (%s)",
+                user.id, detail,
+            )
             return False
 
     auth = await get_authorized_users()
