@@ -2315,6 +2315,15 @@ async def get_authorized_users() -> dict:
 # ------------------------------------------------------------
 
 async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Private: allow (menus / stockpick follow-ups already handled above).
+
+    Group (HARD RULE):
+      - user must be authorised
+      - message must include @BotUsername
+      - message must include at least one #TICKER (e.g. #ALRT)
+    Otherwise stay silent.
+    """
     msg = update.message
     if not msg or not msg.text:
         return False
@@ -2323,45 +2332,45 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     lower = text.lower()
     chat_type = msg.chat.type
 
-    # Private chats always allowed
+    # Private chats always allowed past this gate
     if chat_type == "private":
         return True
 
-    # --- Authorisation (group + Notion Authorised) ---
+    # ----- GROUP ONLY FROM HERE -----
+
+    # 1) Authorised members only
     if not await is_authorized(update, context):
+        logger.info(
+            "Group message ignored – user not authorised (user_id=%s)",
+            update.effective_user.id if update.effective_user else None,
+        )
         return False
 
-    # --- Trigger rules ---
+    # 2) Must @mention the bot
     bot_username = (context.bot.username or "").lower()
-
     has_mention = False
     if bot_username:
         if msg.entities:
             for entity in msg.entities:
                 if entity.type == "mention":
-                    mention = text[entity.offset : entity.offset + entity.length].lower()
+                    mention = text[
+                        entity.offset : entity.offset + entity.length
+                    ].lower()
                     if mention == f"@{bot_username}":
                         has_mention = True
                         break
-        if f"@{bot_username}" in lower:
+        if not has_mention and f"@{bot_username}" in lower:
             has_mention = True
 
+    # 3) Must include a #TICKER hashtag
     hashtag_tickers = extract_hashtag_tickers(text)
-    has_stockpick = "#stockpick" in lower
 
-    if has_stockpick:
-        return True
-
-    # Allow #TICKER + intent word (snapshot / summary / thesis / …)
-    if hashtag_tickers and has_intent_keyword(text):
-        return True
-
-    # Allow @Bot + #TICKER
     if has_mention and hashtag_tickers:
         return True
 
+    # Everything else in the group: stay mute
     return False
-
+    
 async def find_this_month_stockpick_page(user) -> str | None:
     """Return Notion page id for this user's stockpick in the current month."""
     if not notion or not user:
