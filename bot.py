@@ -69,6 +69,10 @@ _awaiting_field: dict[int, str] = {}
 _awaiting_watchlist: dict[int, str] = {}
 # user_id -> True while waiting for link search query
 _awaiting_link: dict[int, bool] = {}
+# admin_id -> Group Links request they are fulfilling (paste URL next)
+_awaiting_admin_glink: dict[int, dict] = {}
+# short req_id -> pending Group Links request details
+_glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 MAX_WATCHLISTS = 3
 _authorized_cache: dict = {"usernames": set(), "expires": 0}
@@ -267,29 +271,66 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     action = parts[1]
     db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
-    # ----- Notify user that Group Link was added -----
-    if action == "glinkdone":
+    # ----- Group Links request management -----
+    if action in ("glinkadd", "glinkdone", "glinkpending"):
         if len(parts) < 3:
             return
-        target_id = parts[2].strip()
-        search_q = parts[3] if len(parts) > 3 else ""
-        try:
-            await context.bot.send_message(
-                chat_id=int(target_id),
-                text=(
-                    "🔗 Your Group Links request has been updated.\n\n"
-                    + (f"Search again for: {search_q}\n" if search_q else "")
-                    + "Tap 🔗 Group Links to look it up."
-                ),
-            )
+        req_id = parts[2].strip()
+        req = _glink_requests.get(req_id)
+        if not req:
             await query.message.reply_text(
-                f"✅ User `{target_id}` has been notified.",
+                "This Group Links request expired or is unknown. Ask the user to search again."
+            )
+            return
+
+        target_id = req["user_id"]
+        search_q = req.get("query") or req.get("ticker") or ""
+
+        if action == "glinkpending":
+            await query.message.reply_text(
+                f"⏳ Marked *Pending* for request `{req_id}` (`{search_q}`).\n"
+                f"User `{target_id}` has not been notified yet.",
                 parse_mode="Markdown",
             )
-        except Exception as e:
-            logger.error("glinkdone notify failed: %s", e)
-            await query.message.reply_text(f"Could not notify user: {e}")
-        return
+            return
+
+        if action == "glinkdone":
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "🔗 Your Group Links request has been updated.\n\n"
+                        + (f"Search again for: {search_q}\n" if search_q else "")
+                        + "Tap 🔗 Group Links to look it up."
+                    ),
+                )
+                await query.message.reply_text(
+                    f"✅ User `{target_id}` notified for `{search_q}`.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error("glinkdone notify failed: %s", e)
+                await query.message.reply_text(f"Could not notify user: {e}")
+            return
+
+        if action == "glinkadd":
+            _awaiting_admin_glink[user.id] = {
+                "req_id": req_id,
+                "user_id": target_id,
+                "query": search_q,
+                "page_id": req.get("page_id"),
+                "ticker": req.get("ticker") or search_q,
+            }
+            await query.message.reply_text(
+                f"➕ *Add new group link*\n\n"
+                f"Request: `{req_id}`\n"
+                f"Search / ticker: `{search_q}`\n"
+                f"Requester: `{target_id}`\n\n"
+                "Send the Telegram group invite link now (e.g. `https://t.me/+xxxx`).\n"
+                "It will be saved to Notion and the user will be notified.",
+                parse_mode="Markdown",
+            )
+            return
 
     # ----- List all pending -----
     if action == "pending":
@@ -460,7 +501,34 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         logger.error("reject_cmd failed: %s", e)
         await update.message.reply_text(f"Error:\n`{e}`", parse_mode="Markdown")
-        
+
+
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin control panel: access approval + Group Links requests."""
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("This command is for admins only.")
+        return
+
+    open_glinks = len(_glink_requests)
+    lines = [
+        "🛠 *Admin control panel*\n",
+        "*1. User access (authorisation)*",
+        "• `/pending` – list Pending access requests",
+        "• `/approve <telegram_id>` – authorise user",
+        "• `/reject <telegram_id>` – reject user",
+        "• Inline buttons on each new access DM: Approve / Reject\n",
+        "*2. Group Links requests*",
+        "When a member searches 🔗 Group Links and no link is saved, you get a DM with:",
+        "• ➕ *Add new group links* – bot asks you to paste the `https://t.me/...` link, saves it to Notion UK AIM Micro-Cap, notifies the user",
+        "• ✅ *Added – Notify User* – notify the user only (if you already updated Notion yourself)",
+        "• ⏳ *Pending* – mark as pending (no user notify)",
+        "• `/cancelglink` – cancel if you started Add but change your mind\n",
+        f"Open Group Links requests in memory: *{open_glinks}*",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ------------------------------------------------------------
 # Notion helpers
 # ------------------------------------------------------------
@@ -1280,6 +1348,7 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
                         "ticker": ticker or "—",
                         "company": company or "—",
                         "link": link,
+                        "page_id": pid,
                     }
                 )
             if results:
@@ -1296,13 +1365,85 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
     return results
 
 
+async def save_telegram_group_link_to_notion(
+    page_id: str | None, query: str, link_url: str
+) -> tuple[bool, str]:
+    """Save Telegram group URL onto UK AIM Micro-Cap page. Returns (ok, message)."""
+    if not notion:
+        return False, "Notion is not configured."
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
+    if not db_id:
+        return False, "NOTION_TICKERS_DB_ID missing."
+
+    raw = db_id.replace("-", "")
+    if len(raw) == 32 and "-" not in db_id:
+        db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+
+    # Resolve page if not provided
+    if not page_id:
+        rows = await lookup_telegram_group_links(query)
+        if rows and rows[0].get("page_id"):
+            page_id = rows[0]["page_id"]
+    if not page_id:
+        return False, f"No Notion page found for `{query}`. Add the ticker in UK AIM Micro-Cap first."
+
+    try:
+        page = notion.pages.retrieve(page_id=page_id)
+        props = page.get("properties", {})
+        prop_name = None
+        prop_type = "url"
+        for key in (
+            "Telegram group ",
+            "Telegram group",
+            "Telegram Group",
+            "Telegram Group Link",
+            "Group Link",
+        ):
+            if key in props:
+                prop_name = key
+                prop_type = props[key].get("type") or "url"
+                break
+        if not prop_name:
+            # Fallback: any url property mentioning telegram
+            for key, prop in props.items():
+                if isinstance(prop, dict) and prop.get("type") == "url":
+                    prop_name = key
+                    prop_type = "url"
+                    break
+        if not prop_name:
+            prop_name = "Telegram group "
+            prop_type = "url"
+
+        if prop_type == "url":
+            update_props = {prop_name: {"url": link_url}}
+        elif prop_type == "rich_text":
+            update_props = {
+                prop_name: {"rich_text": [{"text": {"content": link_url[:2000]}}]}
+            }
+        elif prop_type == "title":
+            update_props = {
+                prop_name: {"title": [{"text": {"content": link_url[:2000]}}]}
+            }
+        else:
+            update_props = {prop_name: {"url": link_url}}
+
+        notion.pages.update(page_id=page_id, properties=update_props)
+        # Clear ticker cache so next lookup is fresh
+        q_upper = query.lstrip("#").upper().strip()
+        _ticker_cache.pop(q_upper, None)
+        return True, f"Saved on Notion page for `{query}` (property: {prop_name})."
+    except Exception as e:
+        logger.error("save_telegram_group_link_to_notion failed: %s", e)
+        return False, str(e)
+
+
 async def notify_admin_missing_group_link(
     context: ContextTypes.DEFAULT_TYPE,
     user,
     query: str,
     rows: list[dict],
 ) -> None:
-    """DM admin R with the same pattern as an access request."""
+    """DM admin R with Group Links request + management buttons."""
     if not context or not user:
         return
     missing = [r for r in (rows or []) if not (r.get("link") or "").strip()]
@@ -1311,30 +1452,56 @@ async def notify_admin_missing_group_link(
 
     if not rows:
         detail = f"No match in UK AIM Micro-Cap for `{query}`"
+        page_id = None
+        ticker = query.lstrip("#").upper().strip()
     else:
         detail = "No Telegram group link saved for:\n" + "\n".join(
             f"• `#{r.get('ticker') or '—'}` – {r.get('company') or '—'}"
             for r in missing[:8]
         )
+        page_id = missing[0].get("page_id")
+        ticker = (missing[0].get("ticker") or query).lstrip("#").upper().strip()
 
-    safe_q = (query or "").replace(":", " ")[:20]
+    req_id = f"{int(time.time()) % 1000000:06d}"
+    _glink_requests[req_id] = {
+        "user_id": user.id,
+        "query": query,
+        "page_id": page_id,
+        "ticker": ticker,
+        "name": user.full_name or "—",
+        "username": user.username or "N/A",
+    }
+
     text = (
         "🔗 *New Group Links request*\n\n"
         f"• Name: {user.full_name or '—'}\n"
         f"• Username: @{user.username or 'N/A'}\n"
         f"• Telegram ID: `{user.id}`\n"
-        f"• Search: `{query}`\n\n"
+        f"• Search: `{query}`\n"
+        f"• Request ID: `{req_id}`\n\n"
         f"{detail}\n\n"
-        "Add the Telegram group link in Notion UK AIM Micro-Cap, then tap below to notify the user."
+        "Choose an action:"
     )
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Added – notify user",
-                    callback_data=f"admin:glinkdone:{user.id}:{safe_q}",
+                    "➕ Add new group links",
+                    callback_data=f"admin:glinkadd:{req_id}",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Added – Notify User",
+                    callback_data=f"admin:glinkdone:{req_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏳ Pending",
+                    callback_data=f"admin:glinkpending:{req_id}",
+                )
+            ],
         ]
     )
     for admin_id in ADMIN_USER_IDS:
@@ -1445,9 +1612,9 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await update.message.reply_text(
             "🔗 Group Link lookup\n\n"
-            "Type a  #ticker or company name and send it, for example:\n"
-            "• #ALRT\n"
+            "Type a ticker or company name and send it, for example:\n"
             "• ALRT\n"
+            "• KEFI\n"
             "• Defence Holdings\n\n"
             "Or in one step: /link ALRT\n\n"
             "I will search UK AIM Micro-Cap and return the Telegram group link if one is saved.",
@@ -1470,6 +1637,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     text = (update.message.text or "").strip()
     lower = text.lower()
+
+    # --- Admin: paste Telegram group link after "Add new group links" ---
+    if user and is_admin(user) and user.id in _awaiting_admin_glink:
+        state = _awaiting_admin_glink.pop(user.id)
+        link_url = text.strip()
+        if not (
+            link_url.startswith("http://")
+            or link_url.startswith("https://")
+            or link_url.startswith("t.me/")
+        ):
+            # Put state back if they sent something else by mistake
+            _awaiting_admin_glink[user.id] = state
+            await update.message.reply_text(
+                "Please send a valid Telegram link (https://t.me/...).\n"
+                "Or send /cancelglink to abort."
+            )
+            return
+        if link_url.startswith("t.me/"):
+            link_url = "https://" + link_url
+
+        ok, msg = await save_telegram_group_link_to_notion(
+            state.get("page_id"),
+            state.get("query") or state.get("ticker") or "",
+            link_url,
+        )
+        target_id = state.get("user_id")
+        search_q = state.get("query") or state.get("ticker") or ""
+        if ok:
+            try:
+                if target_id:
+                    await context.bot.send_message(
+                        chat_id=int(target_id),
+                        text=(
+                            "🔗 Your Group Links request has been updated.\n\n"
+                            f"Search again for: {search_q}\n"
+                            "Tap 🔗 Group Links to look it up."
+                        ),
+                    )
+                await update.message.reply_text(
+                    f"✅ Group link saved.\n{msg}\n"
+                    f"User `{target_id}` has been notified.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"✅ Saved to Notion.\n{msg}\n"
+                    f"Could not notify user: {e}"
+                )
+        else:
+            await update.message.reply_text(
+                f"❌ Could not save to Notion.\n{msg}\n\n"
+                "You can still add it manually in UK AIM Micro-Cap, then use "
+                "✅ Added – Notify User on the request."
+            )
+        return
+
+    if user and is_admin(user) and lower in ("/cancelglink", "cancelglink"):
+        _awaiting_admin_glink.pop(user.id, None)
+        await update.message.reply_text("Cancelled Group Links add.")
+        return
 
     # --- Persistent keyboard shortcuts ---
     if text in ("🙈 Hide", "Hide") or lower in ("hide", "🙈 hide"):
@@ -2980,6 +3207,7 @@ def main() -> None:
     app.add_handler(CommandHandler("pending", pending_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("link", link_cmd))
     app.add_handler(CommandHandler("links", link_cmd))
     app.add_handler(CommandHandler("telegram", link_cmd))
