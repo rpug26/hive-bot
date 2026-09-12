@@ -1168,6 +1168,35 @@ def _is_private(update: Update) -> bool:
     return bool(chat and chat.type == "private")
 
 
+def _extract_telegram_link(props: dict) -> str:
+    """Pull Telegram group URL from Notion properties (URL or text)."""
+    # Prefer known property names (including trailing-space variant)
+    for key in (
+        "Telegram group ",
+        "Telegram group",
+        "Telegram Group",
+        "Telegram Group Link",
+        "Group Link",
+        "Telegram",
+    ):
+        if key in props:
+            val = _get_plain_text(props.get(key)).strip()
+            if val:
+                return val
+    # Fallback: any URL-type property containing t.me
+    for key, prop in props.items():
+        if not isinstance(prop, dict):
+            continue
+        if prop.get("type") == "url":
+            url = (prop.get("url") or "").strip()
+            if "t.me" in url.lower() or "telegram" in url.lower():
+                return url
+        val = _get_plain_text(prop).strip()
+        if val and ("t.me" in val.lower() or "telegram.me" in val.lower()):
+            return val
+    return ""
+
+
 async def lookup_telegram_group_links(query: str) -> list[dict]:
     """Search UK AIM Micro-Cap by ticker or company; return Telegram group links."""
     if not notion or not query:
@@ -1185,9 +1214,13 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
     q = query.strip()
     q_upper = q.lstrip("#").upper()
 
+    # Same robust filter style as get_ticker_from_notion
     filters_to_try = [
         {"property": "Ticker", "title": {"equals": q_upper}},
+        {"property": "Ticker", "rich_text": {"equals": q_upper}},
         {"property": "Ticker", "title": {"contains": q_upper}},
+        {"property": "Ticker", "rich_text": {"contains": q_upper}},
+        {"property": "Company", "title": {"contains": q}},
         {"property": "Company", "rich_text": {"contains": q}},
     ]
 
@@ -1213,13 +1246,11 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
                 seen.add(pid)
                 props = page.get("properties", {})
                 ticker = _get_plain_text(props.get("Ticker")).strip().upper()
-                company = _get_plain_text(props.get("Company")).strip()
-                # Notion property has a trailing space in the name
-                link = (
-                    _get_plain_text(props.get("Telegram group "))
-                    or _get_plain_text(props.get("Telegram Group"))
-                    or _get_plain_text(props.get("Telegram group"))
-                ).strip()
+                company = (
+                    _get_plain_text(props.get("Company")).strip()
+                    or _get_plain_text(props.get("Name")).strip()
+                )
+                link = _extract_telegram_link(props)
                 results.append(
                     {
                         "ticker": ticker or "—",
@@ -1232,15 +1263,65 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
     except Exception as e:
         logger.error("lookup_telegram_group_links failed: %s", e)
 
+    logger.info(
+        "Link search query=%r matches=%d with_link=%d",
+        query,
+        len(results),
+        sum(1 for r in results if r.get("link")),
+    )
     return results
 
 
+async def _send_link_results(
+    update: Update, query: str, rows: list[dict]
+) -> None:
+    if not rows:
+        await update.message.reply_text(
+            f"No match found for {query} in UK AIM Micro-Cap.\n\n"
+            "Try another ticker or company name, or tap 🔗 Link to search again.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    lines = [f"🔗 Group links for {query}\n"]
+    for r in rows[:8]:
+        link = r.get("link") or ""
+        ticker = r.get("ticker") or "—"
+        company = r.get("company") or "—"
+        if link:
+            lines.append(f"• #{ticker} – {company}\n  {link}")
+        else:
+            lines.append(
+                f"• #{ticker} – {company}\n  (No Telegram group link saved yet)"
+            )
+    lines.append("\nTap 🔗 Link to search again.")
+    await update.message.reply_text(
+        "\n".join(lines),
+        disable_web_page_preview=False,
+        reply_markup=main_reply_keyboard(),
+    )
+
+
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Private-only: search Telegram group links from UK AIM Micro-Cap."""
+    """Private-only: search Telegram group links from UK AIM Micro-Cap.
+
+    Supports:
+      /link
+      /link ALRT
+      button 🔗 Link  (then type ticker)
+    """
     if not update.message:
         return
 
     try:
+        logger.info(
+            "link_cmd invoked chat=%s private=%s user=%s args=%s",
+            update.effective_chat.id if update.effective_chat else None,
+            _is_private(update),
+            update.effective_user.id if update.effective_user else None,
+            getattr(context, "args", None),
+        )
+
         if not _is_private(update):
             await update.message.reply_text(
                 "Group Link only works in a private 1-to-1 chat with me.\n\n"
@@ -1255,6 +1336,14 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
+        # One-step: /link ALRT  or  /link Defence Holdings
+        args = getattr(context, "args", None) or []
+        if args:
+            query = " ".join(args).strip()
+            rows = await lookup_telegram_group_links(query)
+            await _send_link_results(update, query, rows)
+            return
+
         user = update.effective_user
         if user:
             _awaiting_link[user.id] = True
@@ -1265,11 +1354,12 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• ALRT\n"
             "• KEFI\n"
             "• Defence Holdings\n\n"
-            "I will search the UK AIM Micro-Cap database and return the Telegram group link if one is saved.",
+            "Or in one step: /link ALRT\n\n"
+            "I will search UK AIM Micro-Cap and return the Telegram group link if one is saved.",
             reply_markup=main_reply_keyboard(),
         )
     except Exception as e:
-        logger.error("link_cmd failed: %s", e)
+        logger.error("link_cmd failed: %s", e, exc_info=True)
         try:
             await update.message.reply_text(
                 f"Could not start Group Link lookup.\nError: {e}"
@@ -1319,7 +1409,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await link_cmd(update, context)
         return
 
-    # Link search follow-up (private only)
+    # Link search follow-up (private only) after tapping 🔗 Link
     if user and user.id in _awaiting_link:
         if not _is_private(update):
             _awaiting_link.pop(user.id, None)
@@ -1335,40 +1425,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         try:
             rows = await lookup_telegram_group_links(query)
+            await _send_link_results(update, query, rows)
         except Exception as e:
-            logger.error("lookup_telegram_group_links failed: %s", e)
+            logger.error("Link follow-up failed: %s", e, exc_info=True)
             await update.message.reply_text(
                 f"Could not search group links right now.\nError: {e}",
                 reply_markup=main_reply_keyboard(),
             )
-            return
-
-        if not rows:
-            await update.message.reply_text(
-                f"No match found for {query} in UK AIM Micro-Cap.\n\n"
-                "Try another ticker or company name, or tap 🔗 Link to search again.",
-                reply_markup=main_reply_keyboard(),
-            )
-            return
-
-        lines = [f"🔗 Group links for {query}\n"]
-        for r in rows[:8]:
-            link = r.get("link") or ""
-            ticker = r.get("ticker") or "—"
-            company = r.get("company") or "—"
-            if link:
-                lines.append(f"• #{ticker} – {company}\n  {link}")
-            else:
-                lines.append(
-                    f"• #{ticker} – {company}\n  (No Telegram group link saved yet)"
-                )
-
-        lines.append("\nTap 🔗 Link to search again.")
-        await update.message.reply_text(
-            "\n".join(lines),
-            disable_web_page_preview=False,
-            reply_markup=main_reply_keyboard(),
-        )
         return
 
     if "my stockpick" in lower or "my🐝 stockpick" in lower:
@@ -2897,3 +2960,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+
+    
