@@ -1112,6 +1112,7 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
     return text
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Full persistent keyboard (4 feature buttons + Hide)."""
     return ReplyKeyboardMarkup(
         [
             [
@@ -1122,9 +1123,24 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("👀 My Watchlist"),
                 KeyboardButton("🔗 Group Links"),
             ],
+            [
+                KeyboardButton("🙈 Hide"),
+            ],
         ],
-        resize_keyboard=True,   # fits mobile screens
-        is_persistent=True,     # always available at the bottom
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+    )
+
+
+def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Collapsed keyboard – single button to restore the full menu."""
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("☰ Show menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
         one_time_keyboard=False,
     )
 
@@ -1264,6 +1280,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lower = text.lower()
 
     # --- Persistent keyboard shortcuts ---
+    if text in ("🙈 Hide", "Hide") or lower in ("hide", "🙈 hide"):
+        await update.message.reply_text(
+            "Keyboard hidden. Tap **☰ Show menu** to bring it back.",
+            parse_mode="Markdown",
+            reply_markup=hidden_reply_keyboard(),
+        )
+        return
+
+    if text in ("☰ Show menu", "Show menu", "Unhide") or lower in (
+        "show menu",
+        "☰ show menu",
+        "unhide",
+    ):
+        await update.message.reply_text(
+            "Menu restored.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
     if text in ("📋 Menu", "Menu") or lower == "menu":
         await menu_cmd(update, context)
         return
@@ -2838,4 +2873,3 @@ if __name__ == "__main__":
 
 
     
-
