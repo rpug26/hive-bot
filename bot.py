@@ -1121,7 +1121,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton("👀 My Watchlist"),
-                KeyboardButton("🔗 Link"),
+                KeyboardButton("🔗 Group Links"),
             ],
             [
                 KeyboardButton("🙈 Hide"),
@@ -1157,7 +1157,7 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📌 My🐝 Stockpick", callback_data="cmd:mystockpick"),
             ],
             [
-                InlineKeyboardButton("🔗 Link", callback_data="cmd:link"),
+                InlineKeyboardButton("🔗 Group Links", callback_data="cmd:link"),
             ],
         ]
     )
