@@ -267,6 +267,30 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     action = parts[1]
     db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
+    # ----- Notify user that Group Link was added -----
+    if action == "glinkdone":
+        if len(parts) < 3:
+            return
+        target_id = parts[2].strip()
+        search_q = parts[3] if len(parts) > 3 else ""
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_id),
+                text=(
+                    "🔗 Your Group Links request has been updated.\n\n"
+                    + (f"Search again for: {search_q}\n" if search_q else "")
+                    + "Tap 🔗 Group Links to look it up."
+                ),
+            )
+            await query.message.reply_text(
+                f"✅ User `{target_id}` has been notified.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error("glinkdone notify failed: %s", e)
+            await query.message.reply_text(f"Could not notify user: {e}")
+        return
+
     # ----- List all pending -----
     if action == "pending":
         if not notion or not db_id:
@@ -1278,33 +1302,49 @@ async def notify_admin_missing_group_link(
     query: str,
     rows: list[dict],
 ) -> None:
-    """DM admin R when a Group Links search has no saved Telegram link."""
-    if not context:
+    """DM admin R with the same pattern as an access request."""
+    if not context or not user:
         return
-    name = (user.full_name if user else "Unknown") or "Unknown"
-    uname = f"@{user.username}" if user and user.username else "N/A"
-    uid = user.id if user else "N/A"
+    missing = [r for r in (rows or []) if not (r.get("link") or "").strip()]
+    if rows and not missing:
+        return
+
     if not rows:
-        detail = f"No ticker/company match in UK AIM Micro-Cap for: {query}"
+        detail = f"No match in UK AIM Micro-Cap for `{query}`"
     else:
-        missing = [r for r in rows if not (r.get("link") or "").strip()]
-        if not missing:
-            return
-        detail = "Match found, but no Telegram group link saved:\n" + "\n".join(
-            f"• #{r.get('ticker') or '—'} – {r.get('company') or '—'}"
+        detail = "No Telegram group link saved for:\n" + "\n".join(
+            f"• `#{r.get('ticker') or '—'}` – {r.get('company') or '—'}"
             for r in missing[:8]
         )
+
+    safe_q = (query or "").replace(":", " ")[:20]
     text = (
-        "🔗 Group Links request\n\n"
-        f"• From: {name} ({uname})\n"
-        f"• Telegram ID: {uid}\n"
-        f"• Search: {query}\n\n"
+        "🔗 *New Group Links request*\n\n"
+        f"• Name: {user.full_name or '—'}\n"
+        f"• Username: @{user.username or 'N/A'}\n"
+        f"• Telegram ID: `{user.id}`\n"
+        f"• Search: `{query}`\n\n"
         f"{detail}\n\n"
-        "Please add the Telegram group link in Notion UK AIM Micro-Cap."
+        "Add the Telegram group link in Notion UK AIM Micro-Cap, then tap below to notify the user."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Added – notify user",
+                    callback_data=f"admin:glinkdone:{user.id}:{safe_q}",
+                )
+            ]
+        ]
     )
     for admin_id in ADMIN_USER_IDS:
         try:
-            await context.bot.send_message(chat_id=admin_id, text=text)
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
         except Exception as e:
             logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
 
@@ -1315,17 +1355,14 @@ async def _send_link_results(
     rows: list[dict],
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
-    missing_link = (not rows) or any(not (r.get("link") or "").strip() for r in rows)
-    ask_admin = (
-        "\nIf you have the Telegram group invite link, please send it to the "
-        "Hive admin group so it can be added."
+    submitted = (
+        "Request submitted to the admin group.\n"
+        "You will be notified once it is updated."
     )
 
     if not rows:
         await update.message.reply_text(
-            f"No match found for {query} in UK AIM Micro-Cap.\n\n"
-            "(No Telegram Group link yet) Tap 🔗 Group Links to search again."
-            f"{ask_admin}",
+            f"(No Telegram Group link yet)\n\n{submitted}",
             reply_markup=main_reply_keyboard(),
         )
         if context:
@@ -1344,12 +1381,11 @@ async def _send_link_results(
             lines.append(f"• #{ticker} – {company}\n  {link}")
         else:
             any_missing = True
-            lines.append(
-                f"• #{ticker} – {company}\n  (No Telegram Group link yet)"
-            )
-    lines.append("\nTap 🔗 Group Links to search again.")
+            lines.append(f"• #{ticker} – {company}\n  (No Telegram Group link yet)")
     if any_missing:
-        lines.append(ask_admin.strip())
+        lines.append(f"\n{submitted}")
+    else:
+        lines.append("\nTap 🔗 Group Links to search again.")
     await update.message.reply_text(
         "\n".join(lines),
         disable_web_page_preview=False,
