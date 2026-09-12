@@ -557,71 +557,6 @@ async def get_authorized_usernames() -> set[str]:
     auth = await get_authorized_users()
     return auth.get("usernames", set())
 
-REQUEST_TYPE_STOCKPICK = "Stockpick"
-REQUEST_TYPE_SNAPSHOT = "Security snapshot"
-REQUEST_TYPE_TG_LINK = "Telegram link"
-
-async def log_member_activity(user, request_type: str) -> None:
-    """
-    Update Hive Bot Authorised Users:
-    - Last Request Date = today
-    - Last Request Type = request_type
-    - Request Count += 1
-    """
-    if not notion or not user:
-        return
-
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
-        return
-
-    try:
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            logger.info("log_member_activity: no auth row for user %s", user.id)
-            return
-
-        page = results[0]
-        page_id = page["id"]
-        props = page.get("properties", {})
-
-        # Current count (if any)
-        count = 0
-        count_prop = props.get("Request Count") or {}
-        if count_prop.get("type") == "number" and count_prop.get("number") is not None:
-            count = int(count_prop["number"])
-
-        notion.pages.update(
-            page_id=page_id,
-            properties={
-                "Last Request Date": {
-                    "date": {
-                        "start": datetime.now(timezone.utc).date().isoformat()
-                    }
-                },
-                "Last Request Type": {
-                    "select": {"name": request_type}
-                },
-                "Request Count": {
-                    "number": count + 1
-                },
-            },
-        )
-        logger.info(
-            "Logged activity user=%s type=%s count=%s",
-            user.id, request_type, count + 1,
-        )
-    except Exception as e:
-        logger.error("log_member_activity failed for %s: %s", user.id, e)
-
 async def is_group_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> tuple[bool, str]:
@@ -1596,6 +1531,14 @@ async def _send_link_results(
     rows: list[dict],
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
+    # Track engagement on Authorised Users DB
+    if update.effective_user:
+        await record_member_activity(
+            update.effective_user,
+            REQUEST_TYPE_TELEGRAM_LINK,
+            detail=query,
+        )
+
     submitted = (
         "Request submitted to the admin group.\n"
         "You will be notified once it is updated."
@@ -1931,15 +1874,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not await require_authorized(update, context):
             return
 
+        if user:
+            await record_member_activity(
+                user,
+                REQUEST_TYPE_STOCKPICK,
+                detail=(clean_text[:200] if clean_text else None),
+            )
+
         if await has_submitted_this_month(user):
             month_name = datetime.now(timezone.utc).strftime("%B")
             page_id = _last_stockpick_page.get(user.id)
             if not page_id:
                 page_id = await find_this_month_stockpick_page(user)
-            if page_id:
-                 _last_stockpick_page[user.id] = page_id
-                 await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
-                 # ... existing success reply ...
+                if page_id:
+                    _last_stockpick_page[user.id] = page_id
 
             keyboard = [
                 [
@@ -2013,6 +1961,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if tickers:
         if not await require_authorized(update, context):
             return
+        if user:
+            await record_member_activity(
+                user,
+                REQUEST_TYPE_SNAPSHOT,
+                detail=", ".join(f"#{t}" for t in tickers[:5]),
+            )
         for t in tickers:
             try:
                 data = await get_ticker_from_notion(t)
@@ -3060,6 +3014,156 @@ async def get_authorized_users() -> dict:
             "usernames": _authorized_cache.get("usernames", set()),
             "user_ids": _authorized_cache.get("user_ids", set()),
         }
+
+
+# Request types written to Notion "Request Type" select
+REQUEST_TYPE_TELEGRAM_LINK = "Telegram link"
+REQUEST_TYPE_STOCKPICK = "Stockpick"
+REQUEST_TYPE_SNAPSHOT = "Security snapshot"
+
+
+async def _find_auth_user_page_id(user) -> str | None:
+    """Locate the user's row in Hive Bot Authorised Users by Telegram User ID."""
+    if not notion or not user:
+        return None
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
+        return None
+    uid = str(user.id).strip()
+    try:
+        for prop_name in ("Telegram User ID", "Telegram ID", "User ID"):
+            for filter_type in ("title", "rich_text"):
+                try:
+                    response = notion.databases.query(
+                        database_id=db_id,
+                        filter={
+                            "property": prop_name,
+                            filter_type: {"equals": uid},
+                        },
+                        page_size=1,
+                    )
+                    results = response.get("results", [])
+                    if results:
+                        return results[0]["id"]
+                except Exception:
+                    continue
+        # Fallback: match by username
+        uname = (user.username or "").strip().lstrip("@")
+        if uname:
+            for prop_name in ("Username", "Telegram Username"):
+                try:
+                    response = notion.databases.query(
+                        database_id=db_id,
+                        filter={
+                            "property": prop_name,
+                            "rich_text": {"equals": uname},
+                        },
+                        page_size=1,
+                    )
+                    results = response.get("results", [])
+                    if results:
+                        return results[0]["id"]
+                except Exception:
+                    try:
+                        response = notion.databases.query(
+                            database_id=db_id,
+                            filter={
+                                "property": prop_name,
+                                "title": {"equals": uname},
+                            },
+                            page_size=1,
+                        )
+                        results = response.get("results", [])
+                        if results:
+                            return results[0]["id"]
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.error("_find_auth_user_page_id failed: %s", e)
+    return None
+
+
+async def record_member_activity(
+    user,
+    request_type: str,
+    detail: str | None = None,
+) -> None:
+    """
+    Update Hive Bot Authorised Users for this member:
+      - Last Request Date (date)
+      - Request Type (select): Telegram link | Stockpick | Security snapshot
+      - optional Last Request Detail (rich_text)
+    Best-effort: never raises to the caller.
+    """
+    if not notion or not user:
+        return
+    try:
+        page_id = await _find_auth_user_page_id(user)
+        if not page_id:
+            logger.info(
+                "Activity not recorded – no auth page for user_id=%s type=%s",
+                user.id,
+                request_type,
+            )
+            return
+
+        page = notion.pages.retrieve(page_id=page_id)
+        props_schema = page.get("properties", {})
+        today = datetime.now(timezone.utc).date().isoformat()
+        update_props: dict = {}
+
+        # Date field – each member's last request date
+        for name in (
+            "Last Request Date",
+            "Last Request",
+            "Last Activity Date",
+            "Last Active",
+            "Date Last Request",
+        ):
+            if name in props_schema and props_schema[name].get("type") == "date":
+                update_props[name] = {"date": {"start": today}}
+                break
+
+        # Request Type select
+        for name in ("Request Type", "Last Request Type", "Activity Type"):
+            if name not in props_schema:
+                continue
+            ptype = props_schema[name].get("type")
+            if ptype == "select":
+                update_props[name] = {"select": {"name": request_type}}
+            elif ptype == "rich_text":
+                update_props[name] = {
+                    "rich_text": [{"text": {"content": request_type[:2000]}}]
+                }
+            break
+
+        # Optional detail
+        if detail:
+            for name in ("Last Request Detail", "Last Activity Detail", "Notes"):
+                if name in props_schema and props_schema[name].get("type") == "rich_text":
+                    update_props[name] = {
+                        "rich_text": [{"text": {"content": str(detail)[:2000]}}]
+                    }
+                    break
+
+        if not update_props:
+            logger.warning(
+                "Activity fields missing on auth DB page %s – add "
+                "'Last Request Date' (date) and 'Request Type' (select) columns",
+                page_id,
+            )
+            return
+
+        notion.pages.update(page_id=page_id, properties=update_props)
+        logger.info(
+            "Recorded activity user=%s type=%s detail=%s",
+            user.id,
+            request_type,
+            detail or "",
+        )
+    except Exception as e:
+        logger.error("record_member_activity failed: %s", e)
+
 
 # ------------------------------------------------------------
 # Message handling – STRICT
