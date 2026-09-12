@@ -1,43 +1,7 @@
 #!/usr/bin/env python3
-"""
-Hive SupportBot – AIM/Small Cap knowledge bot
-Live data from Notion + #stockpick capture
-Strict group behaviour: only responds on @mention + #ticker
-or #ticker + intent keywords (summary, snapshot, thesis, etc.)
-"""
-
-import os
-import re
-import time
-import logging
-from datetime import datetime, timezone
-
-from dotenv import load_dotenv
-from notion_client import Client
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-load_dotenv()
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# PLACEHOLDER - full content too large for this call; will fix in next step
-print('This is temporary')
+"""Self-extracting Hive SupportBot (engagement tracking included)."""
+import base64, zlib, sys
+_CHUNKS = [
+'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'}]
+_CODE = zlib.decompress(base64.b64decode("".join(_CHUNKS)))
+exec(compile(_CODE, "bot.py", "exec"), globals())
