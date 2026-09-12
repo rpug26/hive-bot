@@ -49,11 +49,130 @@ if not TOKEN:
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")       # for #stockpick captures
 NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID")   # UK AIM Micro-Cap database
+# Auth DB container + data source (required for multi-source Notion API 2025-09-03+)
+NOTION_AUTH_DB_ID_ENV = (
+    os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID") or ""
+).strip()
+# Hive Bot Authorised Users data source id (from collection://…)
+NOTION_AUTH_DATA_SOURCE_ID = (
+    os.getenv("NOTION_AUTH_DATA_SOURCE_ID") or "fd1e050c-5396-448d-a2d5-c4749a0cc69e"
+).strip()
 
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 if not notion:
     logger.warning("Notion credentials missing – live lookup and #stockpick write disabled")
+
+
+def _notion_http(method: str, path: str, body: dict | None = None) -> dict:
+    """
+    Raw Notion REST call with API version that supports multi-source databases.
+    path is relative, e.g. 'data_sources/{id}/query'
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    if not NOTION_TOKEN:
+        raise RuntimeError("NOTION_TOKEN missing")
+
+    url = f"https://api.notion.com/v1/{path.lstrip('/')}"
+    data = None if body is None else _json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method.upper(),
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2025-09-03",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Notion HTTP {e.code}: {err_body}") from e
+
+
+def notion_query_data_source(
+    *,
+    data_source_id: str | None = None,
+    database_id: str | None = None,
+    **kwargs,
+) -> dict:
+    """
+    Query a Notion table in a way that works with multi-source databases.
+    Prefer data_sources/{id}/query (API 2025-09-03+); fall back to databases.query.
+    """
+    if not notion and not NOTION_TOKEN:
+        raise RuntimeError("Notion client is not initialised")
+
+    ds_id = (data_source_id or "").strip() or None
+    db_id = (database_id or "").strip() or None
+
+    if ds_id:
+        try:
+            body = dict(kwargs)
+            body.pop("database_id", None)
+            return _notion_http("POST", f"data_sources/{ds_id}/query", body)
+        except Exception as e:
+            logger.warning(
+                "data_sources.query failed for %s: %s – trying databases.query",
+                ds_id,
+                e,
+            )
+
+    if not db_id:
+        raise ValueError("Need data_source_id or database_id for Notion query")
+    if not notion:
+        raise RuntimeError("Notion client is not initialised")
+    return notion.databases.query(database_id=db_id, **kwargs)
+
+
+def notion_create_page_in_data_source(
+    *,
+    properties: dict,
+    data_source_id: str | None = None,
+    database_id: str | None = None,
+) -> dict:
+    """Create a page under a data source (multi-source safe)."""
+    if not notion and not NOTION_TOKEN:
+        raise RuntimeError("Notion client is not initialised")
+
+    ds_id = (data_source_id or "").strip() or None
+    db_id = (database_id or "").strip() or None
+
+    if ds_id:
+        try:
+            return _notion_http(
+                "POST",
+                "pages",
+                {
+                    "parent": {
+                        "type": "data_source_id",
+                        "data_source_id": ds_id,
+                    },
+                    "properties": properties,
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "pages.create with data_source_id failed (%s): %s – trying database_id",
+                ds_id,
+                e,
+            )
+
+    if not db_id:
+        raise ValueError("Need data_source_id or database_id to create Notion page")
+    if not notion:
+        raise RuntimeError("Notion client is not initialised")
+    return notion.pages.create(
+        parent={"database_id": db_id},
+        properties=properties,
+    )
+
 
 # ------------------------------------------------------------
 # Caches
@@ -122,7 +241,8 @@ async def pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     try:
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=NOTION_AUTH_DATA_SOURCE_ID,
             database_id=db_id,
             filter={
                 "property": "Status",
@@ -172,7 +292,8 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     try:
         # Find the page with this Telegram User ID (Title)
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=NOTION_AUTH_DATA_SOURCE_ID,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -402,7 +523,8 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=NOTION_AUTH_DATA_SOURCE_ID,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -490,7 +612,8 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=NOTION_AUTH_DATA_SOURCE_ID,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -2729,23 +2852,24 @@ async def create_access_request(
     user, *, is_group_member_flag: bool | None = None
 ) -> tuple[bool, str]:
     """
-    Upsert a Pending access request in Notion Auth DB.
-    - If a row for this Telegram User ID already exists → set Status = Pending
-      (and refresh name/username).
-    - Otherwise create a new row with Status = Pending.
-    Returns (success, message).
+    Upsert a Pending access request in Notion Auth DB (multi-source safe).
+    Uses data_source_id so Notion API 2025-09-03+ works.
     """
     if not notion:
         return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
 
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
-        return False, "NOTION_AUTH_DB_ID / NOTION_DATABASE_ID is missing"
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
+        return False, "NOTION_AUTH_DB_ID / NOTION_AUTH_DATA_SOURCE_ID is missing"
 
     uid_str = str(user.id)
     try:
-        # 1) Look for existing page
-        response = notion.databases.query(
+        # 1) Look for existing page via data source query
+        response = notion_query_data_source(
+            data_source_id=ds_id,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -2788,16 +2912,18 @@ async def create_access_request(
                     }
                 },
             }
-            notion.pages.create(
-                parent={"database_id": db_id},
+            notion_create_page_in_data_source(
                 properties=create_props,
+                data_source_id=ds_id,
+                database_id=db_id,
             )
             logger.info("Created new Pending auth row for user %s", uid_str)
 
         # Best-effort Group Member (select: Yes / No)
         if is_group_member_flag is not None:
             try:
-                response2 = notion.databases.query(
+                response2 = notion_query_data_source(
+                    data_source_id=ds_id,
                     database_id=db_id,
                     filter={
                         "property": "Telegram User ID",
@@ -3003,8 +3129,11 @@ async def get_authorized_users() -> dict:
     if not notion:
         return empty
 
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
         return empty
 
     now = time.time()
@@ -3031,7 +3160,6 @@ async def get_authorized_users() -> dict:
                 pages = []
                 while True:
                     kwargs = {
-                        "database_id": db_id,
                         "page_size": 100,
                         "filter": {
                             "property": "Status",
@@ -3040,7 +3168,11 @@ async def get_authorized_users() -> dict:
                     }
                     if cursor:
                         kwargs["start_cursor"] = cursor
-                    response = notion.databases.query(**kwargs)
+                    response = notion_query_data_source(
+                        data_source_id=ds_id,
+                        database_id=db_id,
+                        **kwargs,
+                    )
                     pages.extend(response.get("results", []))
                     if not response.get("has_more"):
                         break
