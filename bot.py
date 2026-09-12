@@ -1272,18 +1272,70 @@ async def lookup_telegram_group_links(query: str) -> list[dict]:
     return results
 
 
-async def _send_link_results(
-    update: Update, query: str, rows: list[dict]
+async def notify_admin_missing_group_link(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    query: str,
+    rows: list[dict],
 ) -> None:
+    """DM admin R when a Group Links search has no saved Telegram link."""
+    if not context:
+        return
+    name = (user.full_name if user else "Unknown") or "Unknown"
+    uname = f"@{user.username}" if user and user.username else "N/A"
+    uid = user.id if user else "N/A"
+    if not rows:
+        detail = f"No ticker/company match in UK AIM Micro-Cap for: {query}"
+    else:
+        missing = [r for r in rows if not (r.get("link") or "").strip()]
+        if not missing:
+            return
+        detail = "Match found, but no Telegram group link saved:\n" + "\n".join(
+            f"• #{r.get('ticker') or '—'} – {r.get('company') or '—'}"
+            for r in missing[:8]
+        )
+    text = (
+        "🔗 Group Links request\n\n"
+        f"• From: {name} ({uname})\n"
+        f"• Telegram ID: {uid}\n"
+        f"• Search: {query}\n\n"
+        f"{detail}\n\n"
+        "Please add the Telegram group link in Notion UK AIM Micro-Cap."
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
+
+
+async def _send_link_results(
+    update: Update,
+    query: str,
+    rows: list[dict],
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
+    missing_link = (not rows) or any(not (r.get("link") or "").strip() for r in rows)
+    ask_admin = (
+        "\nIf you have the Telegram group invite link, please send it to the "
+        "Hive admin group so it can be added."
+    )
+
     if not rows:
         await update.message.reply_text(
             f"No match found for {query} in UK AIM Micro-Cap.\n\n"
-            "Try another ticker or company name, or tap 🔗 Link to search again.",
+            "(No Telegram Group link yet) Tap 🔗 Group Links to search again."
+            f"{ask_admin}",
             reply_markup=main_reply_keyboard(),
         )
+        if context:
+            await notify_admin_missing_group_link(
+                context, update.effective_user, query, rows
+            )
         return
 
     lines = [f"🔗 Group links for {query}\n"]
+    any_missing = False
     for r in rows[:8]:
         link = r.get("link") or ""
         ticker = r.get("ticker") or "—"
@@ -1291,15 +1343,22 @@ async def _send_link_results(
         if link:
             lines.append(f"• #{ticker} – {company}\n  {link}")
         else:
+            any_missing = True
             lines.append(
-                f"• #{ticker} – {company}\n  (No Telegram group link saved yet)"
+                f"• #{ticker} – {company}\n  (No Telegram Group link yet)"
             )
-    lines.append("\nTap 🔗 Link to search again.")
+    lines.append("\nTap 🔗 Group Links to search again.")
+    if any_missing:
+        lines.append(ask_admin.strip())
     await update.message.reply_text(
         "\n".join(lines),
         disable_web_page_preview=False,
         reply_markup=main_reply_keyboard(),
     )
+    if context and any_missing:
+        await notify_admin_missing_group_link(
+            context, update.effective_user, query, rows
+        )
 
 
 async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1341,7 +1400,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if args:
             query = " ".join(args).strip()
             rows = await lookup_telegram_group_links(query)
-            await _send_link_results(update, query, rows)
+            await _send_link_results(update, query, rows, context)
             return
 
         user = update.effective_user
@@ -1402,9 +1461,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Match Link button even if emoji/spacing differs
     if (
-        text in ("🔗 Link", "Link", "Group Link", "🔗 Group Link")
-        or lower in ("link", "🔗 link", "group link", "🔗 group link")
-        or (lower.replace("🔗", "").strip() == "link")
+        text in (
+            "🔗 Group Links",
+            "🔗 Group Link",
+            "🔗 Link",
+            "Group Links",
+            "Group Link",
+            "Link",
+        )
+        or lower in (
+            "🔗 group links",
+            "group links",
+            "🔗 group link",
+            "group link",
+            "🔗 link",
+            "link",
+        )
+        or (lower.replace("🔗", "").strip() in ("link", "group link", "group links"))
         or (len(text) <= 24 and "link" in lower and "stock" not in lower)
     ):
         logger.info("Link button matched text=%r", text)
@@ -1427,7 +1500,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         try:
             rows = await lookup_telegram_group_links(query)
-            await _send_link_results(update, query, rows)
+            await _send_link_results(update, query, rows, context)
         except Exception as e:
             logger.error("Link follow-up failed: %s", e, exc_info=True)
             await update.message.reply_text(
