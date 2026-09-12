@@ -3427,9 +3427,10 @@ async def record_member_activity(
 ) -> None:
     """
     Update Hive Bot Authorised Users for this member:
-      - Last Request Date (date)
-      - Request Type (select): Telegram link | Stockpick | Security snapshot
-      - optional Last Request Detail (rich_text)
+      - Last Request Date (date) – latest only
+      - Request Type (select) – latest only
+      - Request History (rich_text) – APPEND full history list
+      - Request Count (number) – increment if present
     Best-effort: never raises to the caller.
     """
     if not notion or not user:
@@ -3446,10 +3447,12 @@ async def record_member_activity(
 
         page = notion.pages.retrieve(page_id=page_id)
         props_schema = page.get("properties", {})
-        today = datetime.now(timezone.utc).date().isoformat()
+        now = datetime.now(timezone.utc)
+        today = now.date().isoformat()
+        stamp = now.strftime("%Y-%m-%d %H:%M UTC")
         update_props: dict = {}
 
-        # Date field – each member's last request date
+        # 1) Last Request Date (latest)
         for name in (
             "Last Request Date",
             "Last Request",
@@ -3461,7 +3464,7 @@ async def record_member_activity(
                 update_props[name] = {"date": {"start": today}}
                 break
 
-        # Request Type select
+        # 2) Request Type (latest)
         for name in ("Request Type", "Last Request Type", "Activity Type"):
             if name not in props_schema:
                 continue
@@ -3474,9 +3477,57 @@ async def record_member_activity(
                 }
             break
 
-        # Optional detail
+        # 3) Append to Request History (aggregated list per member)
+        history_line = f"{stamp} | {request_type}"
         if detail:
-            for name in ("Last Request Detail", "Last Activity Detail", "Notes"):
+            # Keep detail short so history stays readable
+            d = " ".join(str(detail).split())
+            if len(d) > 120:
+                d = d[:117] + "..."
+            history_line += f" | {d}"
+
+        history_names = (
+            "Request History",
+            "Activity History",
+            "Request Log",
+            "Activity Log",
+        )
+        for name in history_names:
+            if name not in props_schema:
+                continue
+            if props_schema[name].get("type") != "rich_text":
+                continue
+            existing = _get_plain_text(props_schema.get(name)).strip()
+            # Newest first
+            if existing:
+                combined = history_line + "\n" + existing
+            else:
+                combined = history_line
+            # Notion rich_text single segment ~2000 chars; keep head of history
+            if len(combined) > 1900:
+                combined = combined[:1900].rsplit("\n", 1)[0]
+            update_props[name] = {
+                "rich_text": [{"text": {"content": combined}}]
+            }
+            break
+
+        # 4) Optional Request Count increment
+        for name in ("Request Count", "Activity Count", "Total Requests"):
+            if name not in props_schema:
+                continue
+            if props_schema[name].get("type") != "number":
+                continue
+            current = props_schema[name].get("number")
+            try:
+                n = int(current) if current is not None else 0
+            except Exception:
+                n = 0
+            update_props[name] = {"number": n + 1}
+            break
+
+        # 5) Still refresh short "last detail" if that column exists
+        if detail:
+            for name in ("Last Request Detail", "Last Activity Detail"):
                 if name in props_schema and props_schema[name].get("type") == "rich_text":
                     update_props[name] = {
                         "rich_text": [{"text": {"content": str(detail)[:2000]}}]
@@ -3486,7 +3537,8 @@ async def record_member_activity(
         if not update_props:
             logger.warning(
                 "Activity fields missing on auth DB page %s – add "
-                "'Last Request Date' (date) and 'Request Type' (select) columns",
+                "'Last Request Date' (date), 'Request Type' (select), "
+                "and 'Request History' (rich text)",
                 page_id,
             )
             return
