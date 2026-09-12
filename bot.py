@@ -557,6 +557,71 @@ async def get_authorized_usernames() -> set[str]:
     auth = await get_authorized_users()
     return auth.get("usernames", set())
 
+REQUEST_TYPE_STOCKPICK = "Stockpick"
+REQUEST_TYPE_SNAPSHOT = "Security snapshot"
+REQUEST_TYPE_TG_LINK = "Telegram link"
+
+async def log_member_activity(user, request_type: str) -> None:
+    """
+    Update Hive Bot Authorised Users:
+    - Last Request Date = today
+    - Last Request Type = request_type
+    - Request Count += 1
+    """
+    if not notion or not user:
+        return
+
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            logger.info("log_member_activity: no auth row for user %s", user.id)
+            return
+
+        page = results[0]
+        page_id = page["id"]
+        props = page.get("properties", {})
+
+        # Current count (if any)
+        count = 0
+        count_prop = props.get("Request Count") or {}
+        if count_prop.get("type") == "number" and count_prop.get("number") is not None:
+            count = int(count_prop["number"])
+
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Last Request Date": {
+                    "date": {
+                        "start": datetime.now(timezone.utc).date().isoformat()
+                    }
+                },
+                "Last Request Type": {
+                    "select": {"name": request_type}
+                },
+                "Request Count": {
+                    "number": count + 1
+                },
+            },
+        )
+        logger.info(
+            "Logged activity user=%s type=%s count=%s",
+            user.id, request_type, count + 1,
+        )
+    except Exception as e:
+        logger.error("log_member_activity failed for %s: %s", user.id, e)
+
 async def is_group_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> tuple[bool, str]:
@@ -1871,8 +1936,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             page_id = _last_stockpick_page.get(user.id)
             if not page_id:
                 page_id = await find_this_month_stockpick_page(user)
-                if page_id:
-                    _last_stockpick_page[user.id] = page_id
+            if page_id:
+                 _last_stockpick_page[user.id] = page_id
+                 await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
+                 # ... existing success reply ...
 
             keyboard = [
                 [
