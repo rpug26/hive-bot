@@ -1445,9 +1445,9 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await update.message.reply_text(
             "🔗 Group Link lookup\n\n"
-            "Type a ticker or company name and send it, for example:\n"
+            "Type a  #ticker or company name and send it, for example:\n"
+            "• #ALRT\n"
             "• ALRT\n"
-            "• KEFI\n"
             "• Defence Holdings\n\n"
             "Or in one step: /link ALRT\n\n"
             "I will search UK AIM Micro-Cap and return the Telegram group link if one is saved.",
