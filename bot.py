@@ -1263,7 +1263,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🔗 *Group Link lookup*\n\n"
         "Type a *ticker* or *company name* and send it, for example:\n"
-        "• ` #GGP`\n"
+        "• '#GGP`\n"
         "• `GGP`\n"
         "• `Greatland Resources`\n\n"
         "I’ll search the UK AIM Micro-Cap database and return the Telegram group link if one is saved.",
