@@ -1676,16 +1676,6 @@ async def notify_admin_missing_group_link(
         except Exception as e:
             logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
 
-    # Always sync this activity to the user's Auth row in Notion
-    try:
-        await log_member_activity(
-            user,
-            REQUEST_TYPE_TG_LINK,
-            notes=f"Group link request: {query} | {detail[:200]}",
-        )
-    except Exception as e:
-        logger.error("log_member_activity after group-link request failed: %s", e)
-
 
 async def _send_link_results(
     update: Update,
@@ -1693,6 +1683,17 @@ async def _send_link_results(
     rows: list[dict],
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
+    # Exactly one activity log + history row per group-link search
+    if update.effective_user:
+        try:
+            await log_member_activity(
+                update.effective_user,
+                REQUEST_TYPE_TG_LINK,
+                notes=f"Group link search: {query}",
+            )
+        except Exception as e:
+            logger.error("group-link activity log failed: %s", e)
+
     submitted = (
         "Request submitted to the admin group.\n"
         "You will be notified once it is updated."
@@ -1770,7 +1771,6 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if args:
             query = " ".join(args).strip()
             rows = await lookup_telegram_group_links(query)
-            await log_member_activity(update.effective_user, REQUEST_TYPE_TG_LINK)
             await _send_link_results(update, query, rows, context)
             return
 
@@ -3569,8 +3569,13 @@ async def log_member_activity(
 
         count = 0
         count_prop = props.get("Request Count") or {}
-        if count_prop.get("type") == "number" and count_prop.get("number") is not None:
-            count = int(count_prop["number"])
+        if isinstance(count_prop, dict):
+            if count_prop.get("type") == "number" and count_prop.get("number") is not None:
+                count = int(count_prop["number"])
+            elif count_prop.get("number") is not None:
+                count = int(count_prop["number"])
+        elif isinstance(count_prop, (int, float)):
+            count = int(count_prop)
 
         update_props: dict = {
             "Last Request Date": {
