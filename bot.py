@@ -1240,36 +1240,42 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    if not _is_private(update):
+    try:
+        if not _is_private(update):
+            await update.message.reply_text(
+                "Group Link only works in a private 1-to-1 chat with me.\n\n"
+                "Open a private chat, tap 🔗 Link (or send /link), then type a ticker or company name."
+            )
+            return
+
+        if not await is_authorized(update, context):
+            await update.message.reply_text(
+                "Group Link is for authorised members only.\n\n"
+                "Send /request to ask for access, then check /status."
+            )
+            return
+
+        user = update.effective_user
+        if user:
+            _awaiting_link[user.id] = True
+
         await update.message.reply_text(
-            "🔗 *Group Link* only works in a private 1-to-1 chat with me.\n\n"
-            "Open a private chat → tap *🔗 Group Links* (or send /link) → then type a ticker or company name.",
-            parse_mode="Markdown",
+            "🔗 Group Link lookup\n\n"
+            "Type a ticker or company name and send it, for example:\n"
+            "• ALRT\n"
+            "• KEFI\n"
+            "• Defence Holdings\n\n"
+            "I will search the UK AIM Micro-Cap database and return the Telegram group link if one is saved.",
+            reply_markup=main_reply_keyboard(),
         )
-        return
-
-    if not await is_authorized(update, context):
-        await update.message.reply_text(
-            "🔒 Group Link is for *authorised members* only.\n\n"
-            "Send /request to ask for access, then check /status.",
-            parse_mode="Markdown",
-        )
-        return
-
-    user = update.effective_user
-    if user:
-        _awaiting_link[user.id] = True
-
-    await update.message.reply_text(
-        "🔗 *Group Link lookup*\n\n"
-        "Type a *ticker* or *company name* and send it, for example:\n"
-        "• '#GGP`\n"
-        "• `GGP`\n"
-        "• `Greatland Resources`\n\n"
-        "I’ll search the UK AIM Micro-Cap database and return the Telegram group link if one is saved.",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
+    except Exception as e:
+        logger.error("link_cmd failed: %s", e)
+        try:
+            await update.message.reply_text(
+                f"Could not start Group Link lookup.\nError: {e}"
+            )
+        except Exception:
+            pass
 
 # ------------------------------------------------------------
 # Command handlers
@@ -1304,7 +1310,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    if text in ("🔗 Group Links", "Link") or lower in ("link", "🔗 group link"):
+    if text in ("🔗 Link", "Link", "Group Link", "🔗 Group Link") or lower in (
+        "link",
+        "🔗 link",
+        "group link",
+        "🔗 group link",
+    ):
         await link_cmd(update, context)
         return
 
@@ -1318,37 +1329,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         query = text.strip()
         if not query:
             await update.message.reply_text(
-                "Please send a *ticker* or *company name* (e.g. `ALRT` or `Defence Holdings`).",
-                parse_mode="Markdown",
+                "Please send a ticker or company name (e.g. ALRT or Defence Holdings)."
             )
             return
 
-        rows = await lookup_telegram_group_links(query)
-        if not rows:
+        try:
+            rows = await lookup_telegram_group_links(query)
+        except Exception as e:
+            logger.error("lookup_telegram_group_links failed: %s", e)
             await update.message.reply_text(
-                f"🔍 No match found for *{query}* in UK AIM Micro-Cap.\n\n"
-                "Try another ticker or company name, or tap *🔗 Group Links* to search again.",
-                parse_mode="Markdown",
+                f"Could not search group links right now.\nError: {e}",
                 reply_markup=main_reply_keyboard(),
             )
             return
 
-        lines = [f"🔗 *Group links for* `{query}`\n"]
+        if not rows:
+            await update.message.reply_text(
+                f"No match found for {query} in UK AIM Micro-Cap.\n\n"
+                "Try another ticker or company name, or tap 🔗 Link to search again.",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+
+        lines = [f"🔗 Group links for {query}\n"]
         for r in rows[:8]:
-            link = r["link"]
+            link = r.get("link") or ""
             ticker = r.get("ticker") or "—"
             company = r.get("company") or "—"
             if link:
-                lines.append(f"• *#{ticker}* – {company}\n  👉 {link}")
+                lines.append(f"• #{ticker} – {company}\n  {link}")
             else:
                 lines.append(
-                    f"• *#{ticker}* – {company}\n  _No Telegram group link saved yet_"
+                    f"• #{ticker} – {company}\n  (No Telegram group link saved yet)"
                 )
 
-        lines.append("\n_Tap 🔗 Link to search again._")
+        lines.append("\nTap 🔗 Link to search again.")
         await update.message.reply_text(
             "\n".join(lines),
-            parse_mode="Markdown",
             disable_web_page_preview=False,
             reply_markup=main_reply_keyboard(),
         )
@@ -2880,5 +2897,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-    
