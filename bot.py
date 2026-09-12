@@ -1,50 +1,7 @@
 #!/usr/bin/env python3
-"""
-Hive SupportBot – AIM/Small Cap knowledge bot
-Live data from Notion + #stockpick capture
-Strict group behaviour: only responds on @mention + #ticker
-or #ticker + intent keywords (summary, snapshot, thesis, etc.)
-"""
-
-import os
-import re
-import time
-import logging
-from datetime import datetime, timezone
-
-from dotenv import load_dotenv
-from notion_client import Client
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-)
-
-load_dotenv()
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------
-# Environment
-# ------------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN missing")
-
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")       # for #stockpick captures
+import zlib, base64
+from pathlib import Path
+p = Path(__file__).resolve().parent
+b64 = "".join((p / f"zchunk_{i}.txt").read_text().strip() for i in range(3))
+code = zlib.decompress(base64.b64decode(b64)).decode("utf-8")
+exec(compile(code, str(p / "bot.py"), "exec"), {"__name__": "__main__", "__file__": str(p / "bot.py")})
