@@ -10,7 +10,6 @@ import os
 import re
 import time
 import logging
-import asyncio
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -74,12 +73,6 @@ _awaiting_link: dict[int, bool] = {}
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
-# admin_id -> missing Security Snapshot request (paste summary next)
-_awaiting_admin_snapshot: dict[int, dict] = {}
-# short req_id -> pending Security Snapshot request details
-_snapshot_requests: dict[str, dict] = {}
-# Serialize Notion activity history updates per Telegram user id
-_activity_locks: dict[int, asyncio.Lock] = {}
 _active_watchlist_name: dict[int, str] = {}
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
@@ -224,27 +217,32 @@ async def notify_admins_of_request(
     *,
     in_group: bool,
 ) -> None:
-    """DM all admins with a new access request + Approve/Reject buttons."""
+    """DM all admins with a new access request + Approve / Denied / Pending buttons."""
     text = (
-        "🔔 *New access request*\n\n"
+        "🔔 *New Bot Access request*\n\n"
         f"• Name: {user.full_name or '—'}\n"
         f"• Username: @{user.username or 'N/A'}\n"
         f"• Telegram ID: `{user.id}`\n"
         f"• Group member: {'Yes' if in_group else 'No'}\n"
         f"• Status: *Pending*\n\n"
-        "Review with the buttons below, or use:\n"
-        f"`/approve {user.id}`\n"
-        f"`/reject {user.id}`\n"
-        "`/pending` for the full list"
+        "Choose an action:\n"
+        "• ✅ *Approved* – grant access (Status = Authorised)\n"
+        "• 🚫 *Denied* – reject access (Status = Blocked)\n"
+        "• ⏳ *Pending* – leave in queue for later review\n\n"
+        "Commands:\n"
+        f"`/approve {user.id}`  `/reject {user.id}`  `/pending`"
     )
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Approve", callback_data=f"admin:approve:{user.id}"
+                    "✅ Approved", callback_data=f"admin:approve:{user.id}"
                 ),
                 InlineKeyboardButton(
-                    "🚫 Reject", callback_data=f"admin:reject:{user.id}"
+                    "🚫 Denied", callback_data=f"admin:reject:{user.id}"
+                ),
+                InlineKeyboardButton(
+                    "⏳ Pending", callback_data=f"admin:keeppending:{user.id}"
                 ),
             ],
             [
@@ -344,71 +342,6 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-    # ----- Security Snapshot request management -----
-    if action in ("snapadd", "snapdone", "snappending"):
-        if len(parts) < 3:
-            return
-        req_id = parts[2].strip()
-        req = _snapshot_requests.get(req_id)
-        if not req:
-            await query.message.reply_text(
-                "This Security Snapshot request expired or is unknown. "
-                "Ask the user to look up the ticker again."
-            )
-            return
-
-        target_id = req["user_id"]
-        ticker = req.get("ticker") or ""
-
-        if action == "snappending":
-            await query.message.reply_text(
-                f"⏳ Marked *Pending* for snapshot `{req_id}` (`#{ticker}`).\n"
-                f"User `{target_id}` has not been notified yet.",
-                parse_mode="Markdown",
-            )
-            return
-
-        if action == "snapdone":
-            try:
-                await context.bot.send_message(
-                    chat_id=int(target_id),
-                    text=(
-                        "📊 Your Security Snapshot request has been updated.\n\n"
-                        f"Search again for: #{ticker}\n"
-                        "Use `#TICKER snapshot` or mention the bot with the ticker."
-                    ),
-                )
-                await query.message.reply_text(
-                    f"✅ User `{target_id}` notified for `#{ticker}`.",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.error("snapdone notify failed: %s", e)
-                await query.message.reply_text(f"Could not notify user: {e}")
-            return
-
-        if action == "snapadd":
-            _awaiting_admin_snapshot[user.id] = {
-                "req_id": req_id,
-                "user_id": target_id,
-                "ticker": ticker,
-            }
-            await query.message.reply_text(
-                f"➕ *Add new Security Summary*\n\n"
-                f"Request: `{req_id}`\n"
-                f"Ticker: `#{ticker}`\n"
-                f"Requester: `{target_id}`\n\n"
-                "Send the summary in this format:\n"
-                "`Company Name`\n"
-                "`Research synopsis / next catalyst text...`\n\n"
-                "Line 1 = company name\n"
-                "Remaining lines = Summary & Next Catalyst\n\n"
-                "It will be saved to Notion UK AIM Micro-Cap and the user will be notified.\n"
-                "Send /cancelsnap to abort.",
-                parse_mode="Markdown",
-            )
-            return
-
     # ----- List all pending -----
     if action == "pending":
         if not notion or not db_id:
@@ -459,8 +392,8 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await query.message.reply_text(f"Error loading pending list:\n`{e}`", parse_mode="Markdown")
         return
 
-    # ----- Approve / Reject one user -----
-    if action not in ("approve", "reject") or len(parts) < 3:
+    # ----- Approve / Denied / keep Pending -----
+    if action not in ("approve", "reject", "keeppending") or len(parts) < 3:
         return
 
     target_id = parts[2].strip()
@@ -483,7 +416,20 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         page_id = results[0]["id"]
-        new_status = "Authorised" if action == "approve" else "Rejected"
+
+        if action == "keeppending":
+            notion.pages.update(
+                page_id=page_id,
+                properties={"Status": {"select": {"name": "Pending"}}},
+            )
+            await query.message.reply_text(
+                f"⏳ User `{target_id}` remains *Pending*.\n"
+                "You can approve or deny later with /pending or the buttons.",
+                parse_mode="Markdown",
+            )
+            return
+
+        new_status = "Authorised" if action == "approve" else "Blocked"
         notion.pages.update(
             page_id=page_id,
             properties={"Status": {"select": {"name": new_status}}},
@@ -508,7 +454,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
         else:
             await query.message.reply_text(
-                f"🚫 User `{target_id}` has been *Rejected*.",
+                f"🚫 User `{target_id}` has been *Denied*.",
                 parse_mode="Markdown",
             )
             try:
@@ -565,13 +511,13 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         notion.pages.update(
             page_id=page_id,
             properties={
-                "Status": {"select": {"name": "Rejected"}}
+                "Status": {"select": {"name": "Blocked"}}
             },
         )
         _authorized_cache["expires"] = 0
 
         await update.message.reply_text(
-            f"🚫 User `{target_id}` has been *Rejected*.",
+            f"🚫 User `{target_id}` has been *Blocked*.",
             parse_mode="Markdown",
         )
 
@@ -588,28 +534,21 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     open_glinks = len(_glink_requests)
-    open_snaps = len(_snapshot_requests)
     lines = [
         "🛠 *Admin control panel*\n",
-        "*1. User access (authorisation)*",
-        "• `/pending` – list Pending access requests",
-        "• `/approve <telegram_id>` – authorise user",
-        "• `/reject <telegram_id>` – reject user",
-        "• Inline buttons on each new access DM: Approve / Reject\n",
-        "*2. Group Links requests*",
+        "*1. Bot Access requests (Authorised Users)*",
+        "When a member sends /request you receive a DM with 3 buttons:",
+        "• ✅ *Approved* – set Status = Authorised, notify user",
+        "• 🚫 *Denied* – set Status = Blocked, notify user",
+        "• ⏳ *Pending* – keep in queue for later review",
+        "Commands: `/pending`  `/approve <id>`  `/reject <id>`\n",
+        "*2. Group Links / Security Summary requests*",
         "When a member searches 🔗 Group Links and no link is saved, you get a DM with:",
         "• ➕ *Add new group links* – paste `https://t.me/...`, save to Notion, notify user",
-        "• ✅ *Added – Notify User* – notify only",
-        "• ⏳ *Pending* – no user notify",
-        "• `/cancelglink` – abort add\n",
-        "*3. Security Snapshot requests*",
-        "When a member looks up a ticker missing from UK AIM Micro-Cap, you get a DM with:",
-        "• ➕ *Add new Security Summary* – paste company + summary, save to Notion, notify user",
-        "• ✅ *Added – Notify User* – notify only",
-        "• ⏳ *Pending* – no user notify",
-        "• `/cancelsnap` – abort add\n",
-        f"Open Group Links requests: *{open_glinks}*",
-        f"Open Security Snapshot requests: *{open_snaps}*",
+        "• ✅ *Added – Notify User* – notify only (if you already updated Notion)",
+        "• ⏳ *Pending* – mark as pending (no user notify)",
+        "• `/cancelglink` – cancel if you started Add but change your mind\n",
+        f"Open Group Links requests in memory: *{open_glinks}*",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -790,7 +729,9 @@ async def sync_group_member_to_notion(
         notion.pages.update(
             page_id=results[0]["id"],
             properties={
-                "Group Member": {"checkbox": is_member}
+                "Group Member": {
+                    "select": {"name": "Yes" if is_member else "No"}
+                }
             },
         )
         logger.info(
@@ -1605,227 +1546,12 @@ async def notify_admin_missing_group_link(
             logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
 
 
-async def save_security_summary_to_notion(
-    ticker: str, company: str, summary: str
-) -> tuple[bool, str]:
-    """Create or update UK AIM Micro-Cap row with Security Summary for a ticker."""
-    if not notion:
-        return False, "Notion is not configured."
-    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
-    if not db_id:
-        return False, "NOTION_TICKERS_DB_ID missing."
-
-    raw = db_id.replace("-", "")
-    if len(raw) == 32 and "-" not in db_id:
-        db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
-
-    ticker_u = ticker.lstrip("#").upper().strip()
-    company = (company or ticker_u).strip()
-    summary = (summary or "").strip()
-    if not summary:
-        return False, "Summary text is empty."
-
-    try:
-        # Find existing page by ticker
-        page_id = None
-        for f in (
-            {"property": "Ticker", "title": {"equals": ticker_u}},
-            {"property": "Ticker", "rich_text": {"equals": ticker_u}},
-        ):
-            try:
-                response = notion.databases.query(
-                    database_id=db_id, filter=f, page_size=1
-                )
-                results = response.get("results", [])
-                if results:
-                    page_id = results[0]["id"]
-                    break
-            except Exception:
-                continue
-
-        # Build properties – try common schema field names
-        def text_prop(name: str, value: str, as_title: bool = False) -> dict:
-            if as_title:
-                return {name: {"title": [{"text": {"content": value[:2000]}}]}}
-            return {name: {"rich_text": [{"text": {"content": value[:2000]}}]}}
-
-        if page_id:
-            page = notion.pages.retrieve(page_id=page_id)
-            props = page.get("properties", {})
-            update_props: dict = {}
-            # Company
-            for name in ("Company", "Name", "Company Name"):
-                if name in props:
-                    ptype = props[name].get("type")
-                    if ptype == "title":
-                        update_props[name] = {
-                            "title": [{"text": {"content": company[:2000]}}]
-                        }
-                    elif ptype == "rich_text":
-                        update_props[name] = {
-                            "rich_text": [{"text": {"content": company[:2000]}}]
-                        }
-                    break
-            # Summary
-            for name in (
-                "Summary & Next Catalyst",
-                "Summary",
-                "Overview",
-                "Company Overview",
-            ):
-                if name in props and props[name].get("type") == "rich_text":
-                    update_props[name] = {
-                        "rich_text": [{"text": {"content": summary[:2000]}}]
-                    }
-                    break
-            if not update_props:
-                return False, "Could not map Company/Summary fields on existing page."
-            notion.pages.update(page_id=page_id, properties=update_props)
-        else:
-            # Create new page – Ticker as title is the usual schema
-            create_props = {
-                "Ticker": {"title": [{"text": {"content": ticker_u}}]},
-            }
-            # Best-effort optional fields (ignore if schema rejects – try minimal)
-            try:
-                create_props["Company"] = {
-                    "rich_text": [{"text": {"content": company[:2000]}}]
-                }
-            except Exception:
-                pass
-            try:
-                create_props["Summary & Next Catalyst"] = {
-                    "rich_text": [{"text": {"content": summary[:2000]}}]
-                }
-            except Exception:
-                pass
-            try:
-                notion.pages.create(
-                    parent={"database_id": db_id},
-                    properties=create_props,
-                )
-            except Exception as e1:
-                # Retry minimal: title only + summary if company failed
-                logger.warning("Full create failed, retrying minimal: %s", e1)
-                minimal = {
-                    "Ticker": {"title": [{"text": {"content": ticker_u}}]},
-                }
-                notion.pages.create(
-                    parent={"database_id": db_id},
-                    properties=minimal,
-                )
-                # Second update with text fields
-                rows = await lookup_telegram_group_links(ticker_u)
-                # Re-query page
-                for f in (
-                    {"property": "Ticker", "title": {"equals": ticker_u}},
-                ):
-                    response = notion.databases.query(
-                        database_id=db_id, filter=f, page_size=1
-                    )
-                    results = response.get("results", [])
-                    if results:
-                        page_id = results[0]["id"]
-                        notion.pages.update(
-                            page_id=page_id,
-                            properties={
-                                "Company": {
-                                    "rich_text": [
-                                        {"text": {"content": company[:2000]}}
-                                    ]
-                                },
-                                "Summary & Next Catalyst": {
-                                    "rich_text": [
-                                        {"text": {"content": summary[:2000]}}
-                                    ]
-                                },
-                            },
-                        )
-                        break
-
-        _ticker_cache.pop(ticker_u, None)
-        return True, f"Security summary saved for #{ticker_u}."
-    except Exception as e:
-        logger.error("save_security_summary_to_notion failed: %s", e)
-        return False, str(e)
-
-
-async def notify_admin_missing_snapshot(
-    context: ContextTypes.DEFAULT_TYPE,
-    user,
-    ticker: str,
-) -> None:
-    """DM admin R when a Security Snapshot ticker is missing."""
-    if not context or not user or not ticker:
-        return
-    ticker_u = ticker.lstrip("#").upper().strip()
-    req_id = f"s{int(time.time()) % 1000000:06d}"
-    _snapshot_requests[req_id] = {
-        "user_id": user.id,
-        "ticker": ticker_u,
-        "name": user.full_name or "—",
-        "username": user.username or "N/A",
-    }
-    text = (
-        "📊 *New Security Snapshot request*\n\n"
-        f"• Name: {user.full_name or '—'}\n"
-        f"• Username: @{user.username or 'N/A'}\n"
-        f"• Telegram ID: `{user.id}`\n"
-        f"• Ticker: `#{ticker_u}`\n"
-        f"• Request ID: `{req_id}`\n\n"
-        "No row found in UK AIM Micro-Cap.\n"
-        "Choose an action:"
-    )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "➕ Add new Security Summary",
-                    callback_data=f"admin:snapadd:{req_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Added – Notify User",
-                    callback_data=f"admin:snapdone:{req_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⏳ Pending",
-                    callback_data=f"admin:snappending:{req_id}",
-                )
-            ],
-        ]
-    )
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to notify admin %s of missing snapshot: %s", admin_id, e
-            )
-
-
 async def _send_link_results(
     update: Update,
     query: str,
     rows: list[dict],
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
-    # Track engagement on Authorised Users DB
-    if update.effective_user:
-        await record_member_activity(
-            update.effective_user,
-            REQUEST_TYPE_TELEGRAM_LINK,
-            detail=query,
-        )
-
     submitted = (
         "Request submitted to the admin group.\n"
         "You will be notified once it is updated."
@@ -1903,6 +1629,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if args:
             query = " ".join(args).strip()
             rows = await lookup_telegram_group_links(query)
+            await log_member_activity(update.effective_user, REQUEST_TYPE_TG_LINK)
             await _send_link_results(update, query, rows, context)
             return
 
@@ -1996,55 +1723,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user and is_admin(user) and lower in ("/cancelglink", "cancelglink"):
         _awaiting_admin_glink.pop(user.id, None)
         await update.message.reply_text("Cancelled Group Links add.")
-        return
-
-    # --- Admin: paste Security Summary after "Add new Security Summary" ---
-    if user and is_admin(user) and user.id in _awaiting_admin_snapshot:
-        state = _awaiting_admin_snapshot.pop(user.id)
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        if len(lines) < 2:
-            _awaiting_admin_snapshot[user.id] = state
-            await update.message.reply_text(
-                "Please send at least 2 lines:\n"
-                "1) Company name\n"
-                "2+) Summary & next catalyst\n\n"
-                "Or /cancelsnap to abort."
-            )
-            return
-        company = lines[0]
-        summary = "\n".join(lines[1:])
-        ticker = state.get("ticker") or ""
-        ok, msg = await save_security_summary_to_notion(ticker, company, summary)
-        target_id = state.get("user_id")
-        if ok:
-            try:
-                if target_id:
-                    await context.bot.send_message(
-                        chat_id=int(target_id),
-                        text=(
-                            "📊 Your Security Snapshot request has been updated.\n\n"
-                            f"Look up again: #{ticker} snapshot"
-                        ),
-                    )
-                await update.message.reply_text(
-                    f"✅ {msg}\nUser `{target_id}` has been notified.",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                await update.message.reply_text(
-                    f"✅ Saved to Notion.\n{msg}\nCould not notify user: {e}"
-                )
-        else:
-            await update.message.reply_text(
-                f"❌ Could not save Security Summary.\n{msg}\n\n"
-                "You can add it manually in UK AIM Micro-Cap, then use "
-                "✅ Added – Notify User."
-            )
-        return
-
-    if user and is_admin(user) and lower in ("/cancelsnap", "cancelsnap"):
-        _awaiting_admin_snapshot.pop(user.id, None)
-        await update.message.reply_text("Cancelled Security Summary add.")
         return
 
     # --- Persistent keyboard shortcuts ---
@@ -2210,13 +1888,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not await require_authorized(update, context):
             return
 
-        if user:
-            await record_member_activity(
-                user,
-                REQUEST_TYPE_STOCKPICK,
-                detail=(clean_text[:200] if clean_text else None),
-            )
-
         if await has_submitted_this_month(user):
             month_name = datetime.now(timezone.utc).strftime("%B")
             page_id = _last_stockpick_page.get(user.id)
@@ -2260,6 +1931,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if page_id:
             _last_stockpick_page[user.id] = page_id
+            await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
@@ -2298,16 +1970,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not await require_authorized(update, context):
             return
         for t in tickers:
-            # One history line per ticker so multi-lookups all appear in Notion
-            if user:
-                await record_member_activity(
-                    user,
-                    REQUEST_TYPE_SNAPSHOT,
-                    detail=f"#{t}",
-                )
             try:
                 data = await get_ticker_from_notion(t)
                 if data:
+                    await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
                     try:
                         stockpickers = await get_stockpickers_for_ticker(t)
                     except Exception as e:
@@ -2320,12 +1986,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         await update.message.reply_text(body)
                 else:
                     await update.message.reply_text(
-                        f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot.\n\n"
-                        "Request submitted to the admin group.\n"
-                        "You will be notified once it is updated."
+                        f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot."
                     )
-                    if context and user:
-                        await notify_admin_missing_snapshot(context, user, t)
             except Exception as e:
                 logger.error("Ticker lookup path failed for %s: %s", t, e)
                 await update.message.reply_text(
@@ -2448,16 +2110,61 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📊 *Company snapshot*\n\n"
-        "In the group or here, use a hashtag ticker:\n"
-        "• `#KEFI summary`\n"
-        "• `#ALRT snapshot`\n"
-        "• `@Bot #AVCT thesis`\n\n"
-        "I’ll pull the live UK AIM Micro-Cap snapshot.",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
+    """
+    /snap              → short help
+    /snap #80M         → snapshot for authorised users
+    /snap 80M          → same
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not msg:
+        return
+
+    raw = " ".join(context.args) if context.args else ""
+    tickers = extract_hashtag_tickers(raw)
+
+    if not tickers and context.args:
+        for a in context.args:
+            t = a.lstrip("#").upper().strip()
+            if t and re.fullmatch(r"[A-Z0-9]{1,5}", t):
+                tickers.append(t)
+
+    if not tickers:
+        await msg.reply_text(
+            "📊 *Company snapshot*\n\n"
+            "Use one of:\n"
+            "• `/snap #80M`\n"
+            "• `#80M #summary`\n"
+            "• `#KEFI #snapshot`\n\n"
+            "A bare `#TICKER` alone is ignored.",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if not await is_authorized(update, context):
+        await msg.reply_text(
+            "🔒 Only authorised members can request snapshots.\n"
+            "Send /request to ask for access."
+        )
+        return
+
+    for t in tickers:
+        data = await get_ticker_from_notion(t)
+        if data:
+            await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
+            stockpickers = await get_stockpickers_for_ticker(t)
+            await msg.reply_text(
+                format_reply(t, data, stockpickers),
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+        else:
+            await msg.reply_text(
+                f"I don’t have *#{t}* in the current UK AIM Micro-Cap snapshot.",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
 
 async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -3021,7 +2728,13 @@ async def handle_watchlist_text(
 async def create_access_request(
     user, *, is_group_member_flag: bool | None = None
 ) -> tuple[bool, str]:
-    """Create a Pending access request in Notion."""
+    """
+    Upsert a Pending access request in Notion Auth DB.
+    - If a row for this Telegram User ID already exists → set Status = Pending
+      (and refresh name/username).
+    - Otherwise create a new row with Status = Pending.
+    Returns (success, message).
+    """
     if not notion:
         return False, "Notion client is not initialised (NOTION_TOKEN missing?)"
 
@@ -3029,55 +2742,79 @@ async def create_access_request(
     if not db_id:
         return False, "NOTION_AUTH_DB_ID / NOTION_DATABASE_ID is missing"
 
+    uid_str = str(user.id)
     try:
-        properties = {
-            "Telegram User ID": {
-                "title": [{"text": {"content": str(user.id)}}]
+        # 1) Look for existing page
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": uid_str},
             },
+            page_size=1,
+        )
+        results = response.get("results", [])
+
+        base_props = {
             "Status": {"select": {"name": "Pending"}},
             "Full Name": {
                 "rich_text": [
                     {"text": {"content": (user.full_name or "Unknown")[:100]}}
                 ]
             },
-            "Date Added": {
-                "date": {
-                    "start": datetime.now(timezone.utc).date().isoformat()
-                }
-            },
         }
-
         if user.username:
-            properties["Username"] = {
+            base_props["Username"] = {
                 "rich_text": [{"text": {"content": user.username}}]
             }
 
-        # Only include Group Member if we know the value.
-        # If the property does not exist, first create without it, then try update.
-        notion.pages.create(
-            parent={"database_id": db_id},
-            properties=properties,
-        )
+        if results:
+            page_id = results[0]["id"]
+            notion.pages.update(page_id=page_id, properties=base_props)
+            logger.info(
+                "Updated existing auth row to Pending for user %s (page %s)",
+                uid_str,
+                page_id,
+            )
+        else:
+            create_props = {
+                "Telegram User ID": {
+                    "title": [{"text": {"content": uid_str}}]
+                },
+                **base_props,
+                "Date Added": {
+                    "date": {
+                        "start": datetime.now(timezone.utc).date().isoformat()
+                    }
+                },
+            }
+            notion.pages.create(
+                parent={"database_id": db_id},
+                properties=create_props,
+            )
+            logger.info("Created new Pending auth row for user %s", uid_str)
 
-        # Best-effort: set Group Member after create
+        # Best-effort Group Member (select: Yes / No)
         if is_group_member_flag is not None:
             try:
-                response = notion.databases.query(
+                response2 = notion.databases.query(
                     database_id=db_id,
                     filter={
                         "property": "Telegram User ID",
-                        "title": {"equals": str(user.id)},
+                        "title": {"equals": uid_str},
                     },
                     page_size=1,
                 )
-                results = response.get("results", [])
-                if results:
+                pages = response2.get("results", [])
+                if pages:
                     notion.pages.update(
-                        page_id=results[0]["id"],
+                        page_id=pages[0]["id"],
                         properties={
                             "Group Member": {
                                 "select": {
-                                    "name": "Yes" if is_group_member_flag else "No"
+                                    "name": "Yes"
+                                    if is_group_member_flag
+                                    else "No"
                                 }
                             }
                         },
@@ -3090,7 +2827,9 @@ async def create_access_request(
         return True, "OK"
 
     except Exception as e:
-        logger.error("Failed to create access request: %s", e)
+        logger.error(
+            "Failed to create/update access request for %s: %s", uid_str, e
+        )
         return False, str(e)
 
 async def request_access(
@@ -3124,35 +2863,31 @@ async def request_access(
         )
         return
 
-    # Must be in the group first
+    # Group membership is recorded on the request but does NOT block submission.
+    # Admin still gets the DM and can approve/deny from Notion.
     if os.getenv("TELEGRAM_GROUP_ID") and not in_group:
-        await update.message.reply_text(
-            "Access status\n\n"
-            f"Telegram User ID: {user.id}  {'OK' if has_valid_id else 'Missing'}\n"
-            f"Group member: No\n"
-            f"Detail: {group_detail}\n"
-            f"Admin authorised: {'Yes' if in_notion else 'No'}\n\n"
-            "Result: ACCESS DENIED\n\n"
-            "To get access you need all 3:\n"
-            "1) Valid Telegram user ID\n"
-            "2) Be a member of The Hive group\n"
-            "3) Admin approval (Status = Authorised)\n\n"
-            "Next step: join The Hive group https://t.me/+kqnqJM9XaNAzZTU8, then send /request again."
+        logger.info(
+            "Access request from non-member user_id=%s detail=%s – still creating Pending",
+            user.id,
+            group_detail,
         )
-        return
-        
-    # Notify admins
-    await notify_admins_of_request(context, user, in_group=in_group)
-    
-    # Submit Pending request
+
+    # Submit Pending request (upsert into Notion)
     success, info = await create_access_request(
         user, is_group_member_flag=in_group
     )
 
+    # Always try to notify admin R (even if Notion write failed)
+    try:
+        await notify_admins_of_request(context, user, in_group=in_group)
+    except Exception as e:
+        logger.error("notify_admins_of_request crashed: %s", e)
+
     if not success:
         await update.message.reply_text(
-            "Could not submit your request.\n\n"
-            f"Error: {info}"
+            "Your request was sent to an admin, but saving to Notion failed.\n\n"
+            f"Error: {info}\n\n"
+            "An admin has still been notified. Please wait or contact Hive support."
         )
         return
 
@@ -3174,7 +2909,7 @@ async def request_access(
         f"2) Group membership: {'Yes' if in_group else 'No'}\n\n"
         "Still required:\n"
         "3) Admin approval in Notion (Status = Authorised)\n\n"
-        "An admin will review your request.\n"
+        "An admin has been notified and will review your request.\n"
         "Check progress anytime with /status."
     )
 
@@ -3355,233 +3090,6 @@ async def get_authorized_users() -> dict:
             "usernames": _authorized_cache.get("usernames", set()),
             "user_ids": _authorized_cache.get("user_ids", set()),
         }
-
-
-# Request types written to Notion "Request Type" select
-REQUEST_TYPE_TELEGRAM_LINK = "Telegram link"
-REQUEST_TYPE_STOCKPICK = "Stockpick"
-REQUEST_TYPE_SNAPSHOT = "Security snapshot"
-
-
-async def _find_auth_user_page_id(user) -> str | None:
-    """Locate the user's row in Hive Bot Authorised Users by Telegram User ID."""
-    if not notion or not user:
-        return None
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
-        return None
-    uid = str(user.id).strip()
-    try:
-        for prop_name in ("Telegram User ID", "Telegram ID", "User ID"):
-            for filter_type in ("title", "rich_text"):
-                try:
-                    response = notion.databases.query(
-                        database_id=db_id,
-                        filter={
-                            "property": prop_name,
-                            filter_type: {"equals": uid},
-                        },
-                        page_size=1,
-                    )
-                    results = response.get("results", [])
-                    if results:
-                        return results[0]["id"]
-                except Exception:
-                    continue
-        # Fallback: match by username
-        uname = (user.username or "").strip().lstrip("@")
-        if uname:
-            for prop_name in ("Username", "Telegram Username"):
-                try:
-                    response = notion.databases.query(
-                        database_id=db_id,
-                        filter={
-                            "property": prop_name,
-                            "rich_text": {"equals": uname},
-                        },
-                        page_size=1,
-                    )
-                    results = response.get("results", [])
-                    if results:
-                        return results[0]["id"]
-                except Exception:
-                    try:
-                        response = notion.databases.query(
-                            database_id=db_id,
-                            filter={
-                                "property": prop_name,
-                                "title": {"equals": uname},
-                            },
-                            page_size=1,
-                        )
-                        results = response.get("results", [])
-                        if results:
-                            return results[0]["id"]
-                    except Exception:
-                        continue
-    except Exception as e:
-        logger.error("_find_auth_user_page_id failed: %s", e)
-    return None
-
-
-async def record_member_activity(
-    user,
-    request_type: str,
-    detail: str | None = None,
-) -> None:
-    """
-    Update Hive Bot Authorised Users for this member:
-      - Last Request Date (date) – latest only
-      - Request Type (select) – latest only
-      - Request History (rich_text) – APPEND full history list (newest first)
-      - Request Count (number) – increment if present
-
-    Uses a per-user lock so rapid back-to-back requests (e.g. 3 snapshots)
-    do not overwrite each other.
-    Best-effort: never raises to the caller.
-    """
-    if not notion or not user:
-        return
-
-    lock = _activity_locks.setdefault(user.id, asyncio.Lock())
-    async with lock:
-        try:
-            page_id = await _find_auth_user_page_id(user)
-            if not page_id:
-                logger.info(
-                    "Activity not recorded – no auth page for user_id=%s type=%s",
-                    user.id,
-                    request_type,
-                )
-                return
-
-            # Small pause so a previous Notion write is visible on re-read
-            await asyncio.sleep(0.35)
-
-            page = notion.pages.retrieve(page_id=page_id)
-            props_schema = page.get("properties", {})
-            now = datetime.now(timezone.utc)
-            today = now.date().isoformat()
-            # Include seconds so rapid entries stay distinct
-            stamp = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-            update_props: dict = {}
-
-            # 1) Last Request Date (latest)
-            for name in (
-                "Last Request Date",
-                "Last Request",
-                "Last Activity Date",
-                "Last Active",
-                "Date Last Request",
-            ):
-                if name in props_schema and props_schema[name].get("type") == "date":
-                    update_props[name] = {"date": {"start": today}}
-                    break
-
-            # 2) Request Type (latest)
-            for name in ("Request Type", "Last Request Type", "Activity Type"):
-                if name not in props_schema:
-                    continue
-                ptype = props_schema[name].get("type")
-                if ptype == "select":
-                    update_props[name] = {"select": {"name": request_type}}
-                elif ptype == "rich_text":
-                    update_props[name] = {
-                        "rich_text": [{"text": {"content": request_type[:2000]}}]
-                    }
-                break
-
-            # 3) Append to Request History (aggregated list per member)
-            history_line = f"{stamp} | {request_type}"
-            if detail:
-                d = " ".join(str(detail).split())
-                if len(d) > 120:
-                    d = d[:117] + "..."
-                history_line += f" | {d}"
-
-            history_names = (
-                "Request History",
-                "Activity History",
-                "Request Log",
-                "Activity Log",
-            )
-            for name in history_names:
-                if name not in props_schema:
-                    continue
-                if props_schema[name].get("type") != "rich_text":
-                    continue
-                existing = _get_plain_text(props_schema.get(name)).strip()
-                # Deduplicate exact same line at top (retries)
-                if existing.startswith(history_line):
-                    combined = existing
-                elif existing:
-                    combined = history_line + "\n" + existing
-                else:
-                    combined = history_line
-                # Keep newest lines within Notion rich_text limit
-                if len(combined) > 1900:
-                    lines = combined.split("\n")
-                    kept: list[str] = []
-                    size = 0
-                    for ln in lines:
-                        add = len(ln) + (1 if kept else 0)
-                        if size + add > 1900:
-                            break
-                        kept.append(ln)
-                        size += add
-                    combined = "\n".join(kept)
-                update_props[name] = {
-                    "rich_text": [{"text": {"content": combined}}]
-                }
-                break
-
-            # 4) Optional Request Count increment
-            for name in ("Request Count", "Activity Count", "Total Requests"):
-                if name not in props_schema:
-                    continue
-                if props_schema[name].get("type") != "number":
-                    continue
-                current = props_schema[name].get("number")
-                try:
-                    n = int(current) if current is not None else 0
-                except Exception:
-                    n = 0
-                update_props[name] = {"number": n + 1}
-                break
-
-            # 5) Last Request Detail (latest only)
-            if detail:
-                for name in ("Last Request Detail", "Last Activity Detail"):
-                    if (
-                        name in props_schema
-                        and props_schema[name].get("type") == "rich_text"
-                    ):
-                        update_props[name] = {
-                            "rich_text": [
-                                {"text": {"content": str(detail)[:2000]}}
-                            ]
-                        }
-                        break
-
-            if not update_props:
-                logger.warning(
-                    "Activity fields missing on auth DB page %s – add "
-                    "'Last Request Date' (date), 'Request Type' (select), "
-                    "and 'Request History' (rich text)",
-                    page_id,
-                )
-                return
-
-            notion.pages.update(page_id=page_id, properties=update_props)
-            logger.info(
-                "Recorded activity user=%s type=%s detail=%s",
-                user.id,
-                request_type,
-                detail or "",
-            )
-        except Exception as e:
-            logger.error("record_member_activity failed: %s", e)
-
 
 # ------------------------------------------------------------
 # Message handling – STRICT
@@ -3768,12 +3276,76 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
         # Optional: auto-revoke Authorised when they leave
         if not is_member:
             props["Status"] = {"select": {"name": "Pending"}}
-            # or use "Blocked" / "Rejected" if you prefer
+            # Status options in Notion: Authorised | Pending | Blocked
 
         notion.pages.update(page_id=page_id, properties=props)
         _authorized_cache["expires"] = 0
     except Exception as e:
         logger.error("mark_group_member_in_notion failed for %s: %s", user.id, e)
+
+
+REQUEST_TYPE_STOCKPICK = "Stockpick"
+REQUEST_TYPE_SNAPSHOT = "Security snapshot"
+REQUEST_TYPE_TG_LINK = "Telegram link"
+
+
+async def log_member_activity(user, request_type: str) -> None:
+    """Update Hive Bot Authorised Users with last request date/type and increment count."""
+    if not notion or not user:
+        return
+
+    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not db_id:
+        return
+
+    try:
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            logger.info("log_member_activity: no auth row for user %s", user.id)
+            return
+
+        page = results[0]
+        page_id = page["id"]
+        props = page.get("properties", {})
+
+        count = 0
+        count_prop = props.get("Request Count") or {}
+        if count_prop.get("type") == "number" and count_prop.get("number") is not None:
+            count = int(count_prop["number"])
+
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Last Request Date": {
+                    "date": {
+                        "start": datetime.now(timezone.utc).date().isoformat()
+                    }
+                },
+                "Last Request Type": {
+                    "select": {"name": request_type}
+                },
+                "Request Count": {
+                    "number": count + 1
+                },
+            },
+        )
+        logger.info(
+            "Logged activity user=%s type=%s count=%s",
+            user.id,
+            request_type,
+            count + 1,
+        )
+    except Exception as e:
+        logger.error("log_member_activity failed for %s: %s", user.id, e)
+
         
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
