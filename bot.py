@@ -1400,12 +1400,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    if text in ("🔗 Link", "Link", "Group Link", "🔗 Group Link") or lower in (
-        "link",
-        "🔗 link",
-        "group link",
-        "🔗 group link",
+    # Match Link button even if emoji/spacing differs
+    if (
+        text in ("🔗 Link", "Link", "Group Link", "🔗 Group Link")
+        or lower in ("link", "🔗 link", "group link", "🔗 group link")
+        or (lower.replace("🔗", "").strip() == "link")
+        or (len(text) <= 24 and "link" in lower and "stock" not in lower)
     ):
+        logger.info("Link button matched text=%r", text)
         await link_cmd(update, context)
         return
 
@@ -1631,14 +1633,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
         return
 
-    # 3. Pure @mention with no #ticker
-    await update.message.reply_text(
-        "Hi! To look up a ticker use:\n"
-        "`@Bot #KEFI summary` or `#KEFI snapshot`\n"
-        "Or use `#stockpick` to save an idea.",
-        parse_mode="Markdown",
-    )
-    
+    # 3. Fallback help (private vs group)
+    if _is_private(update):
+        await update.message.reply_text(
+            "Use the buttons below, or try:\n"
+            "• /link ALRT – Group Link lookup\n"
+            "• #KEFI snapshot – ticker summary\n"
+            "• #stockpick my idea – save a pick\n"
+            "• /menu – full command list",
+            reply_markup=main_reply_keyboard(),
+        )
+    else:
+        await update.message.reply_text(
+            "Hi! To look up a ticker use:\n"
+            "@Bot #KEFI summary or #KEFI snapshot\n"
+            "Or use #stockpick to save an idea."
+        )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name if user else "there"
@@ -2715,77 +2726,7 @@ async def find_this_month_stockpick_page(user) -> str | None:
         logger.error("find_this_month_stockpick_page failed: %s", e)
         return None
 
-        user_name = user.full_name if user else "Unknown"
-        tickers = extract_hashtag_tickers(clean_text)
-        ticker = tickers[0] if tickers else None
-        period_type, period_value = extract_period(clean_text)
 
-        page_id = await save_stockpick_to_notion(
-            clean_text,
-            user_name,
-            ticker,
-            period_type,
-            period_value,
-            user_id=user.id if user else None,
-        )
-
-        if page_id:
-            _last_stockpick_page[user.id] = page_id
-
-            reply = "✅ Captured your #stockpick"
-            if ticker:
-                reply += f" (#{ticker})"
-            if period_type and period_value:
-                reply += f"\n📅 {period_type}: *{period_value}*"
-            reply += "\nYour pick has been saved.\n\nWhat would you like to do next?"
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
-                ],
-                [
-                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-                ],
-            ]
-            await update.message.reply_text(
-                reply,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-        else:
-            await update.message.reply_text(
-                "✅ Received your #stockpick.\n"
-                "(Could not save it right now – please try again later or contact an admin.)"
-            )
-        return
-
-    # 2. Ticker lookup – ONLY from hashtags
-    tickers = extract_hashtag_tickers(clean_text)
-    if tickers:
-        for t in tickers:
-            data = await get_ticker_from_notion(t)
-            if data:
-                await update.message.reply_text(
-                    format_reply(t, data),
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text(
-                    f"I don’t have *#{t}* in the current UK AIM Micro-Cap snapshot.",
-                    parse_mode="Markdown",
-                )
-        return
-
-    # 3. Pure @mention with no #ticker
-    await update.message.reply_text(
-        "Hi! To look up a ticker use:\n"
-        "`@Bot #KEFI summary` or `#KEFI snapshot`\n"
-        "Or use `#stockpick` to save an idea.",
-        parse_mode="Markdown",
-    )
-    
 from telegram.ext import ChatMemberHandler
 from telegram import ChatMemberUpdated, ChatMember
 
