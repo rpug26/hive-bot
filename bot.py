@@ -73,6 +73,10 @@ _awaiting_link: dict[int, bool] = {}
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
+# admin_id -> missing Security Snapshot request (paste summary next)
+_awaiting_admin_snapshot: dict[int, dict] = {}
+# short req_id -> pending Security Snapshot request details
+_snapshot_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
@@ -337,6 +341,71 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
+    # ----- Security Snapshot request management -----
+    if action in ("snapadd", "snapdone", "snappending"):
+        if len(parts) < 3:
+            return
+        req_id = parts[2].strip()
+        req = _snapshot_requests.get(req_id)
+        if not req:
+            await query.message.reply_text(
+                "This Security Snapshot request expired or is unknown. "
+                "Ask the user to look up the ticker again."
+            )
+            return
+
+        target_id = req["user_id"]
+        ticker = req.get("ticker") or ""
+
+        if action == "snappending":
+            await query.message.reply_text(
+                f"⏳ Marked *Pending* for snapshot `{req_id}` (`#{ticker}`).\n"
+                f"User `{target_id}` has not been notified yet.",
+                parse_mode="Markdown",
+            )
+            return
+
+        if action == "snapdone":
+            try:
+                await context.bot.send_message(
+                    chat_id=int(target_id),
+                    text=(
+                        "📊 Your Security Snapshot request has been updated.\n\n"
+                        f"Search again for: #{ticker}\n"
+                        "Use `#TICKER snapshot` or mention the bot with the ticker."
+                    ),
+                )
+                await query.message.reply_text(
+                    f"✅ User `{target_id}` notified for `#{ticker}`.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.error("snapdone notify failed: %s", e)
+                await query.message.reply_text(f"Could not notify user: {e}")
+            return
+
+        if action == "snapadd":
+            _awaiting_admin_snapshot[user.id] = {
+                "req_id": req_id,
+                "user_id": target_id,
+                "ticker": ticker,
+            }
+            await query.message.reply_text(
+                f"➕ *Add new Security Summary*\n\n"
+                f"Request: `{req_id}`\n"
+                f"Ticker: `#{ticker}`\n"
+                f"Requester: `{target_id}`\n\n"
+                "Send the summary in this format:\n"
+                "`Company Name`\n"
+                "`Research synopsis / next catalyst text...`\n\n"
+                "Line 1 = company name\n"
+                "Remaining lines = Summary & Next Catalyst\n\n"
+                "It will be saved to Notion UK AIM Micro-Cap and the user will be notified.\n"
+                "Send /cancelsnap to abort.",
+                parse_mode="Markdown",
+            )
+            return
+
     # ----- List all pending -----
     if action == "pending":
         if not notion or not db_id:
@@ -516,6 +585,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     open_glinks = len(_glink_requests)
+    open_snaps = len(_snapshot_requests)
     lines = [
         "🛠 *Admin control panel*\n",
         "*1. User access (authorisation)*",
@@ -525,11 +595,18 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Inline buttons on each new access DM: Approve / Reject\n",
         "*2. Group Links requests*",
         "When a member searches 🔗 Group Links and no link is saved, you get a DM with:",
-        "• ➕ *Add new group links* – bot asks you to paste the `https://t.me/...` link, saves it to Notion UK AIM Micro-Cap, notifies the user",
-        "• ✅ *Added – Notify User* – notify the user only (if you already updated Notion yourself)",
-        "• ⏳ *Pending* – mark as pending (no user notify)",
-        "• `/cancelglink` – cancel if you started Add but change your mind\n",
-        f"Open Group Links requests in memory: *{open_glinks}*",
+        "• ➕ *Add new group links* – paste `https://t.me/...`, save to Notion, notify user",
+        "• ✅ *Added – Notify User* – notify only",
+        "• ⏳ *Pending* – no user notify",
+        "• `/cancelglink` – abort add\n",
+        "*3. Security Snapshot requests*",
+        "When a member looks up a ticker missing from UK AIM Micro-Cap, you get a DM with:",
+        "• ➕ *Add new Security Summary* – paste company + summary, save to Notion, notify user",
+        "• ✅ *Added – Notify User* – notify only",
+        "• ⏳ *Pending* – no user notify",
+        "• `/cancelsnap` – abort add\n",
+        f"Open Group Links requests: *{open_glinks}*",
+        f"Open Security Snapshot requests: *{open_snaps}*",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -1525,6 +1602,213 @@ async def notify_admin_missing_group_link(
             logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
 
 
+async def save_security_summary_to_notion(
+    ticker: str, company: str, summary: str
+) -> tuple[bool, str]:
+    """Create or update UK AIM Micro-Cap row with Security Summary for a ticker."""
+    if not notion:
+        return False, "Notion is not configured."
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
+    if not db_id:
+        return False, "NOTION_TICKERS_DB_ID missing."
+
+    raw = db_id.replace("-", "")
+    if len(raw) == 32 and "-" not in db_id:
+        db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+
+    ticker_u = ticker.lstrip("#").upper().strip()
+    company = (company or ticker_u).strip()
+    summary = (summary or "").strip()
+    if not summary:
+        return False, "Summary text is empty."
+
+    try:
+        # Find existing page by ticker
+        page_id = None
+        for f in (
+            {"property": "Ticker", "title": {"equals": ticker_u}},
+            {"property": "Ticker", "rich_text": {"equals": ticker_u}},
+        ):
+            try:
+                response = notion.databases.query(
+                    database_id=db_id, filter=f, page_size=1
+                )
+                results = response.get("results", [])
+                if results:
+                    page_id = results[0]["id"]
+                    break
+            except Exception:
+                continue
+
+        # Build properties – try common schema field names
+        def text_prop(name: str, value: str, as_title: bool = False) -> dict:
+            if as_title:
+                return {name: {"title": [{"text": {"content": value[:2000]}}]}}
+            return {name: {"rich_text": [{"text": {"content": value[:2000]}}]}}
+
+        if page_id:
+            page = notion.pages.retrieve(page_id=page_id)
+            props = page.get("properties", {})
+            update_props: dict = {}
+            # Company
+            for name in ("Company", "Name", "Company Name"):
+                if name in props:
+                    ptype = props[name].get("type")
+                    if ptype == "title":
+                        update_props[name] = {
+                            "title": [{"text": {"content": company[:2000]}}]
+                        }
+                    elif ptype == "rich_text":
+                        update_props[name] = {
+                            "rich_text": [{"text": {"content": company[:2000]}}]
+                        }
+                    break
+            # Summary
+            for name in (
+                "Summary & Next Catalyst",
+                "Summary",
+                "Overview",
+                "Company Overview",
+            ):
+                if name in props and props[name].get("type") == "rich_text":
+                    update_props[name] = {
+                        "rich_text": [{"text": {"content": summary[:2000]}}]
+                    }
+                    break
+            if not update_props:
+                return False, "Could not map Company/Summary fields on existing page."
+            notion.pages.update(page_id=page_id, properties=update_props)
+        else:
+            # Create new page – Ticker as title is the usual schema
+            create_props = {
+                "Ticker": {"title": [{"text": {"content": ticker_u}}]},
+            }
+            # Best-effort optional fields (ignore if schema rejects – try minimal)
+            try:
+                create_props["Company"] = {
+                    "rich_text": [{"text": {"content": company[:2000]}}]
+                }
+            except Exception:
+                pass
+            try:
+                create_props["Summary & Next Catalyst"] = {
+                    "rich_text": [{"text": {"content": summary[:2000]}}]
+                }
+            except Exception:
+                pass
+            try:
+                notion.pages.create(
+                    parent={"database_id": db_id},
+                    properties=create_props,
+                )
+            except Exception as e1:
+                # Retry minimal: title only + summary if company failed
+                logger.warning("Full create failed, retrying minimal: %s", e1)
+                minimal = {
+                    "Ticker": {"title": [{"text": {"content": ticker_u}}]},
+                }
+                notion.pages.create(
+                    parent={"database_id": db_id},
+                    properties=minimal,
+                )
+                # Second update with text fields
+                rows = await lookup_telegram_group_links(ticker_u)
+                # Re-query page
+                for f in (
+                    {"property": "Ticker", "title": {"equals": ticker_u}},
+                ):
+                    response = notion.databases.query(
+                        database_id=db_id, filter=f, page_size=1
+                    )
+                    results = response.get("results", [])
+                    if results:
+                        page_id = results[0]["id"]
+                        notion.pages.update(
+                            page_id=page_id,
+                            properties={
+                                "Company": {
+                                    "rich_text": [
+                                        {"text": {"content": company[:2000]}}
+                                    ]
+                                },
+                                "Summary & Next Catalyst": {
+                                    "rich_text": [
+                                        {"text": {"content": summary[:2000]}}
+                                    ]
+                                },
+                            },
+                        )
+                        break
+
+        _ticker_cache.pop(ticker_u, None)
+        return True, f"Security summary saved for #{ticker_u}."
+    except Exception as e:
+        logger.error("save_security_summary_to_notion failed: %s", e)
+        return False, str(e)
+
+
+async def notify_admin_missing_snapshot(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    ticker: str,
+) -> None:
+    """DM admin R when a Security Snapshot ticker is missing."""
+    if not context or not user or not ticker:
+        return
+    ticker_u = ticker.lstrip("#").upper().strip()
+    req_id = f"s{int(time.time()) % 1000000:06d}"
+    _snapshot_requests[req_id] = {
+        "user_id": user.id,
+        "ticker": ticker_u,
+        "name": user.full_name or "—",
+        "username": user.username or "N/A",
+    }
+    text = (
+        "📊 *New Security Snapshot request*\n\n"
+        f"• Name: {user.full_name or '—'}\n"
+        f"• Username: @{user.username or 'N/A'}\n"
+        f"• Telegram ID: `{user.id}`\n"
+        f"• Ticker: `#{ticker_u}`\n"
+        f"• Request ID: `{req_id}`\n\n"
+        "No row found in UK AIM Micro-Cap.\n"
+        "Choose an action:"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Add new Security Summary",
+                    callback_data=f"admin:snapadd:{req_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Added – Notify User",
+                    callback_data=f"admin:snapdone:{req_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏳ Pending",
+                    callback_data=f"admin:snappending:{req_id}",
+                )
+            ],
+        ]
+    )
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to notify admin %s of missing snapshot: %s", admin_id, e
+            )
+
+
 async def _send_link_results(
     update: Update,
     query: str,
@@ -1709,6 +1993,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user and is_admin(user) and lower in ("/cancelglink", "cancelglink"):
         _awaiting_admin_glink.pop(user.id, None)
         await update.message.reply_text("Cancelled Group Links add.")
+        return
+
+    # --- Admin: paste Security Summary after "Add new Security Summary" ---
+    if user and is_admin(user) and user.id in _awaiting_admin_snapshot:
+        state = _awaiting_admin_snapshot.pop(user.id)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            _awaiting_admin_snapshot[user.id] = state
+            await update.message.reply_text(
+                "Please send at least 2 lines:\n"
+                "1) Company name\n"
+                "2+) Summary & next catalyst\n\n"
+                "Or /cancelsnap to abort."
+            )
+            return
+        company = lines[0]
+        summary = "\n".join(lines[1:])
+        ticker = state.get("ticker") or ""
+        ok, msg = await save_security_summary_to_notion(ticker, company, summary)
+        target_id = state.get("user_id")
+        if ok:
+            try:
+                if target_id:
+                    await context.bot.send_message(
+                        chat_id=int(target_id),
+                        text=(
+                            "📊 Your Security Snapshot request has been updated.\n\n"
+                            f"Look up again: #{ticker} snapshot"
+                        ),
+                    )
+                await update.message.reply_text(
+                    f"✅ {msg}\nUser `{target_id}` has been notified.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"✅ Saved to Notion.\n{msg}\nCould not notify user: {e}"
+                )
+        else:
+            await update.message.reply_text(
+                f"❌ Could not save Security Summary.\n{msg}\n\n"
+                "You can add it manually in UK AIM Micro-Cap, then use "
+                "✅ Added – Notify User."
+            )
+        return
+
+    if user and is_admin(user) and lower in ("/cancelsnap", "cancelsnap"):
+        _awaiting_admin_snapshot.pop(user.id, None)
+        await update.message.reply_text("Cancelled Security Summary add.")
         return
 
     # --- Persistent keyboard shortcuts ---
@@ -1983,8 +2316,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         await update.message.reply_text(body)
                 else:
                     await update.message.reply_text(
-                        f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot."
+                        f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot.\n\n"
+                        "Request submitted to the admin group.\n"
+                        "You will be notified once it is updated."
                     )
+                    if context and user:
+                        await notify_admin_missing_snapshot(context, user, t)
             except Exception as e:
                 logger.error("Ticker lookup path failed for %s: %s", t, e)
                 await update.message.reply_text(
