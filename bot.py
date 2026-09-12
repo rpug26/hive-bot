@@ -10,6 +10,7 @@ import os
 import re
 import time
 import logging
+import asyncio
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -77,6 +78,8 @@ _glink_requests: dict[str, dict] = {}
 _awaiting_admin_snapshot: dict[int, dict] = {}
 # short req_id -> pending Security Snapshot request details
 _snapshot_requests: dict[str, dict] = {}
+# Serialize Notion activity history updates per Telegram user id
+_activity_locks: dict[int, asyncio.Lock] = {}
 _active_watchlist_name: dict[int, str] = {}
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
@@ -2294,13 +2297,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if tickers:
         if not await require_authorized(update, context):
             return
-        if user:
-            await record_member_activity(
-                user,
-                REQUEST_TYPE_SNAPSHOT,
-                detail=", ".join(f"#{t}" for t in tickers[:5]),
-            )
         for t in tickers:
+            # One history line per ticker so multi-lookups all appear in Notion
+            if user:
+                await record_member_activity(
+                    user,
+                    REQUEST_TYPE_SNAPSHOT,
+                    detail=f"#{t}",
+                )
             try:
                 data = await get_ticker_from_notion(t)
                 if data:
@@ -3429,129 +3433,154 @@ async def record_member_activity(
     Update Hive Bot Authorised Users for this member:
       - Last Request Date (date) – latest only
       - Request Type (select) – latest only
-      - Request History (rich_text) – APPEND full history list
+      - Request History (rich_text) – APPEND full history list (newest first)
       - Request Count (number) – increment if present
+
+    Uses a per-user lock so rapid back-to-back requests (e.g. 3 snapshots)
+    do not overwrite each other.
     Best-effort: never raises to the caller.
     """
     if not notion or not user:
         return
-    try:
-        page_id = await _find_auth_user_page_id(user)
-        if not page_id:
-            logger.info(
-                "Activity not recorded – no auth page for user_id=%s type=%s",
-                user.id,
-                request_type,
-            )
-            return
 
-        page = notion.pages.retrieve(page_id=page_id)
-        props_schema = page.get("properties", {})
-        now = datetime.now(timezone.utc)
-        today = now.date().isoformat()
-        stamp = now.strftime("%Y-%m-%d %H:%M UTC")
-        update_props: dict = {}
+    lock = _activity_locks.setdefault(user.id, asyncio.Lock())
+    async with lock:
+        try:
+            page_id = await _find_auth_user_page_id(user)
+            if not page_id:
+                logger.info(
+                    "Activity not recorded – no auth page for user_id=%s type=%s",
+                    user.id,
+                    request_type,
+                )
+                return
 
-        # 1) Last Request Date (latest)
-        for name in (
-            "Last Request Date",
-            "Last Request",
-            "Last Activity Date",
-            "Last Active",
-            "Date Last Request",
-        ):
-            if name in props_schema and props_schema[name].get("type") == "date":
-                update_props[name] = {"date": {"start": today}}
-                break
+            # Small pause so a previous Notion write is visible on re-read
+            await asyncio.sleep(0.35)
 
-        # 2) Request Type (latest)
-        for name in ("Request Type", "Last Request Type", "Activity Type"):
-            if name not in props_schema:
-                continue
-            ptype = props_schema[name].get("type")
-            if ptype == "select":
-                update_props[name] = {"select": {"name": request_type}}
-            elif ptype == "rich_text":
-                update_props[name] = {
-                    "rich_text": [{"text": {"content": request_type[:2000]}}]
-                }
-            break
+            page = notion.pages.retrieve(page_id=page_id)
+            props_schema = page.get("properties", {})
+            now = datetime.now(timezone.utc)
+            today = now.date().isoformat()
+            # Include seconds so rapid entries stay distinct
+            stamp = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+            update_props: dict = {}
 
-        # 3) Append to Request History (aggregated list per member)
-        history_line = f"{stamp} | {request_type}"
-        if detail:
-            # Keep detail short so history stays readable
-            d = " ".join(str(detail).split())
-            if len(d) > 120:
-                d = d[:117] + "..."
-            history_line += f" | {d}"
-
-        history_names = (
-            "Request History",
-            "Activity History",
-            "Request Log",
-            "Activity Log",
-        )
-        for name in history_names:
-            if name not in props_schema:
-                continue
-            if props_schema[name].get("type") != "rich_text":
-                continue
-            existing = _get_plain_text(props_schema.get(name)).strip()
-            # Newest first
-            if existing:
-                combined = history_line + "\n" + existing
-            else:
-                combined = history_line
-            # Notion rich_text single segment ~2000 chars; keep head of history
-            if len(combined) > 1900:
-                combined = combined[:1900].rsplit("\n", 1)[0]
-            update_props[name] = {
-                "rich_text": [{"text": {"content": combined}}]
-            }
-            break
-
-        # 4) Optional Request Count increment
-        for name in ("Request Count", "Activity Count", "Total Requests"):
-            if name not in props_schema:
-                continue
-            if props_schema[name].get("type") != "number":
-                continue
-            current = props_schema[name].get("number")
-            try:
-                n = int(current) if current is not None else 0
-            except Exception:
-                n = 0
-            update_props[name] = {"number": n + 1}
-            break
-
-        # 5) Still refresh short "last detail" if that column exists
-        if detail:
-            for name in ("Last Request Detail", "Last Activity Detail"):
-                if name in props_schema and props_schema[name].get("type") == "rich_text":
-                    update_props[name] = {
-                        "rich_text": [{"text": {"content": str(detail)[:2000]}}]
-                    }
+            # 1) Last Request Date (latest)
+            for name in (
+                "Last Request Date",
+                "Last Request",
+                "Last Activity Date",
+                "Last Active",
+                "Date Last Request",
+            ):
+                if name in props_schema and props_schema[name].get("type") == "date":
+                    update_props[name] = {"date": {"start": today}}
                     break
 
-        if not update_props:
-            logger.warning(
-                "Activity fields missing on auth DB page %s – add "
-                "'Last Request Date' (date), 'Request Type' (select), "
-                "and 'Request History' (rich text)",
-                page_id,
-            )
-            return
+            # 2) Request Type (latest)
+            for name in ("Request Type", "Last Request Type", "Activity Type"):
+                if name not in props_schema:
+                    continue
+                ptype = props_schema[name].get("type")
+                if ptype == "select":
+                    update_props[name] = {"select": {"name": request_type}}
+                elif ptype == "rich_text":
+                    update_props[name] = {
+                        "rich_text": [{"text": {"content": request_type[:2000]}}]
+                    }
+                break
 
-        notion.pages.update(page_id=page_id, properties=update_props)
-        logger.info(
-            "Recorded activity user=%s type=%s detail=%s",
-            user.id,
-            request_type,
-            detail or "",
-        )
-    except Exception as e:
-        logger.error("record_member_activity failed: %s", e)
+            # 3) Append to Request History (aggregated list per member)
+            history_line = f"{stamp} | {request_type}"
+            if detail:
+                d = " ".join(str(detail).split())
+                if len(d) > 120:
+                    d = d[:117] + "..."
+                history_line += f" | {d}"
+
+            history_names = (
+                "Request History",
+                "Activity History",
+                "Request Log",
+                "Activity Log",
+            )
+            for name in history_names:
+                if name not in props_schema:
+                    continue
+                if props_schema[name].get("type") != "rich_text":
+                    continue
+                existing = _get_plain_text(props_schema.get(name)).strip()
+                # Deduplicate exact same line at top (retries)
+                if existing.startswith(history_line):
+                    combined = existing
+                elif existing:
+                    combined = history_line + "\n" + existing
+                else:
+                    combined = history_line
+                # Keep newest lines within Notion rich_text limit
+                if len(combined) > 1900:
+                    lines = combined.split("\n")
+                    kept: list[str] = []
+                    size = 0
+                    for ln in lines:
+                        add = len(ln) + (1 if kept else 0)
+                        if size + add > 1900:
+                            break
+                        kept.append(ln)
+                        size += add
+                    combined = "\n".join(kept)
+                update_props[name] = {
+                    "rich_text": [{"text": {"content": combined}}]
+                }
+                break
+
+            # 4) Optional Request Count increment
+            for name in ("Request Count", "Activity Count", "Total Requests"):
+                if name not in props_schema:
+                    continue
+                if props_schema[name].get("type") != "number":
+                    continue
+                current = props_schema[name].get("number")
+                try:
+                    n = int(current) if current is not None else 0
+                except Exception:
+                    n = 0
+                update_props[name] = {"number": n + 1}
+                break
+
+            # 5) Last Request Detail (latest only)
+            if detail:
+                for name in ("Last Request Detail", "Last Activity Detail"):
+                    if (
+                        name in props_schema
+                        and props_schema[name].get("type") == "rich_text"
+                    ):
+                        update_props[name] = {
+                            "rich_text": [
+                                {"text": {"content": str(detail)[:2000]}}
+                            ]
+                        }
+                        break
+
+            if not update_props:
+                logger.warning(
+                    "Activity fields missing on auth DB page %s – add "
+                    "'Last Request Date' (date), 'Request Type' (select), "
+                    "and 'Request History' (rich text)",
+                    page_id,
+                )
+                return
+
+            notion.pages.update(page_id=page_id, properties=update_props)
+            logger.info(
+                "Recorded activity user=%s type=%s detail=%s",
+                user.id,
+                request_type,
+                detail or "",
+            )
+        except Exception as e:
+            logger.error("record_member_activity failed: %s", e)
 
 
 # ------------------------------------------------------------
