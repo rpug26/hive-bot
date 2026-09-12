@@ -75,8 +75,13 @@ _awaiting_admin_glink: dict[int, dict] = {}
 _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 MAX_WATCHLISTS = 3
-_authorized_cache: dict = {"usernames": set(), "expires": 0}
-AUTH_CACHE_TTL = 300  # 5 minutes
+# Single auth cache: usernames + user_ids where Notion Status = Authorised
+_authorized_cache: dict = {
+    "usernames": set(),
+    "user_ids": set(),
+    "expires": 0,
+}
+AUTH_CACHE_TTL = 60  # short TTL so admin approvals apply quickly
 
 # Keywords that indicate the user wants a ticker lookup
 INTENT_KEYWORDS = {
@@ -548,46 +553,9 @@ def _get_plain_text(prop: dict) -> str:
     return ""
 
 async def get_authorized_usernames() -> set[str]:
-    """Return a set of authorised Telegram usernames (without @)."""
-    if not notion or not NOTION_DATABASE_ID:
-        return set()
-
-    now = time.time()
-    if _authorized_cache["expires"] > now:
-        return _authorized_cache["usernames"]
-
-    try:
-        usernames = set()
-        cursor = None
-
-        while True:
-            kwargs = {"database_id": NOTION_DATABASE_ID, "page_size": 100}
-            if cursor:
-                kwargs["start_cursor"] = cursor
-
-            response = notion.databases.query(**kwargs)
-
-            for page in response.get("results", []):
-                props = page.get("properties", {})
-                for key in ("Telegram Username", "Username", "TG Username", "Telegram", "User"):
-                    if key in props:
-                        val = _get_plain_text(props[key]).strip().lstrip("@").lower()
-                        if val:
-                            usernames.add(val)
-                        break
-
-            if not response.get("has_more"):
-                break
-            cursor = response.get("next_cursor")
-
-        _authorized_cache["usernames"] = usernames
-        _authorized_cache["expires"] = now + AUTH_CACHE_TTL
-        logger.info("Loaded %d authorised usernames from Notion", len(usernames))
-        return usernames
-
-    except Exception as e:
-        logger.error("Failed to load authorised users: %s", e)
-        return _authorized_cache["usernames"]
+    """Return authorised usernames (wrapper around get_authorized_users)."""
+    auth = await get_authorized_users()
+    return auth.get("usernames", set())
 
 async def is_group_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
@@ -621,35 +589,76 @@ async def is_group_member(
             user_id,
             e,
         )
+        # Prefix with error: so is_authorized does not treat this as left/kicked
         return False, f"error: {e}"
-        
+
 async def is_authorized(
     update: Update, context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> bool:
+    """
+    Authorised if:
+      1) Admin, or
+      2) Notion Hive Bot Authorised Users has Status = Authorised
+         for this Telegram User ID (preferred) or Username.
+
+    Group membership is checked only as a soft signal:
+      - Definite left/kicked → deny
+      - API error / TELEGRAM_GROUP_ID missing → do not deny (Notion wins)
+    """
     user = update.effective_user
     if not user:
         return False
 
-    # Admins always authorised
     if is_admin(user):
         return True
 
-    # Must still be in The Hive group (when configured)
+    auth = await get_authorized_users()
+    uid = str(user.id).strip()
+    uname = (user.username or "").strip().lstrip("@").lower()
+
+    in_notion = uid in auth.get("user_ids", set()) or (
+        uname and uname in auth.get("usernames", set())
+    )
+    if not in_notion:
+        logger.info(
+            "Auth denied for id=%s username=%s – not in Notion Authorised list "
+            "(ids=%d usernames=%d)",
+            uid,
+            uname or "N/A",
+            len(auth.get("user_ids", set())),
+            len(auth.get("usernames", set())),
+        )
+        return False
+
+    # Soft group check: only block on clear non-membership
     group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
     if group_id and context is not None:
         in_group, detail = await is_group_member(context, user.id)
-        if not in_group:
-            logger.info(
-                "Auth denied for %s – not in group (%s)",
-                user.id, detail,
-            )
-            return False
+        if not in_group and detail.startswith("status="):
+            status = detail.replace("status=", "")
+            if status in ("left", "kicked"):
+                logger.info(
+                    "Auth denied for %s – left/kicked group (%s)", user.id, detail
+                )
+                return False
+        # API errors / skipped → still allow if Notion Authorised
 
-    auth = await get_authorized_users()
-    if user.username and user.username.lower() in auth.get("usernames", set()):
+    return True
+
+
+async def require_authorized(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Return True if authorised; otherwise reply with standard denial and return False."""
+    if await is_authorized(update, context):
         return True
-    if str(user.id) in auth.get("user_ids", set()):
-        return True
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            "🔒 You are not authorised to use this bot service yet.\n\n"
+            "Send /request to ask for access, then /status to check.\n"
+            "An admin must set your Status to Authorised in Notion."
+        )
     return False
 
 async def sync_group_member_to_notion(
@@ -1591,11 +1600,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        if not await is_authorized(update, context):
-            await update.message.reply_text(
-                "Group Link is for authorised members only.\n\n"
-                "Send /request to ask for access, then check /status."
-            )
+        if not await require_authorized(update, context):
             return
 
         # One-step: /link ALRT  or  /link Defence Holdings
@@ -1858,12 +1863,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 1. #stockpick capture
     if "#stockpick" in clean_lower:
-        if not await is_authorized(update, context):
-            await update.message.reply_text(
-                "🔒 Only authorised members can submit a #stockpick.\n\n"
-                "Send /request to ask for access, then wait for an admin to approve you.\n"
-                "Check status anytime with /status."
-            )
+        if not await require_authorized(update, context):
             return
 
         if await has_submitted_this_month(user):
@@ -1941,9 +1941,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         return
 
-    # 2. Ticker lookup
+    # 2. Ticker lookup (snapshot / summary) – authorised only
     tickers = extract_hashtag_tickers(clean_text)
     if tickers:
+        if not await require_authorized(update, context):
+            return
         for t in tickers:
             try:
                 data = await get_ticker_from_notion(t)
@@ -2100,11 +2102,7 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not user:
         return
 
-    if not await is_authorized(update, context):
-        await update.message.reply_text(
-            "🔒 Only authorised members can use this.\n"
-            "Send /request to ask for access."
-        )
+    if not await require_authorized(update, context):
         return
 
     await update.message.reply_text(
@@ -2124,7 +2122,10 @@ async def show_my_stockpicks(
     msg = update.callback_query.message if update.callback_query else update.message
 
     if not await is_authorized(update, context):
-        text = "🔒 Authorised members only."
+        text = (
+            "🔒 You are not authorised to use this bot service yet.\n"
+            "Send /request then /status."
+        )
         if edit:
             await msg.edit_text(text)
         else:
@@ -2260,7 +2261,10 @@ async def show_watchlist(
         return
 
     if not await is_authorized(update, context):
-        text = "Authorised members only."
+        text = (
+            "🔒 You are not authorised to use this bot service yet.\n"
+            "Send /request then /status."
+        )
         if edit:
             await msg.edit_text(text)
         else:
@@ -2891,73 +2895,104 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ------------------------------------------------------------
-# Authorisation ...
+# Authorisation (Status = "Authorised" in Hive Bot Authorised Users)
 # ------------------------------------------------------------
-# Authorisation (Status = "Authorised" required)
-# ------------------------------------------------------------
-_authorized_cache: dict = {"users": {}, "expires": 0}
-AUTH_CACHE_TTL = 300  # 5 minutes
-
 NOTION_AUTH_DB_ID = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
+
 async def get_authorized_users() -> dict:
-    """Load users where Status == Authorised."""
+    """Load users where Status == Authorised (by Telegram User ID + Username)."""
+    empty = {"usernames": set(), "user_ids": set()}
     if not notion:
-        return {"usernames": set(), "user_ids": set()}
+        return empty
 
     db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
     if not db_id:
-        return {"usernames": set(), "user_ids": set()}
+        return empty
 
     now = time.time()
-    if _authorized_cache["expires"] > now:
-        return _authorized_cache["users"]
+    if _authorized_cache.get("expires", 0) > now and (
+        _authorized_cache.get("user_ids") is not None
+    ):
+        return {
+            "usernames": _authorized_cache.get("usernames", set()),
+            "user_ids": _authorized_cache.get("user_ids", set()),
+        }
 
     try:
-        usernames = set()
-        user_ids = set()
+        usernames: set[str] = set()
+        user_ids: set[str] = set()
         cursor = None
 
-        while True:
-            kwargs = {
-                "database_id": db_id,
-                "page_size": 100,
-                "filter": {
-                    "property": "Status",
-                    "select": {"equals": "Authorised"}
-                },
-            }
-            if cursor:
-                kwargs["start_cursor"] = cursor
+        # Try common Status option spellings
+        status_values = ("Authorised", "Authorized", "Approved")
+        pages: list = []
+        last_err = None
+        for status_name in status_values:
+            try:
+                cursor = None
+                pages = []
+                while True:
+                    kwargs = {
+                        "database_id": db_id,
+                        "page_size": 100,
+                        "filter": {
+                            "property": "Status",
+                            "select": {"equals": status_name},
+                        },
+                    }
+                    if cursor:
+                        kwargs["start_cursor"] = cursor
+                    response = notion.databases.query(**kwargs)
+                    pages.extend(response.get("results", []))
+                    if not response.get("has_more"):
+                        break
+                    cursor = response.get("next_cursor")
+                if pages:
+                    break
+            except Exception as e:
+                last_err = e
+                logger.warning("Auth filter Status=%s failed: %s", status_name, e)
 
-            response = notion.databases.query(**kwargs)
+        if not pages and last_err:
+            logger.error("Failed to load authorised users: %s", last_err)
 
-            for page in response.get("results", []):
-                props = page.get("properties", {})
+        for page in pages:
+            props = page.get("properties", {})
 
-                # Title = Telegram User ID
-                uid = _get_plain_text(props.get("Telegram User ID"))
-                if uid:
-                    user_ids.add(uid.strip())
+            # Telegram User ID (title or rich_text)
+            uid = (
+                _get_plain_text(props.get("Telegram User ID"))
+                or _get_plain_text(props.get("Telegram ID"))
+                or _get_plain_text(props.get("User ID"))
+            )
+            if uid:
+                user_ids.add(uid.strip())
 
-                # Username
-                uname = _get_plain_text(props.get("Username"))
-                if uname:
-                    usernames.add(uname.strip().lstrip("@").lower())
+            uname = (
+                _get_plain_text(props.get("Username"))
+                or _get_plain_text(props.get("Telegram Username"))
+                or _get_plain_text(props.get("TG Username"))
+            )
+            if uname:
+                usernames.add(uname.strip().lstrip("@").lower())
 
-            if not response.get("has_more"):
-                break
-            cursor = response.get("next_cursor")
-
-        result = {"usernames": usernames, "user_ids": user_ids}
-        _authorized_cache["users"] = result
+        _authorized_cache["usernames"] = usernames
+        _authorized_cache["user_ids"] = user_ids
         _authorized_cache["expires"] = now + AUTH_CACHE_TTL
-        logger.info("Loaded %d authorised usernames, %d user IDs", len(usernames), len(user_ids))
-        return result
+        logger.info(
+            "Loaded authorised users: %d usernames, %d user IDs",
+            len(usernames),
+            len(user_ids),
+        )
+        return {"usernames": usernames, "user_ids": user_ids}
 
     except Exception as e:
         logger.error("Failed to load authorised users: %s", e)
-        return _authorized_cache.get("users", {"usernames": set(), "user_ids": set()})
+        return {
+            "usernames": _authorized_cache.get("usernames", set()),
+            "user_ids": _authorized_cache.get("user_ids", set()),
+        }
 
 # ------------------------------------------------------------
 # Message handling – STRICT
