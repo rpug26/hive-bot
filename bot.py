@@ -1120,7 +1120,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton("👀 My Watchlist"),
-                KeyboardButton("🔗 Link"),
+                KeyboardButton("🔗 Grouo Links"),
             ],
         ],
         resize_keyboard=True,   # fits mobile screens
