@@ -58,6 +58,14 @@ NOTION_AUTH_DATA_SOURCE_ID = (
     os.getenv("NOTION_AUTH_DATA_SOURCE_ID") or "fd1e050c-5396-448d-a2d5-c4749a0cc69e"
 ).strip()
 
+# Standalone request history (one row per request)
+NOTION_HISTORY_DB_ID = (
+    os.getenv("NOTION_HISTORY_DB_ID") or "3dbe81bb-7bfb-4def-ab05-80eac9b0c009"
+).strip()
+NOTION_HISTORY_DATA_SOURCE_ID = (
+    os.getenv("NOTION_HISTORY_DATA_SOURCE_ID") or "aee62b48-46a5-4cbc-8237-af8912a3f22c"
+).strip()
+
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 if not notion:
@@ -1668,6 +1676,16 @@ async def notify_admin_missing_group_link(
         except Exception as e:
             logger.error("Failed to notify admin %s of missing group link: %s", admin_id, e)
 
+    # Always sync this activity to the user's Auth row in Notion
+    try:
+        await log_member_activity(
+            user,
+            REQUEST_TYPE_TG_LINK,
+            notes=f"Group link request: {query} | {detail[:200]}",
+        )
+    except Exception as e:
+        logger.error("log_member_activity after group-link request failed: %s", e)
+
 
 async def _send_link_results(
     update: Update,
@@ -2950,6 +2968,17 @@ async def create_access_request(
                     "Could not set Group Member (property may be missing): %s", e
                 )
 
+        # Standalone history row for this access request
+        try:
+            await append_request_history(
+                user,
+                "Access request",
+                details="Access request submitted (Status=Pending)",
+                status="Pending",
+            )
+        except Exception as he:
+            logger.warning("history row for access request failed: %s", he)
+
         return True, "OK"
 
     except Exception as e:
@@ -3377,14 +3406,18 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
     """Update Group Member (and optionally Status) in the auth database."""
-    if not notion:
+    if not notion and not NOTION_TOKEN:
         return
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
         return
 
     try:
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=ds_id,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -3394,12 +3427,10 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
         )
         results = response.get("results", [])
         if not results:
-            # No row yet – optional: create one with Group Member only
             return
 
         page_id = results[0]["id"]
         props = {
-            # Adjust property name if yours is different (e.g. "Group Member")
             "Group Member": {
                 "select": {"name": "Yes" if is_member else "No"}
             },
@@ -3408,9 +3439,11 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
         # Optional: auto-revoke Authorised when they leave
         if not is_member:
             props["Status"] = {"select": {"name": "Pending"}}
-            # Status options in Notion: Authorised | Pending | Blocked
 
-        notion.pages.update(page_id=page_id, properties=props)
+        if notion:
+            notion.pages.update(page_id=page_id, properties=props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": props})
         _authorized_cache["expires"] = 0
     except Exception as e:
         logger.error("mark_group_member_in_notion failed for %s: %s", user.id, e)
@@ -3421,17 +3454,103 @@ REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
 
 
-async def log_member_activity(user, request_type: str) -> None:
-    """Update Hive Bot Authorised Users with last request date/type and increment count."""
-    if not notion or not user:
+async def append_request_history(
+    user,
+    request_type: str,
+    *,
+    details: str | None = None,
+    status: str = "Logged",
+) -> None:
+    """
+    Create a standalone row in Hive Bot Request History (one row per request).
+    """
+    if not user:
+        return
+    if not NOTION_TOKEN and not notion:
+        return
+    ds_id = NOTION_HISTORY_DATA_SOURCE_ID
+    db_id = NOTION_HISTORY_DB_ID
+    if not ds_id and not db_id:
         return
 
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not db_id:
+    # Map bot types → Notion select options
+    type_map = {
+        "Stockpick": "Stockpick",
+        "Security snapshot": "Security snapshot",
+        "Telegram link": "Telegram link",
+        "Access request": "Access request",
+        REQUEST_TYPE_STOCKPICK: "Stockpick",
+        REQUEST_TYPE_SNAPSHOT: "Security snapshot",
+        REQUEST_TYPE_TG_LINK: "Telegram link",
+    }
+    notion_type = type_map.get(request_type, request_type if request_type in {
+        "Stockpick", "Security snapshot", "Telegram link", "Access request", "Other"
+    } else "Other")
+
+    now = datetime.now(timezone.utc)
+    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
+    props = {
+        "Request": {"title": [{"text": {"content": title[:100]}}]},
+        "Telegram User ID": {
+            "rich_text": [{"text": {"content": str(user.id)}}]
+        },
+        "Full Name": {
+            "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+        },
+        "Request Type": {"select": {"name": notion_type}},
+        "Requested At": {
+            "date": {
+                "start": now.isoformat().replace("+00:00", "Z"),
+            }
+        },
+        "Status": {"select": {"name": status if status in {
+            "Logged", "Pending", "Completed", "Denied"
+        } else "Logged"}},
+    }
+    if user.username:
+        props["Username"] = {
+            "rich_text": [{"text": {"content": user.username[:100]}}]
+        }
+    if details:
+        props["Details"] = {
+            "rich_text": [{"text": {"content": details[:1800]}}]
+        }
+
+    try:
+        notion_create_page_in_data_source(
+            properties=props,
+            data_source_id=ds_id,
+            database_id=db_id,
+        )
+        logger.info(
+            "Request history row created user=%s type=%s", user.id, notion_type
+        )
+    except Exception as e:
+        logger.error("append_request_history failed for %s: %s", user.id, e)
+
+
+async def log_member_activity(
+    user, request_type: str, *, notes: str | None = None
+) -> None:
+    """
+    Update Hive Bot Authorised Users with last request date/type and increment count.
+    Uses data-source API so multi-source Auth DB updates reliably.
+    """
+    if not user:
+        return
+    if not notion and not NOTION_TOKEN:
+        return
+
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
         return
 
     try:
-        response = notion.databases.query(
+        response = notion_query_data_source(
+            data_source_id=ds_id,
             database_id=db_id,
             filter={
                 "property": "Telegram User ID",
@@ -3453,27 +3572,35 @@ async def log_member_activity(user, request_type: str) -> None:
         if count_prop.get("type") == "number" and count_prop.get("number") is not None:
             count = int(count_prop["number"])
 
-        notion.pages.update(
-            page_id=page_id,
-            properties={
-                "Last Request Date": {
-                    "date": {
-                        "start": datetime.now(timezone.utc).date().isoformat()
-                    }
-                },
-                "Last Request Type": {
-                    "select": {"name": request_type}
-                },
-                "Request Count": {
-                    "number": count + 1
-                },
+        update_props: dict = {
+            "Last Request Date": {
+                "date": {
+                    "start": datetime.now(timezone.utc).date().isoformat()
+                }
             },
-        )
+            "Last Request Type": {"select": {"name": request_type}},
+            "Request Count": {"number": count + 1},
+        }
+        if notes:
+            update_props["Notes"] = {
+                "rich_text": [{"text": {"content": notes[:1800]}}]
+            }
+
+        # pages.update still works by page_id regardless of multi-source
+        if notion:
+            notion.pages.update(page_id=page_id, properties=update_props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+
         logger.info(
             "Logged activity user=%s type=%s count=%s",
             user.id,
             request_type,
             count + 1,
+        )
+        # Standalone history row (one row per request)
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
         )
     except Exception as e:
         logger.error("log_member_activity failed for %s: %s", user.id, e)
