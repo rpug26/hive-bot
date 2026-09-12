@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Bootstrap: assemble bot from base64 chunk files and run."""
-from pathlib import Path
-import base64
-import sys
+"""Temporary bootstrap: load bot source from last known good commit.
+Replace this with full bot.py (includes /link) from artifacts as soon as possible.
+"""
+import urllib.request
 
-p = Path(__file__).resolve().parent
-parts = sorted(p.glob("bot_b64_*.txt"), key=lambda x: x.name)
-if not parts:
-    raise SystemExit("Missing bot_b64_*.txt chunk files")
-b64 = "".join(x.read_text().strip() for x in parts)
-code = base64.b64decode(b64).decode("utf-8")
-exec(compile(code, str(p / "bot.py"), "exec"), {"__name__": "__main__", "__file__": str(p / "bot.py")})
+URL = "https://raw.githubusercontent.com/rpug26/hive-bot/68f2a0c69571fdabad51a6d92acf2bd6999de3fa/bot.py"
+print("Loading bot from commit 68f2a0c...", flush=True)
+code = urllib.request.urlopen(URL, timeout=60).read().decode("utf-8")
+exec(compile(code, "bot.py", "exec"), {"__name__": "__main__", "__file__": "bot.py"})
