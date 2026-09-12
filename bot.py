@@ -1121,7 +1121,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton("👀 My Watchlist"),
-                KeyboardButton("🔗 Group Links"),
+                KeyboardButton("🔗 Link"),
             ],
             [
                 KeyboardButton("🙈 Hide"),
@@ -1157,7 +1157,7 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📌 My🐝 Stockpick", callback_data="cmd:mystockpick"),
             ],
             [
-                InlineKeyboardButton("🔗 Group Links", callback_data="cmd:link"),
+                InlineKeyboardButton("🔗 Link", callback_data="cmd:link"),
             ],
         ]
     )
@@ -1242,16 +1242,17 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not _is_private(update):
         await update.message.reply_text(
-            "🔗 Group link lookup only works in a *private chat* with me.\n"
-            "Open a 1-1 chat and tap 🔗 Link or send /link.",
+            "🔗 *Group Link* only works in a private 1-to-1 chat with me.\n\n"
+            "Open a private chat → tap *🔗 Link* (or send /link) → then type a ticker or company name.",
             parse_mode="Markdown",
         )
         return
 
     if not await is_authorized(update, context):
         await update.message.reply_text(
-            "🔒 Only authorised members can look up group links.\n"
-            "Send /request then wait for admin approval."
+            "🔒 Group Link is for *authorised members* only.\n\n"
+            "Send /request to ask for access, then check /status.",
+            parse_mode="Markdown",
         )
         return
 
@@ -1260,12 +1261,12 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _awaiting_link[user.id] = True
 
     await update.message.reply_text(
-        "🔗 *Telegram Group Link search*\n\n"
-        "Send a *ticker* or *company name*, e.g.\n"
+        "🔗 *Group Link lookup*\n\n"
+        "Type a *ticker* or *company name* and send it, for example:\n"
         "• `ALRT`\n"
-        "• `#KEFI`\n"
+        "• `KEFI`\n"
         "• `Defence Holdings`\n\n"
-        "I'll look up the Telegram group link from UK AIM Micro-Cap.",
+        "I’ll search the UK AIM Micro-Cap database and return the Telegram group link if one is saved.",
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
     )
@@ -1316,27 +1317,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         _awaiting_link.pop(user.id, None)
         query = text.strip()
         if not query:
-            await update.message.reply_text("Please send a ticker or company name.")
+            await update.message.reply_text(
+                "Please send a *ticker* or *company name* (e.g. `ALRT` or `Defence Holdings`).",
+                parse_mode="Markdown",
+            )
             return
 
         rows = await lookup_telegram_group_links(query)
         if not rows:
             await update.message.reply_text(
-                f"No match for *{query}* in UK AIM Micro-Cap.",
+                f"🔍 No match found for *{query}* in UK AIM Micro-Cap.\n\n"
+                "Try another ticker or company name, or tap *🔗 Link* to search again.",
                 parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
             )
             return
 
-        lines = [f"🔗 *Results for* `{query}`\n"]
+        lines = [f"🔗 *Group links for* `{query}`\n"]
         for r in rows[:8]:
             link = r["link"]
+            ticker = r.get("ticker") or "—"
+            company = r.get("company") or "—"
             if link:
-                lines.append(f"• *#{r['ticker']}* – {r['company']}\n  {link}")
+                lines.append(f"• *#{ticker}* – {company}\n  👉 {link}")
             else:
                 lines.append(
-                    f"• *#{r['ticker']}* – {r['company']}\n  _No Telegram group link saved_"
+                    f"• *#{ticker}* – {company}\n  _No Telegram group link saved yet_"
                 )
 
+        lines.append("\n_Tap 🔗 Link to search again._")
         await update.message.reply_text(
             "\n".join(lines),
             parse_mode="Markdown",
@@ -1588,11 +1597,11 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /request – Request access\n"
         "• /snap – How to look up a ticker\n"
         "• /mystockpick – Your stockpick this month\n"
-        "• /link – Telegram Group Links\n"
+        "• /link – Group Link (private chat only)\n"
         "• /faq – FAQ\n\n"
         "In the group: `@Bot #TICKER` to look up a stock\n"
         "Or use `#stockpick your idea` to save one.\n"
-        "🔗 Link lookup is *private chat only*.",
+        "🔗 *Group Link* works only in a private 1-to-1 chat.",
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
     )
