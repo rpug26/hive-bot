@@ -1243,7 +1243,7 @@ async def link_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         await update.message.reply_text(
             "🔗 *Group Link* only works in a private 1-to-1 chat with me.\n\n"
-            "Open a private chat → tap *🔗 Link* (or send /link) → then type a ticker or company name.",
+            "Open a private chat → tap *🔗 Group Links* (or send /link) → then type a ticker or company name.",
             parse_mode="Markdown",
         )
         return
@@ -1304,7 +1304,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    if text in ("🔗 Link", "Link") or lower in ("link", "🔗 link"):
+    if text in ("🔗 Group Links", "Link") or lower in ("link", "🔗 group link"):
         await link_cmd(update, context)
         return
 
@@ -1327,7 +1327,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not rows:
             await update.message.reply_text(
                 f"🔍 No match found for *{query}* in UK AIM Micro-Cap.\n\n"
-                "Try another ticker or company name, or tap *🔗 Link* to search again.",
+                "Try another ticker or company name, or tap *🔗 Group Links* to search again.",
                 parse_mode="Markdown",
                 reply_markup=main_reply_keyboard(),
             )
