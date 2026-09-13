@@ -746,6 +746,78 @@ def _get_plain_text(prop: dict) -> str:
         return (prop.get("url") or "").strip()
     return ""
 
+
+def _md_escape(text) -> str:
+    """Escape Telegram legacy Markdown special characters in dynamic text."""
+    if text is None:
+        return ""
+    s = str(text)
+    # Order matters: backslash first
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, f"\\{ch}")
+    return s
+
+
+async def _safe_edit_or_reply(
+    msg,
+    text: str,
+    *,
+    edit: bool = False,
+    reply_markup=None,
+    parse_mode: str | None = "Markdown",
+) -> None:
+    """
+    Send/edit message; on entity parse errors, retry without parse_mode.
+    Prevents 'Can't parse entities' from breaking My Watchlist / Explore.
+    """
+    kwargs = {
+        "reply_markup": reply_markup,
+        "disable_web_page_preview": True,
+    }
+    try:
+        if edit:
+            await msg.edit_text(text, parse_mode=parse_mode, **kwargs)
+        else:
+            await msg.reply_text(text, parse_mode=parse_mode, **kwargs)
+    except Exception as e1:
+        err = str(e1).lower()
+        if "parse" in err or "entities" in err or "can't find end" in err:
+            logger.warning("Markdown parse failed – retry plain text: %s", e1)
+            # Strip simple markdown markers for readable plain fallback
+            plain = (
+                text.replace("\\_", "_")
+                .replace("\\*", "*")
+                .replace("\\`", "`")
+                .replace("\\[", "[")
+            )
+            try:
+                if edit:
+                    await msg.edit_text(plain, parse_mode=None, **kwargs)
+                else:
+                    await msg.reply_text(plain, parse_mode=None, **kwargs)
+            except Exception as e2:
+                # Last resort: short error without markup
+                logger.error("_safe_edit_or_reply plain retry failed: %s", e2)
+                if edit:
+                    try:
+                        await msg.edit_text(
+                            "Could not render this view. Tap Refresh or /start.",
+                            reply_markup=reply_markup,
+                        )
+                    except Exception:
+                        await msg.reply_text(
+                            "Could not render this view. Try /start.",
+                            reply_markup=reply_markup,
+                        )
+                else:
+                    await msg.reply_text(
+                        "Could not render this view. Try /start.",
+                        reply_markup=reply_markup,
+                    )
+        else:
+            raise
+
+
 async def get_authorized_usernames() -> set[str]:
     """Return authorised usernames (wrapper around get_authorized_users)."""
     auth = await get_authorized_users()
@@ -2214,11 +2286,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if "watchlist" in lower and len(text) < 40:
         try:
-            await show_watchlist(update, context, edit=False)
+            await show_explore(update, context, tab="feed", edit=False)
         except Exception as e:
-            logger.error("My Watchlist button failed: %s", e)
+            logger.error("My Watchlist / Explore failed: %s", e)
             await update.message.reply_text(
-                f"Could not open watchlist.\n`{e}`",
+                f"Could not open Explore.\n`{e}`",
                 parse_mode="Markdown",
             )
         await cleanup_trigger_message(update, context)
@@ -2805,6 +2877,320 @@ def _watchlist_continue_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _explore_tab_keyboard(active: str = "feed") -> list[list]:
+    """Top tab row – similar to Explore / News app chrome."""
+    tabs = [
+        ("feed", "📰 Feed"),
+        ("picks", "📌 Picks"),
+        ("list", "👀 List"),
+        ("hub", "🏠 Hub"),
+    ]
+    row = []
+    for key, label in tabs:
+        shown = f"· {label} ·" if key == active else label
+        row.append(InlineKeyboardButton(shown, callback_data=f"exp:tab:{key}"))
+    return [row]
+
+
+async def _user_stockpick_rows(user) -> list[dict]:
+    """Load this user's stockpicks (newest first), max 8."""
+    db_id = os.getenv("NOTION_STOCKPICKS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    if not notion or not db_id or not user:
+        return []
+    try:
+        response = notion.databases.query(database_id=db_id, page_size=50)
+    except Exception as e:
+        logger.error("_user_stockpick_rows query failed: %s", e)
+        return []
+
+    uid_marker = f"uid:{user.id}"
+    user_name = (user.full_name or "").strip().lower()
+    username = (user.username or "").strip().lower()
+    rows = []
+    for page in response.get("results", []):
+        props = page.get("properties", {})
+        notes = _get_plain_text(props.get("Notes")).lower()
+        posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
+        is_mine = (
+            uid_marker in notes
+            or (user_name and posted_by == user_name)
+            or (username and username in posted_by)
+            or (username and f"@{username}" in posted_by)
+            or (user_name and user_name in posted_by)
+        )
+        if not is_mine:
+            continue
+        ticker = (
+            _get_plain_text(props.get("Ticker"))
+            or _get_plain_text(props.get("Stockpick & Month"))
+            or ""
+        ).upper()
+        # Prefer explicit ticker hashtag inside message
+        msg = _get_plain_text(props.get("Message")) or ""
+        ht = extract_hashtag_tickers(msg)
+        if ht:
+            ticker = ht[0]
+        summary = _get_plain_text(props.get("Summary")) or "—"
+        date_s = "—"
+        for dname in ("Date", "Created", "Date Added"):
+            dp = props.get(dname) or {}
+            if isinstance(dp, dict) and dp.get("type") == "date" and dp.get("date"):
+                date_s = (dp["date"] or {}).get("start") or "—"
+                break
+        if ticker:
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "summary": summary[:120],
+                    "date": date_s[:10],
+                    "page_id": page["id"],
+                }
+            )
+    # Newest first by date string
+    rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+    return rows[:8]
+
+
+async def _watchlist_rns_lines(user_id: int) -> list[dict]:
+    """
+    Build RNS feed lines for tickers on the user's active watchlist.
+    Uses UK AIM Micro-Cap Last RNS Date (+ company). Full headlines come via R_News DMs.
+    """
+    pages = await _fetch_user_watchlist_pages(user_id)
+    active = _active_watchlist_name.get(user_id)
+    list_names = _list_names_from_pages(pages)
+    if not active or active not in list_names:
+        active = list_names[0] if list_names else "Default"
+
+    seen = set()
+    lines = []
+    for page in pages:
+        props = page.get("properties", {})
+        ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+        if ln != active:
+            continue
+        ticker = (_get_plain_text(props.get("Ticker")) or "").upper()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        name = _get_plain_text(props.get("Name")) or ticker
+        meta = await get_ticker_from_notion(ticker)
+        company = (meta or {}).get("company") or name
+        last_rns = (meta or {}).get("last_rns") or ""
+        summary = ((meta or {}).get("summary") or "").strip()
+        # First line of summary as soft "headline" stand-in
+        headline = ""
+        if summary:
+            headline = summary.split("\n")[0].strip()[:140]
+        lines.append(
+            {
+                "ticker": ticker,
+                "company": company,
+                "last_rns": last_rns,
+                "headline": headline,
+            }
+        )
+    # Sort by last_rns desc when present
+    lines.sort(key=lambda x: x.get("last_rns") or "", reverse=True)
+    return lines[:12]
+
+
+async def show_explore(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    tab: str = "feed",
+    edit: bool = False,
+) -> None:
+    """
+    Tab-frame home inspired by Explore / News apps:
+      · Feed  – stockpick blocks (top) + RNS lines for watchlist (bottom)
+      · Picks – stockpick list only
+      · List  – manage watchlist table
+      · Hub   – stockpick hub shortcuts
+    """
+    user = update.effective_user
+    if update.callback_query:
+        msg = update.callback_query.message
+    else:
+        msg = update.message
+    if not msg or not user:
+        return
+
+    if not await is_authorized(update, context):
+        text = (
+            "🔒 You are not authorised to use this bot service yet.\n"
+            "Send /request then /status."
+        )
+        if edit:
+            try:
+                await msg.edit_text(text)
+            except Exception:
+                await msg.reply_text(text)
+        else:
+            await msg.reply_text(text)
+        return
+
+    tab = (tab or "feed").lower()
+    if tab == "list":
+        await show_watchlist(update, context, edit=edit)
+        return
+    if tab == "hub":
+        text = (
+            "🏠 *Hive Hub*\n\n"
+            "• Edit this month’s stockpick\n"
+            "• Open full picks history\n"
+            "• Manage watchlist tickers\n"
+        )
+        kb = _explore_tab_keyboard("hub")
+        kb.extend(_hub_keyboard().inline_keyboard)
+        markup = InlineKeyboardMarkup(kb)
+        if edit:
+            try:
+                await msg.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            except Exception:
+                await msg.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await msg.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    # --- Feed or Picks ---
+    picks = await _user_stockpick_rows(user)
+    rns_lines = await _watchlist_rns_lines(user.id) if tab == "feed" else []
+
+    lines = ["🐝 *Hive Explore*\n"]
+    keyboard = _explore_tab_keyboard(tab)
+
+    # Part 1 – stockpick blocks
+    lines.append("📌 *Your stockpicks*")
+    if not picks:
+        lines.append("No stockpicks yet. Use #stockpick #TICKER to add one.\n")
+    else:
+        for i, p in enumerate(picks[:6], 1):
+            safe_t = _md_escape(p["ticker"])
+            safe_sum = _md_escape((p.get("summary") or "")[:90])
+            safe_d = _md_escape(p.get("date") or "")
+            lines.append(
+                f"{i}. *#{safe_t}* · {safe_d}\n"
+                f"   {safe_sum}"
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"📊 #{p['ticker']} snapshot",
+                        callback_data=f"exp:snap:{p['ticker'][:16]}",
+                    )
+                ]
+            )
+        lines.append("")
+
+    if tab == "feed":
+        # Part 2 – RNS feed for watchlist tickers
+        lines.append("───")
+        lines.append("📰 *RNS · your watchlist*")
+        if not rns_lines:
+            lines.append(
+                "No watchlist tickers yet. Open List to add names.\n"
+            )
+        else:
+            for r in rns_lines:
+                if r.get("last_rns"):
+                    try:
+                        dt = datetime.fromisoformat(str(r["last_rns"])[:10])
+                        date_bit = dt.strftime("%d %b %Y")
+                    except Exception:
+                        date_bit = _md_escape(str(r["last_rns"])[:10])
+                else:
+                    date_bit = "—"
+                head = _md_escape(
+                    (r.get("headline") or "Latest company update on file")[:120]
+                )
+                safe_t = _md_escape(r["ticker"])
+                safe_c = _md_escape(r.get("company") or "")
+                lines.append(
+                    f"🕒 *{date_bit}* · *#{safe_t}* – {safe_c}\n"
+                    f"   {head}"
+                )
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"📊 #{r['ticker']}",
+                            callback_data=f"exp:snap:{r['ticker'][:16]}",
+                        )
+                    ]
+                )
+        lines.append("")
+        lines.append(
+            "Live RNS headlines are also DM'd by R-News when a release hits "
+            "your watchlist."
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"exp:tab:{tab}"),
+        ]
+    )
+
+    text = "\n".join(lines)
+    # Telegram hard limit
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+    markup = InlineKeyboardMarkup(keyboard)
+    await _safe_edit_or_reply(
+        msg, text, edit=edit, reply_markup=markup, parse_mode="Markdown"
+    )
+
+
+async def explore_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle exp:tab:* and exp:snap:TICKER callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    user = query.from_user
+    if not user:
+        return
+
+    if data.startswith("exp:tab:"):
+        tab = data.replace("exp:tab:", "", 1).strip() or "feed"
+        await show_explore(update, context, tab=tab, edit=True)
+        return
+
+    if data.startswith("exp:snap:"):
+        ticker = data.replace("exp:snap:", "", 1).strip().upper()
+        if not ticker:
+            await query.message.reply_text("Missing ticker.")
+            return
+        try:
+            meta = await get_ticker_from_notion(ticker)
+            if not meta:
+                await query.message.reply_text(
+                    f"No snapshot for *#{ticker}* in UK AIM Micro-Cap.",
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                stockpickers = await get_stockpickers_for_ticker(ticker)
+            except Exception:
+                stockpickers = []
+            body = format_reply(ticker, meta, stockpickers)
+            await query.message.reply_text(
+                body,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            try:
+                await log_member_activity(
+                    user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} explore snapshot"
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error("explore snapshot failed for %s: %s", ticker, e)
+            await query.message.reply_text(f"Snapshot failed: {e}")
+        return
+
+
 async def show_watchlist(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
@@ -2858,16 +3244,16 @@ async def show_watchlist(
 
         lines = [
             f"👀 *My Watchlist*  ({len(list_names)}/{MAX_WATCHLISTS})",
-            f"Active list: *{active}*",
+            f"Active list: *{_md_escape(active)}*",
             "",
-            "_Ticker | Name | Last RNS / link | Stockpick_",
+            "Ticker | Name | Last RNS / link | Stockpick",
             "",
         ]
         keyboard: list[list] = []
         keyboard.extend(_tab_keyboard(list_names, active))
 
         if not rows:
-            lines.append("Empty — tap *➕ Add ticker* to start.")
+            lines.append("Empty — tap Add ticker to start.")
         else:
             for i, (ticker, name, url, _page_id) in enumerate(rows, 1):
                 meta = await get_ticker_from_notion(ticker)
@@ -2878,7 +3264,7 @@ async def show_watchlist(
                         dt = datetime.fromisoformat(str(last_rns)[:10])
                         rns_bit = f"🕒 {dt.strftime('%d %b %Y')}"
                     except Exception:
-                        rns_bit = f"🕒 {last_rns[:10]}"
+                        rns_bit = f"🕒 {_md_escape(str(last_rns)[:10])}"
                 else:
                     rns_bit = "🕒 No RNS date yet"
                 # Stockpick marker for this user/ticker
@@ -2898,9 +3284,15 @@ async def show_watchlist(
                 except Exception:
                     pass
                 pick_bit = "💬" if has_pick else "—"
-                link_bit = f"[link]({url})" if url and url.startswith("http") else "—"
+                # Plain URL only – markdown links often break entity parsing
+                if url and url.startswith("http"):
+                    link_bit = _md_escape(url)
+                else:
+                    link_bit = "—"
+                safe_company = _md_escape(company)
+                safe_ticker = _md_escape(ticker)
                 lines.append(
-                    f"{i}. *#{ticker}*  {company}\n"
+                    f"{i}. *#{safe_ticker}*  {safe_company}\n"
                     f"   {rns_bit} · {link_bit} · {pick_bit}"
                 )
                 # Per-row edit / remove
@@ -2918,9 +3310,10 @@ async def show_watchlist(
                 )
 
         lines.append("")
+        # No underscores inside italic – "R_News" was breaking Markdown entities
         lines.append(
-            "_RNS headlines are pushed live by R\\_News when a release hits "
-            "your watchlist tickers._"
+            "RNS headlines are pushed live by R-News when a release hits "
+            "your watchlist tickers."
         )
 
         keyboard.append(
@@ -2947,28 +3340,9 @@ async def show_watchlist(
 
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(keyboard)
-        if edit:
-            try:
-                await msg.edit_text(
-                    text,
-                    reply_markup=markup,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                await msg.reply_text(
-                    text,
-                    reply_markup=markup,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                )
-        else:
-            await msg.reply_text(
-                text,
-                reply_markup=markup,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
+        await _safe_edit_or_reply(
+            msg, text, edit=edit, reply_markup=markup, parse_mode="Markdown"
+        )
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
@@ -2981,15 +3355,11 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     data = query.data or ""
 
     if data == "hub:watchlist":
-        await show_watchlist(update, context, edit=True)
+        await show_explore(update, context, tab="feed", edit=True)
     elif data == "hub:mypicks":
-        await show_my_stockpicks(update, context, edit=True)
+        await show_explore(update, context, tab="picks", edit=True)
     elif data == "hub:home":
-        await query.edit_message_text(
-            "📌 *My Stockpick hub*\n\nChoose an option:",
-            parse_mode="Markdown",
-            reply_markup=_hub_keyboard(),
-        )
+        await show_explore(update, context, tab="hub", edit=True)
 
 
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4430,6 +4800,7 @@ def main() -> None:
 
     # Inline buttons (once each — no duplicates)
     app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
+    app.add_handler(CallbackQueryHandler(explore_button, pattern=r"^exp:"))
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
