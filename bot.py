@@ -8,6 +8,7 @@ or #ticker + intent keywords (summary, snapshot, thesis, etc.)
 
 import os
 import re
+import asyncio
 import time
 import logging
 from datetime import datetime, timezone
@@ -1421,6 +1422,70 @@ def _is_private(update: Update) -> bool:
     return bool(chat and chat.type == "private")
 
 
+async def safe_delete_message(
+    bot, chat_id: int | None, message_id: int | None
+) -> bool:
+    """Best-effort delete. Works in private chats; groups need delete rights."""
+    if not bot or chat_id is None or message_id is None:
+        return False
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        logger.debug("delete_message failed chat=%s msg=%s: %s", chat_id, message_id, e)
+        return False
+
+
+async def cleanup_trigger_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove the user's button/command message so the chat stays clean."""
+    msg = update.effective_message or update.message
+    if not msg or not context or not context.bot:
+        return
+    # Prefer private chats (always allowed for bot↔user)
+    if not _is_private(update) and not is_admin(update.effective_user):
+        return
+    await safe_delete_message(context.bot, msg.chat_id, msg.message_id)
+
+
+async def send_clean(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    delete_trigger: bool = True,
+    delete_reply_after: float | None = None,
+    **reply_kwargs,
+):
+    """
+    Send text via chat_id (safe after deleting the trigger message),
+    and optionally delete this bot reply after a few seconds.
+    """
+    chat = update.effective_chat
+    if delete_trigger:
+        await cleanup_trigger_message(update, context)
+
+    msg = None
+    if chat and context and context.bot:
+        msg = await context.bot.send_message(chat.id, text, **reply_kwargs)
+    elif update.effective_message:
+        msg = await update.effective_message.reply_text(text, **reply_kwargs)
+
+    if delete_reply_after and msg and context and context.bot:
+        async def _later():
+            try:
+                await asyncio.sleep(float(delete_reply_after))
+                await safe_delete_message(context.bot, msg.chat_id, msg.message_id)
+            except Exception as e:
+                logger.debug("ephemeral delete failed: %s", e)
+
+        try:
+            asyncio.create_task(_later())
+        except Exception as e:
+            logger.debug("Could not schedule ephemeral delete: %s", e)
+
+    return msg
+
+
 def _extract_telegram_link(props: dict) -> str:
     """Pull Telegram group URL from Notion properties (URL or text)."""
     # Prefer known property names (including trailing-space variant)
@@ -1866,11 +1931,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Cancelled Group Links add.")
         return
 
-    # --- Persistent keyboard shortcuts ---
+    # --- Persistent keyboard shortcuts (delete trigger text so chat stays clean) ---
     if text in ("🙈 Hide", "Hide") or lower in ("hide", "🙈 hide"):
-        await update.message.reply_text(
-            "Keyboard hidden. Tap **☰ Show menu** to bring it back.",
-            parse_mode="Markdown",
+        await send_clean(
+            update,
+            context,
+            "Keyboard hidden. Tap ☰ Show menu to bring it back.",
+            delete_trigger=True,
+            delete_reply_after=3.0,
             reply_markup=hidden_reply_keyboard(),
         )
         return
@@ -1880,13 +1948,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "☰ show menu",
         "unhide",
     ):
-        await update.message.reply_text(
+        await send_clean(
+            update,
+            context,
             "Menu restored.",
+            delete_trigger=True,
+            delete_reply_after=2.5,
             reply_markup=main_reply_keyboard(),
         )
         return
 
     if text in ("📋 Menu", "Menu") or lower == "menu":
+        await cleanup_trigger_message(update, context)
         await menu_cmd(update, context)
         return
 
@@ -1913,6 +1986,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ):
         logger.info("Link button matched text=%r", text)
         await link_cmd(update, context)
+        await cleanup_trigger_message(update, context)
         return
 
     # Link search follow-up (private only) after tapping 🔗 Link
@@ -1923,6 +1997,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         _awaiting_link.pop(user.id, None)
         query = text.strip()
+        # Keep the search query visible (useful history); only strip pure UI taps
         if not query:
             await update.message.reply_text(
                 "Please send a ticker or company name (e.g. ALRT or Defence Holdings)."
@@ -1949,6 +2024,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Could not open My Stockpick.\n`{e}`",
                 parse_mode="Markdown",
             )
+        await cleanup_trigger_message(update, context)
         return
 
     if "watchlist" in lower and len(text) < 40:
@@ -1960,6 +2036,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Could not open watchlist.\n`{e}`",
                 parse_mode="Markdown",
             )
+        await cleanup_trigger_message(update, context)
         return
 
     # Watchlist follow-up
@@ -2177,14 +2254,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Check status with /status."
         )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
+    # Remove /start (or Start button text) so only the welcome stays
+    await cleanup_trigger_message(update, context)
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    text = (
         "🐝 *BuzzBot Menu*\n\n"
         "• /start – Welcome & status\n"
         "• /status – Check if you are authorised\n"
@@ -2195,10 +2283,23 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /faq – FAQ\n\n"
         "In the group: `@Bot #TICKER` to look up a stock\n"
         "Or use `#stockpick your idea` to save one.\n"
-        "🔗 *Group Link* works only in a private 1-to-1 chat.",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
+        "🔗 *Group Link* works only in a private 1-to-1 chat."
     )
+    await cleanup_trigger_message(update, context)
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2206,38 +2307,59 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
     data = (query.data or "").replace("cmd:", "")
 
-    # Reuse existing handlers by faking a simple flow
-    class _FakeMsg:
-        def __init__(self, q):
-            self._q = q
-        async def reply_text(self, *a, **k):
-            return await self._q.message.reply_text(*a, **k)
+    # Remove the inline menu message after a button is pressed (clean chat)
+    if query and query.message and _is_private(update):
+        await safe_delete_message(
+            context.bot, query.message.chat_id, query.message.message_id
+        )
 
-    fake_update = update
-    # Easier: just reply based on command
     if data == "start":
-        await query.message.reply_text("Send /start to refresh the welcome screen.")
+        await start(update, context)
     elif data == "faq":
-        await faq(update, context)
+        # faq expects update.message – send via bot if needed
+        if update.message:
+            await faq(update, context)
+        else:
+            chat = update.effective_chat
+            if chat:
+                # minimal proxy
+                class _MsgProxy:
+                    def __init__(self, bot, chat_id):
+                        self._bot = bot
+                        self.chat_id = chat_id
+                    async def reply_text(self, *a, **k):
+                        return await self._bot.send_message(self.chat_id, *a, **k)
+                class _Up:
+                    def __init__(self, orig, msg):
+                        self.effective_user = orig.effective_user
+                        self.effective_chat = orig.effective_chat
+                        self.message = msg
+                await faq(
+                    _Up(update, _MsgProxy(context.bot, chat.id)), context
+                )
     elif data == "snap":
         await snap_cmd(update, context)
     elif data == "mystockpick":
         await mystockpick_cmd(update, context)
     elif data == "link":
-        # CallbackQuery has no update.message; use the message under the button
         query = update.callback_query
         if query and query.message:
             class _MsgProxy:
-                def __init__(self, msg):
+                def __init__(self, msg, bot):
                     self._msg = msg
+                    self._bot = bot
+                    self.chat = msg.chat
                 async def reply_text(self, *a, **k):
-                    return await self._msg.reply_text(*a, **k)
+                    return await self._bot.send_message(self._msg.chat_id, *a, **k)
             class _UpdateProxy:
                 def __init__(self, orig, msg):
                     self.effective_user = orig.effective_user
                     self.effective_chat = msg.chat
-                    self.message = _MsgProxy(msg)
-            await link_cmd(_UpdateProxy(update, query.message), context)
+                    self.message = msg
+            await link_cmd(
+                _UpdateProxy(update, _MsgProxy(query.message, context.bot)),
+                context,
+            )
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
