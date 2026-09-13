@@ -1069,6 +1069,15 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                         return val
             return ""
 
+        # Last RNS Date (date property)
+        last_rns = ""
+        for rns_name in ("Last RNS Date", "Last RNS", "Last RNS date"):
+            if rns_name in props:
+                rp = props[rns_name]
+                if isinstance(rp, dict) and rp.get("type") == "date" and rp.get("date"):
+                    last_rns = (rp["date"] or {}).get("start") or ""
+                    break
+
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
             "summary": find_prop(
@@ -1077,6 +1086,13 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
+            "last_rns": last_rns,
+            "group_link": (
+                (props.get("Telegram group ") or {}).get("url")
+                or (props.get("Telegram Group") or {}).get("url")
+                or (props.get("Group Link") or {}).get("url")
+                or ""
+            ),
         }
 
         _ticker_cache[ticker] = {
@@ -2769,6 +2785,26 @@ async def show_my_stockpicks(
         logger.error("show_my_stockpicks failed: %s", e)
         await msg.reply_text("Could not load your stockpicks right now.")
 
+def _watchlist_continue_keyboard() -> InlineKeyboardMarkup:
+    """After add/create – keep user in the list-building flow."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ Add another ticker", callback_data="wl:add"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Done – Save & view list", callback_data="wl:done"
+                ),
+            ],
+            [
+                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ],
+        ]
+    )
+
+
 async def show_watchlist(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
 ) -> None:
@@ -2803,7 +2839,6 @@ async def show_watchlist(
         pages = await _fetch_user_watchlist_pages(user.id)
         list_names = _list_names_from_pages(pages)
 
-        # Active tab
         active = _active_watchlist_name.get(user.id)
         if not active or active not in list_names:
             active = list_names[0] if list_names else "Default"
@@ -2816,58 +2851,130 @@ async def show_watchlist(
             ln = _get_plain_text(props.get("List Name")).strip() or "Default"
             if ln != active:
                 continue
-            ticker = _get_plain_text(props.get("Ticker")) or "-"
+            ticker = (_get_plain_text(props.get("Ticker")) or "-").upper()
             name = _get_plain_text(props.get("Name")) or "-"
             url = ((props.get("Group Link") or {}).get("url") or "").strip()
-            rows.append((ticker, name, url or "-"))
+            rows.append((ticker, name, url, page["id"]))
 
         lines = [
-            f"My Watchlist  ({len(list_names)}/{MAX_WATCHLISTS})",
-            f"Active: {active}",
+            f"👀 *My Watchlist*  ({len(list_names)}/{MAX_WATCHLISTS})",
+            f"Active list: *{active}*",
             "",
-            "Ticker | Name | Link",
+            "_Ticker | Name | Last RNS / link | Stockpick_",
             "",
         ]
-        if not rows:
-            lines.append("Empty — use Edit Watchlist to add tickers.")
-        else:
-            for ticker, name, url in rows:
-                lines.append(f"#{ticker} | {name} | {url}")
-
-        keyboard = []
-        # Tabs
+        keyboard: list[list] = []
         keyboard.extend(_tab_keyboard(list_names, active))
-        # Manage
+
+        if not rows:
+            lines.append("Empty — tap *➕ Add ticker* to start.")
+        else:
+            for i, (ticker, name, url, _page_id) in enumerate(rows, 1):
+                meta = await get_ticker_from_notion(ticker)
+                company = (meta or {}).get("company") or name
+                last_rns = (meta or {}).get("last_rns") or ""
+                if last_rns:
+                    try:
+                        dt = datetime.fromisoformat(str(last_rns)[:10])
+                        rns_bit = f"🕒 {dt.strftime('%d %b %Y')}"
+                    except Exception:
+                        rns_bit = f"🕒 {last_rns[:10]}"
+                else:
+                    rns_bit = "🕒 No RNS date yet"
+                # Stockpick marker for this user/ticker
+                has_pick = False
+                try:
+                    picks = await get_stockpickers_for_ticker(ticker)
+                    uname = (user.username or "").lower()
+                    fname = (user.full_name or "").lower()
+                    for p in picks or []:
+                        pl = (p or "").lower()
+                        if uname and uname in pl:
+                            has_pick = True
+                            break
+                        if fname and fname[:12] and fname[:12] in pl:
+                            has_pick = True
+                            break
+                except Exception:
+                    pass
+                pick_bit = "💬" if has_pick else "—"
+                link_bit = f"[link]({url})" if url and url.startswith("http") else "—"
+                lines.append(
+                    f"{i}. *#{ticker}*  {company}\n"
+                    f"   {rns_bit} · {link_bit} · {pick_bit}"
+                )
+                # Per-row edit / remove
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"✏️ #{ticker}",
+                            callback_data=f"wl:ed:{ticker[:20]}",
+                        ),
+                        InlineKeyboardButton(
+                            f"🗑 #{ticker}",
+                            callback_data=f"wl:rm:{ticker[:20]}",
+                        ),
+                    ]
+                )
+
+        lines.append("")
+        lines.append(
+            "_RNS headlines are pushed live by R\\_News when a release hits "
+            "your watchlist tickers._"
+        )
+
+        keyboard.append(
+            [
+                InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
+                InlineKeyboardButton("✏️ Edit menu", callback_data="wl:edit_menu"),
+            ]
+        )
         keyboard.append(
             [
                 InlineKeyboardButton("Create New", callback_data="wl:create"),
-                InlineKeyboardButton("Edit list", callback_data="wl:edit_menu"),
-            ]
-        )
-        keyboard.append(
-            [
                 InlineKeyboardButton("Rename", callback_data="wl:rename"),
-                InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
             ]
         )
         keyboard.append(
             [
+                InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
                 InlineKeyboardButton("Refresh", callback_data="hub:watchlist"),
-                InlineKeyboardButton("Back to Hub", callback_data="hub:home"),
             ]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("« Back to Hub", callback_data="hub:home")]
         )
 
         text = "\n".join(lines)
         markup = InlineKeyboardMarkup(keyboard)
         if edit:
-            await msg.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+            try:
+                await msg.edit_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                await msg.reply_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
         else:
-            await msg.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+            await msg.reply_text(
+                text,
+                reply_markup=markup,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
-        
+
+
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -2884,6 +2991,7 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=_hub_keyboard(),
         )
 
+
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -2891,7 +2999,65 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not user:
         return
 
-    action = (query.data or "").replace("wl:", "")
+    raw = query.data or ""
+    action = raw.replace("wl:", "", 1)
+
+    # --- Tab switch ---
+    if action.startswith("tab:"):
+        tab = action[4:].strip()
+        if tab:
+            _active_watchlist_name[user.id] = tab
+        await show_watchlist(update, context, edit=True)
+        return
+
+    # --- Done: leave add mode and show list ---
+    if action == "done":
+        _awaiting_watchlist.pop(user.id, None)
+        await show_watchlist(update, context, edit=False)
+        return
+
+    # --- Per-row remove ---
+    if action.startswith("rm:"):
+        ticker = action[3:].strip().upper()
+        db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
+        if not notion or not db_id or not ticker:
+            await query.message.reply_text("Could not remove ticker.")
+            return
+        try:
+            response = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "and": [
+                        {
+                            "property": "Telegram User ID",
+                            "rich_text": {"equals": str(user.id)},
+                        },
+                        {"property": "Ticker", "title": {"equals": ticker}},
+                    ]
+                },
+                page_size=5,
+            )
+            results = response.get("results", [])
+            for page in results:
+                notion.pages.update(page_id=page["id"], archived=True)
+            await query.message.reply_text(f"Removed #{ticker} from your watchlist.")
+            await show_watchlist(update, context, edit=False)
+        except Exception as e:
+            await query.message.reply_text(f"Remove failed: {e}")
+        return
+
+    # --- Per-row edit ---
+    if action.startswith("ed:"):
+        ticker = action[3:].strip().upper()
+        _awaiting_watchlist[user.id] = "change"
+        await query.message.reply_text(
+            f"✏️ *Edit #{ticker}*\n\n"
+            "Send:\n"
+            f"`#{ticker} | New Name | https://t.me/+newlink`\n\n"
+            "Or change only the name / link.",
+            parse_mode="Markdown",
+        )
+        return
 
     # --- List-level actions ---
     if action == "create":
@@ -2908,17 +3074,18 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         _awaiting_watchlist[user.id] = "rename_list"
         await query.message.reply_text(
             "✏️ *Rename Watchlist*\n\n"
-            "Send: `Old Name | New Name`",
+            "Send the *new name* for the active list.",
             parse_mode="Markdown",
         )
         return
 
     if action == "delete_list":
+        active = _active_watchlist_name.get(user.id, "Default")
         _awaiting_watchlist[user.id] = "delete_list"
         await query.message.reply_text(
-            "🗑 *Delete Watchlist*\n\n"
-            "Send the list name to delete, e.g. `UK AIM Growth`\n"
-            "This removes **all tickers** in that list.",
+            f"🗑 *Delete Watchlist*\n\n"
+            f"Active list: *{active}*\n"
+            "Send `YES` to delete **all tickers** in this list.",
             parse_mode="Markdown",
         )
         return
@@ -2951,12 +3118,14 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     _awaiting_watchlist[user.id] = action
 
     if action == "add":
+        active = _active_watchlist_name.get(user.id, "Default")
         await query.message.reply_text(
-            "➕ *Add ticker*\n\n"
+            f"➕ *Add ticker* to `{active}`\n\n"
             "Send one line:\n"
             "`#TICKER | Company Name | https://t.me/+invite`\n\n"
             "Example:\n"
-            "`#ALRT | Defence Holdings | https://t.me/+abc123`",
+            "`#ALRT | Defence Holdings | https://t.me/+abc123`\n\n"
+            "You can keep adding until you tap *Done – Save & view list*.",
             parse_mode="Markdown",
         )
     elif action == "change":
@@ -3008,16 +3177,16 @@ async def handle_watchlist_text(
                 )
                 return
             _active_watchlist_name[user.id] = list_name
-            keyboard = [
-                [
-                    InlineKeyboardButton("Add ticker", callback_data="wl:add"),
-                    InlineKeyboardButton("My Watchlist", callback_data="hub:watchlist"),
-                ],
-                [InlineKeyboardButton("Back to Hub", callback_data="hub:home")],
-            ]
+            # Keep user in add flow until they confirm Done
+            _awaiting_watchlist[user.id] = "add"
             await update.message.reply_text(
-                f"List set to: {list_name}\n\nNext: add your first ticker.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                f'List set to: "{list_name}"\n\n'
+                "Next: continue add ticker?\n\n"
+                "Send:\n"
+                "`#TICKER | Company Name | https://t.me/+invite`\n\n"
+                "Keep adding until you tap *Done – Save & view list*.",
+                parse_mode="Markdown",
+                reply_markup=_watchlist_continue_keyboard(),
             )
             return
 
@@ -3125,8 +3294,16 @@ async def handle_watchlist_text(
                     "rich_text": [{"text": {"content": user.username}}]
                 }
             notion.pages.create(parent={"database_id": db_id}, properties=props)
+            # Stay in add mode until user confirms Done
+            _awaiting_watchlist[user.id] = "add"
             await update.message.reply_text(
-                f"Added #{ticker} to list: {list_name}"
+                f'List set to: "{list_name}"\n'
+                f"Added *#{ticker}* ({name or ticker}).\n\n"
+                "Next: continue add ticker?\n\n"
+                "Send another `#TICKER | Name | link` line, or tap "
+                "*Done – Save & view list*.",
+                parse_mode="Markdown",
+                reply_markup=_watchlist_continue_keyboard(),
             )
             return
 
@@ -3163,7 +3340,10 @@ async def handle_watchlist_text(
                 props["Group Link"] = {"url": link}
             if props:
                 notion.pages.update(page_id=results[0]["id"], properties=props)
-            await update.message.reply_text(f"Updated #{ticker}.")
+            await update.message.reply_text(
+                f"Updated #{ticker}.",
+                reply_markup=_watchlist_continue_keyboard(),
+            )
             return
 
         await update.message.reply_text(
