@@ -1447,6 +1447,40 @@ async def cleanup_trigger_message(update: Update, context: ContextTypes.DEFAULT_
     await safe_delete_message(context.bot, msg.chat_id, msg.message_id)
 
 
+def with_command_cleanup(handler):
+    """
+    Wrap a CommandHandler callback: run it, then delete the /command message
+    in private chat so only the bot's reply remains.
+    """
+    async def _wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            return await handler(update, context)
+        finally:
+            try:
+                # Don't strip admin tooling in groups; private chat only
+                if _is_private(update):
+                    await cleanup_trigger_message(update, context)
+            except Exception as e:
+                logger.debug("command cleanup failed: %s", e)
+
+    _wrapped.__name__ = getattr(handler, "__name__", "wrapped_cmd")
+    return _wrapped
+
+
+async def cleanup_callback_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, only_if_private: bool = True
+) -> None:
+    """Delete the message that held the inline keyboard (after a button press)."""
+    query = update.callback_query
+    if not query or not query.message or not context or not context.bot:
+        return
+    if only_if_private and not _is_private(update):
+        return
+    await safe_delete_message(
+        context.bot, query.message.chat_id, query.message.message_id
+    )
+
+
 async def send_clean(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3775,36 +3809,32 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("faq", faq))
-    app.add_handler(CommandHandler("snap", snap_cmd))
-    app.add_handler(CommandHandler("mystockpick", mystockpick_cmd))
-    app.add_handler(CommandHandler("help", menu_cmd))
-    app.add_handler(CommandHandler("tickers", snap_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("request", request_access))
-    app.add_handler(CommandHandler("debug", debug_cmd))
-    app.add_handler(CommandHandler("pending", pending_cmd))
-    app.add_handler(CommandHandler("approve", approve_cmd))
-    app.add_handler(CommandHandler("reject", reject_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("link", link_cmd))
-    app.add_handler(CommandHandler("links", link_cmd))
-    app.add_handler(CommandHandler("telegram", link_cmd))
+    # Commands — with_command_cleanup removes /status, /mystockpick, etc. after run
+    app.add_handler(CommandHandler("start", with_command_cleanup(start)))
+    app.add_handler(CommandHandler("menu", with_command_cleanup(menu_cmd)))
+    app.add_handler(CommandHandler("faq", with_command_cleanup(faq)))
+    app.add_handler(CommandHandler("snap", with_command_cleanup(snap_cmd)))
+    app.add_handler(CommandHandler("mystockpick", with_command_cleanup(mystockpick_cmd)))
+    app.add_handler(CommandHandler("help", with_command_cleanup(menu_cmd)))
+    app.add_handler(CommandHandler("tickers", with_command_cleanup(snap_cmd)))
+    app.add_handler(CommandHandler("status", with_command_cleanup(status_cmd)))
+    app.add_handler(CommandHandler("request", with_command_cleanup(request_access)))
+    app.add_handler(CommandHandler("debug", with_command_cleanup(debug_cmd)))
+    app.add_handler(CommandHandler("pending", with_command_cleanup(pending_cmd)))
+    app.add_handler(CommandHandler("approve", with_command_cleanup(approve_cmd)))
+    app.add_handler(CommandHandler("reject", with_command_cleanup(reject_cmd)))
+    app.add_handler(CommandHandler("admin", with_command_cleanup(admin_cmd)))
+    app.add_handler(CommandHandler("link", with_command_cleanup(link_cmd)))
+    app.add_handler(CommandHandler("links", with_command_cleanup(link_cmd)))
+    app.add_handler(CommandHandler("telegram", with_command_cleanup(link_cmd)))
 
-    # Inline buttons (must be before run_polling)
+    # Inline buttons (once each — no duplicates)
     app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
+    app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
-    app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
-    app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
-    app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
-    app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))  # ← add this
 
     # Text messages + reply keyboard buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
