@@ -820,12 +820,17 @@ async def sync_group_member_to_notion(
     Check Telegram group membership and update Notion "Group Member".
     Returns True/False, or None if check not possible.
     """
-    if not user or not notion:
+    if not user:
+        return None
+    if not notion and not NOTION_TOKEN:
         return None
 
-    group_id = os.getenv("TELEGRAM_GROUP_ID")
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not group_id or not db_id:
+    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not group_id or (not db_id and not ds_id):
         return None
 
     try:
@@ -843,32 +848,11 @@ async def sync_group_member_to_notion(
         logger.warning("get_chat_member failed for %s: %s", user.id, e)
         return None
 
-    status_label = "Yes" if is_member else "No"
-
     try:
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            return is_member
-
-        notion.pages.update(
-            page_id=results[0]["id"],
-            properties={
-                "Group Member": {
-                    "select": {"name": "Yes" if is_member else "No"}
-                }
-            },
-        )
+        await mark_group_member_in_notion(user, is_member=is_member)
         logger.info(
             "Updated Notion Group Member=%s for user %s",
-            status_label,
+            "Yes" if is_member else "No",
             user.id,
         )
     except Exception as e:
@@ -3225,22 +3209,37 @@ async def request_access(
     )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Show access status aligned with Notion Authorised Users + live Telegram check.
+    Prefer Notion for Admin status / Group Member when Telegram API fails.
+    """
     user = update.effective_user
     if not user:
         return
 
     msg = update.effective_message
     authorised = await is_authorized(update, context)
-    in_group, group_detail = await is_group_member(context, user.id)
+    in_group_tg, group_detail = await is_group_member(context, user.id)
 
-    # Look up Notion row for this user (Date Added / join proxy)
+    # Live Telegram signal
+    tg_error = group_detail.startswith("error:") or group_detail.startswith(
+        "Invalid TELEGRAM_GROUP_ID"
+    )
+    tg_skipped = "not set" in group_detail
+
+    # Notion row (multi-source safe)
     member_since = None
     notion_status = None
-    db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
+    notion_group = None
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
 
-    if notion and db_id:
+    if NOTION_TOKEN or notion:
         try:
-            response = notion.databases.query(
+            response = notion_query_data_source(
+                data_source_id=ds_id,
                 database_id=db_id,
                 filter={
                     "property": "Telegram User ID",
@@ -3251,49 +3250,113 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             results = response.get("results", [])
             if results:
                 props = results[0].get("properties", {})
-                notion_status = _get_plain_text(props.get("Status")) or None
-
-                # Prefer Date Added; fall back to other date-style fields if you rename later
+                # Status (select)
+                st = props.get("Status") or {}
+                if isinstance(st, dict):
+                    if st.get("type") == "select" and st.get("select"):
+                        notion_status = (st["select"] or {}).get("name")
+                    else:
+                        notion_status = _get_plain_text(st) or None
+                # Group Member (select)
+                gm = props.get("Group Member") or {}
+                if isinstance(gm, dict):
+                    if gm.get("type") == "select" and gm.get("select"):
+                        notion_group = (gm["select"] or {}).get("name")
+                    else:
+                        notion_group = _get_plain_text(gm) or None
+                # Date Added
                 date_prop = (
                     props.get("Date Added")
                     or props.get("Joined")
                     or props.get("Member Since")
                 )
-                if date_prop and date_prop.get("type") == "date":
-                    start = (date_prop.get("date") or {}).get("start")
-                    if start:
-                        # start is "YYYY-MM-DD" or datetime
-                        try:
-                            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-                            member_since = dt.strftime("%B %Y")  # e.g. September 2026
-                        except Exception:
-                            member_since = start[:7]  # YYYY-MM fallback
+                start = None
+                if isinstance(date_prop, dict):
+                    if date_prop.get("type") == "date" and date_prop.get("date"):
+                        start = (date_prop.get("date") or {}).get("start")
+                    elif date_prop.get("date") and isinstance(date_prop["date"], dict):
+                        start = date_prop["date"].get("start")
+                if start:
+                    try:
+                        dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                        member_since = dt.strftime("%B %Y")
+                    except Exception:
+                        member_since = str(start)[:7]
         except Exception as e:
             logger.error("status_cmd Notion lookup failed: %s", e)
+
+    # Resolve group membership display: Telegram first, else Notion, else unknown
+    if tg_skipped:
+        group_display = (
+            f"Yes (Notion)" if (notion_group or "").lower() == "yes"
+            else (f"No (Notion)" if (notion_group or "").lower() == "no"
+                  else "Unknown (TELEGRAM_GROUP_ID not set)")
+        )
+        in_group_effective = (notion_group or "").lower() == "yes"
+    elif tg_error:
+        # Telegram API failed (bot not in group / wrong ID / privacy) — trust Notion
+        if (notion_group or "").lower() == "yes":
+            group_display = "Yes (from Notion; Telegram check unavailable)"
+            in_group_effective = True
+        elif (notion_group or "").lower() == "no":
+            group_display = "No (from Notion; Telegram check unavailable)"
+            in_group_effective = False
+        else:
+            group_display = "Unknown (Telegram check failed)"
+            in_group_effective = False
+        logger.warning(
+            "status_cmd group check failed for %s: %s – using Notion Group Member=%s",
+            user.id,
+            group_detail,
+            notion_group,
+        )
+    else:
+        group_display = "Yes" if in_group_tg else "No"
+        in_group_effective = in_group_tg
+        # Best-effort: keep Notion Group Member in sync when Telegram works
+        try:
+            if notion_group and (
+                (in_group_tg and (notion_group or "").lower() != "yes")
+                or ((not in_group_tg) and (notion_group or "").lower() != "no")
+            ):
+                await mark_group_member_in_notion(user, is_member=in_group_tg)
+        except Exception:
+            pass
 
     lines = [
         "📋 *Your access status*\n",
         f"• Name: {user.full_name}",
         f"• Username: @{user.username or 'N/A'}",
         f"• Telegram ID: `{user.id}`",
-        f"• Group member: {'Yes' if in_group else 'No'}",
+        f"• Group member: *{group_display}*",
     ]
 
     if member_since:
-        lines.append(f"• Member of the group since: *{member_since}*")
-    elif in_group:
-        lines.append("• Member of the group since: _not recorded yet_")
+        lines.append(f"• On file since: *{member_since}*")
 
     if notion_status:
-        lines.append(f"• Admin status: *{notion_status}*")
+        lines.append(f"• Admin status (Notion): *{notion_status}*")
     else:
-        lines.append("• Admin status: _no record_")
+        lines.append("• Admin status (Notion): _no record_")
 
     if authorised:
         lines.append("\n✅ *Result: ACCESS GRANTED*")
     else:
         lines.append("\n❌ *Result: NOT AUTHORISED*")
         lines.append("Send /request to ask for access.")
+
+    # Helpful note when Telegram and Notion disagree
+    if (
+        not tg_error
+        and not tg_skipped
+        and notion_group
+        and in_group_tg != ((notion_group or "").lower() == "yes")
+    ):
+        lines.append(
+            f"\n_Note: Notion Group Member is “{notion_group}”; "
+            f"live Telegram check says {'Yes' if in_group_tg else 'No'}. "
+            "Notion was updated to match Telegram where possible._"
+        )
 
     await msg.reply_text(
         "\n".join(lines),
