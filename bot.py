@@ -1314,6 +1314,59 @@ def extract_hashtag_tickers(text: str) -> list[str]:
 
 MAX_WATCHLISTS = 3
 
+
+def _fetch_pct_on_day_live(ticker: str) -> float | None:
+    """
+    Live day % change for AIM/LSE ticker via Yahoo Finance (TICKER.L).
+    Returns percent points e.g. 1.25 meaning +1.25%, or None.
+    """
+    if not ticker:
+        return None
+    symbol = f"{ticker.upper().strip()}.L"
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?range=5d&interval=1d"
+    )
+    try:
+        import json as _json
+        import urllib.request
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; HiveBot/1.0)",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        result = (data.get("chart") or {}).get("result") or []
+        if not result:
+            return None
+        meta = result[0].get("meta") or {}
+        # Prefer price vs previous close (Yahoo % field is often stale/zero)
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        if price is not None and prev:
+            try:
+                return round((float(price) / float(prev) - 1.0) * 100.0, 2)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        if meta.get("regularMarketChangePercent") is not None:
+            return round(float(meta["regularMarketChangePercent"]), 2)
+        # Fallback from last two daily closes
+        closes = (
+            ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close")
+            or []
+        )
+        closes = [c for c in closes if c is not None]
+        if len(closes) >= 2 and closes[-2]:
+            return round((float(closes[-1]) / float(closes[-2]) - 1.0) * 100.0, 2)
+    except Exception as e:
+        logger.warning("live %% on day failed for %s: %s", ticker, e)
+    return None
+
+
 async def _fetch_user_watchlist_pages(user_id: int) -> list[dict]:
     """All Notion rows for this Telegram user (multi-source safe)."""
     db_id = NOTION_WATCHLIST_DB_ID or (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
@@ -3049,17 +3102,25 @@ async def show_watchlist(
         rns_hits = len(rns_map)
 
         # Day % change – always load for display (and for sort-by-pct)
-        # 1) Notion UK AIM Micro-Cap number fields
-        # 2) On force_rns (Refresh), also write into Watchlist "% On Day"
+        # Priority: live Yahoo (on Refresh or if missing) → Micro-Cap → Watchlist cache
         pct_map: dict[str, float | None] = {}
         sort_mode = _watchlist_sort.get(user.id, "rns")
         for t in tickers_for_rns:
+            pct_map[t] = None
+            # 1) Notion UK AIM Micro-Cap
             try:
                 data = await get_ticker_from_notion(t)
-                pct_map[t] = (data or {}).get("day_change_pct")
+                if data and data.get("day_change_pct") is not None:
+                    pct_map[t] = data.get("day_change_pct")
             except Exception:
-                pct_map[t] = None
-        # Prefer value already stored on Watchlist row if Micro-Cap has none
+                pass
+            # 2) Live market (always on Refresh; otherwise only if still missing)
+            if force_rns or pct_map[t] is None:
+                live = _fetch_pct_on_day_live(t)
+                if live is not None:
+                    pct_map[t] = live
+                await asyncio.sleep(0.15)
+        # 3) Watchlist row cache if still missing
         for page in pages:
             props = page.get("properties", {})
             ln = _get_plain_text(props.get("List Name")).strip() or "Default"
@@ -3074,8 +3135,8 @@ async def show_watchlist(
                     pct_map[t] = float(pct_prop["number"])
                 except (TypeError, ValueError):
                     pass
-        # On Refresh: persist latest % into Hive Bot Watchlist
-        if force_rns and notion:
+        # On Refresh: persist latest % into Hive Bot Watchlist "% On Day"
+        if force_rns and (notion or NOTION_TOKEN):
             for page in pages:
                 props = page.get("properties", {})
                 ln = _get_plain_text(props.get("List Name")).strip() or "Default"
@@ -3086,14 +3147,22 @@ async def show_watchlist(
                 if pct is None or not page.get("id"):
                     continue
                 try:
-                    notion.pages.update(
-                        page_id=page["id"],
-                        properties={"% On Day": {"number": float(pct)}},
-                    )
+                    if notion:
+                        notion.pages.update(
+                            page_id=page["id"],
+                            properties={"% On Day": {"number": float(pct)}},
+                        )
+                    else:
+                        _notion_http(
+                            "PATCH",
+                            f"pages/{page['id']}",
+                            {"properties": {"% On Day": {"number": float(pct)}}},
+                        )
+                    logger.info("Wrote %% On Day=%.2f for %s", pct, t)
                 except Exception as we:
                     logger.warning(
                         "Watchlist %% On Day write failed for %s "
-                        "(add Number column '%% On Day' if missing): %s",
+                        "(add Number column '%% On Day' on Hive Bot Watchlist): %s",
                         t,
                         we,
                     )
@@ -3156,19 +3225,30 @@ async def show_watchlist(
         if not rows:
             lines.append("Empty — use Edit list to add tickers.")
         else:
-            lines.append("_Tap a #ticker button to open the company snapshot._")
+            lines.append("Tap a #ticker button to open the company snapshot.")
             lines.append("")
             for r in page_rows:
                 ticker, name, url = r["ticker"], r["name"], r["url"]
+                # Prefer company name from UK AIM Micro-Cap when list Name is thin
+                company = name
+                try:
+                    meta = await get_ticker_from_notion(ticker)
+                    if meta and meta.get("company"):
+                        company = meta["company"]
+                except Exception:
+                    pass
+                r["display_name"] = company
                 pri = r.get("priority")
                 pri_bit = f" · ⭐{pri}" if pri is not None else ""
                 pct = r.get("pct")
-                pct_bit = ""
                 if pct is not None:
                     sign = "+" if pct >= 0 else ""
-                    pct_bit = f" · {sign}{pct:.2f}%"
-                # Display: #ALRT Defence Holdings · +1.25%
-                lines.append(f"*#{ticker}* {name}{pri_bit}{pct_bit}")
+                    arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+                    pct_bit = f" · {arrow} {sign}{pct:.2f}%"
+                else:
+                    pct_bit = " · ⚪ —%"
+                # Display: #ALRT Defence Holdings · 🟢 +1.25%
+                lines.append(f"*#{ticker}* {company}{pri_bit}{pct_bit}")
                 if url and url != "-":
                     lines.append(f"  🔗 {url}")
                 rns = r.get("rns") or {}
@@ -3177,7 +3257,7 @@ async def show_watchlist(
                     lines.append(f"  📰 *Latest RNS*{date_bit}")
                     lines.append(f"  {rns.get('title') or '—'}")
                     if rns.get("summary"):
-                        lines.append(f"  _{rns['summary']}_")
+                        lines.append(f"  {rns['summary']}")
                     if rns.get("link"):
                         lines.append(f"  {rns['link']}")
                 else:
@@ -3190,7 +3270,7 @@ async def show_watchlist(
         # Per-ticker "hyperlink" buttons → snapshot (this page only)
         for r in page_rows:
             t = r["ticker"]
-            n = (r.get("name") or t)[:28]
+            n = (r.get("display_name") or r.get("name") or t)[:28]
             if t and t != "-":
                 keyboard.append(
                     [
@@ -3397,6 +3477,8 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 stockpickers = []
             body = format_reply(ticker, meta, stockpickers)
             pct = meta.get("day_change_pct")
+            if pct is None:
+                pct = _fetch_pct_on_day_live(ticker)
             if pct is not None:
                 sign = "+" if pct >= 0 else ""
                 body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
