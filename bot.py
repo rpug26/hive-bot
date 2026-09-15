@@ -224,11 +224,22 @@ _awaiting_admin_glink: dict[int, dict] = {}
 _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 # user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
-_watchlist_ui: dict[int, dict] = {}
+_watchlist_ui: dict[int, dict] = {}  # panel msg tracking: chat_id, panel_msg_id, ...
 _watchlist_page: dict[int, int] = {}  # user_id -> page index (0-based)
 _watchlist_sort: dict[int, str] = {}  # user_id -> rns | pct | priority | name
+# Expand/collapse flags for My Watchlist keyboard sections (separate from panel ids)
+_watchlist_kb: dict[int, dict] = {}  # user_id -> {sort_open, manage_open, lists_open}
 WATCHLIST_PAGE_SIZE = 3
 MAX_WATCHLISTS = 3
+
+
+def _wl_ui(user_id: int) -> dict:
+    """Keyboard expand/collapse state for My Watchlist (not panel message ids)."""
+    st = _watchlist_kb.get(user_id)
+    if not st:
+        st = {"sort_open": False, "manage_open": False, "lists_open": False}
+        _watchlist_kb[user_id] = st
+    return st
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
 _authorized_cache: dict = {
     "usernames": set(),
@@ -3372,10 +3383,18 @@ async def show_watchlist(
                     lines.append("  📰 No RNS in News Log yet")
                 lines.append("")
 
+        # ----- Inline keyboard in 3 sections (expand / contract) -----
+        # 1) Company snapshot list
+        # 2) Navigation (page / sort / refresh) — sort expands
+        # 3) Manage menu — collapsed by default
+        ui = _wl_ui(user.id)
+        sort_open = bool(ui.get("sort_open"))
+        manage_open = bool(ui.get("manage_open"))
+        lists_open = bool(ui.get("lists_open"))
+
         keyboard = []
-        # Tabs
-        keyboard.extend(_tab_keyboard(list_names, active))
-        # Per-ticker "hyperlink" buttons → snapshot (this page only)
+
+        # --- Section 1: company snapshot list ---
         for r in page_rows:
             t = r["ticker"]
             n = (r.get("display_name") or r.get("name") or t)[:28]
@@ -3383,72 +3402,137 @@ async def show_watchlist(
                 keyboard.append(
                     [
                         InlineKeyboardButton(
-                            f"#{t} {n}",
+                            f"#{t}  {n}",
                             callback_data=f"wl:snap:{t[:20]}",
                         )
                     ]
                 )
-        # Pagination
-        if total_pages > 1 or total > 0:
-            nav = []
-            if page_idx > 0:
-                nav.append(
-                    InlineKeyboardButton("◀️ Prev", callback_data="wl:page_prev")
+
+        # --- Section 2: navigation ---
+        # List switcher (collapsed to one button when >1 lists)
+        if len(list_names) > 1:
+            if lists_open:
+                keyboard.extend(_tab_keyboard(list_names, active))
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            "▴ Hide lists", callback_data="wl:ui_lists"
+                        )
+                    ]
                 )
-            nav.append(
-                InlineKeyboardButton(
-                    f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
+            else:
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(
+                            f"📂 {active} ▾",
+                            callback_data="wl:ui_lists",
+                        )
+                    ]
                 )
+        elif list_names:
+            # Single list – compact label only (no extra chrome)
+            pass
+
+        # Page + Refresh on one row
+        nav = []
+        if page_idx > 0:
+            nav.append(InlineKeyboardButton("‹", callback_data="wl:page_prev"))
+        nav.append(
+            InlineKeyboardButton(
+                f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
             )
-            if page_idx < total_pages - 1:
-                nav.append(
-                    InlineKeyboardButton("Next ▶️", callback_data="wl:page_next")
-                )
-            keyboard.append(nav)
-        # Sort
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
-                    callback_data="wl:sort_rns",
-                ),
-                InlineKeyboardButton(
-                    "% Day" + (" ✓" if sort_mode == "pct" else ""),
-                    callback_data="wl:sort_pct",
-                ),
-                InlineKeyboardButton(
-                    "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
-                    callback_data="wl:sort_priority",
-                ),
-            ]
         )
-        keyboard.append(
-            [
-                InlineKeyboardButton("⭐ Set priority", callback_data="wl:set_priority"),
-                # Refresh RNS + % On Day → Notion
-                InlineKeyboardButton(
-                    "🔄 Refresh", callback_data="wl:refresh_rns"
-                ),
-            ]
-        )
-        # Manage
-        keyboard.append(
-            [
-                InlineKeyboardButton("Create New", callback_data="wl:create"),
-                InlineKeyboardButton("Edit list", callback_data="wl:edit_menu"),
-            ]
-        )
-        keyboard.append(
-            [
-                InlineKeyboardButton("Rename", callback_data="wl:rename"),
-                InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
-            ]
-        )
-        keyboard.append(
-            [
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ]
-        )
+        if page_idx < total_pages - 1:
+            nav.append(InlineKeyboardButton("›", callback_data="wl:page_next"))
+        nav.append(InlineKeyboardButton("🔄", callback_data="wl:refresh_rns"))
+        keyboard.append(nav)
+
+        # Sort – collapsed dropdown style
+        sort_labels = {
+            "rns": "📰 RNS",
+            "pct": "% Day",
+            "priority": "⭐ Pri",
+            "name": "Name",
+        }
+        cur_sort = sort_labels.get(sort_mode, "Sort")
+        if sort_open:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
+                        callback_data="wl:sort_rns",
+                    ),
+                    InlineKeyboardButton(
+                        "% Day" + (" ✓" if sort_mode == "pct" else ""),
+                        callback_data="wl:sort_pct",
+                    ),
+                    InlineKeyboardButton(
+                        "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
+                        callback_data="wl:sort_priority",
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "▴ Hide sort", callback_data="wl:ui_sort"
+                    )
+                ]
+            )
+        else:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"Sort: {cur_sort} ▾",
+                        callback_data="wl:ui_sort",
+                    )
+                ]
+            )
+
+        # --- Section 3: manage menu (collapsed by default) ---
+        if manage_open:
+            keyboard.append(
+                [
+                    InlineKeyboardButton("➕ Add", callback_data="wl:add"),
+                    InlineKeyboardButton(
+                        "✏️ Edit", callback_data="wl:edit_menu"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "⭐ Priority", callback_data="wl:set_priority"
+                    ),
+                    InlineKeyboardButton(
+                        "🆕 New list", callback_data="wl:create"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton("Rename", callback_data="wl:rename"),
+                    InlineKeyboardButton(
+                        "🗑 Delete", callback_data="wl:delete_list"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "▴ Hide menu", callback_data="wl:ui_manage"
+                    )
+                ]
+            )
+        else:
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        "☰ Manage ▾", callback_data="wl:ui_manage"
+                    ),
+                    InlineKeyboardButton("« Hub", callback_data="hub:home"),
+                ]
+            )
 
         text = "\n".join(lines).strip()
         # Telegram message limit safety
@@ -3547,6 +3631,34 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             pass
         await show_watchlist(update, context, edit=True, force_rns=True)
+        return
+
+    # Expand / contract keyboard sections
+    if action == "ui_sort":
+        st = _wl_ui(user.id)
+        st["sort_open"] = not st.get("sort_open")
+        # keep manage closed when opening sort (less clutter)
+        if st["sort_open"]:
+            st["manage_open"] = False
+        await query.answer()
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "ui_manage":
+        st = _wl_ui(user.id)
+        st["manage_open"] = not st.get("manage_open")
+        if st["manage_open"]:
+            st["sort_open"] = False
+            st["lists_open"] = False
+        await query.answer()
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "ui_lists":
+        st = _wl_ui(user.id)
+        st["lists_open"] = not st.get("lists_open")
+        if st["lists_open"]:
+            st["manage_open"] = False
+        await query.answer()
+        await show_watchlist(update, context, edit=True, force_rns=False)
         return
 
     # « Back to Watchlist from snapshot – restore same panel in place
@@ -3654,6 +3766,11 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             mode = "rns"
         _watchlist_sort[user.id] = mode
         _watchlist_page[user.id] = 0  # reset to first page
+        # Collapse sort dropdown after choice
+        try:
+            _wl_ui(user.id)["sort_open"] = False
+        except Exception:
+            pass
         labels = {
             "rns": "Latest RNS",
             "pct": "% day change",
