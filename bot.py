@@ -67,6 +67,27 @@ NOTION_HISTORY_DATA_SOURCE_ID = (
     os.getenv("NOTION_HISTORY_DATA_SOURCE_ID") or "aee62b48-46a5-4cbc-8237-af8912a3f22c"
 ).strip()
 
+# Hive Bot Watchlist
+NOTION_WATCHLIST_DB_ID = (
+    os.getenv("NOTION_WATCHLIST_DB_ID") or "d587a125-e6c3-4597-af2d-440d09cc49ac"
+).strip()
+NOTION_WATCHLIST_DATA_SOURCE_ID = (
+    os.getenv("NOTION_WATCHLIST_DATA_SOURCE_ID")
+    or "dedbbebf-df4a-4c06-8ffb-0e5945315350"
+).strip()
+
+# RNS News Log (latest regulatory news per ticker)
+NOTION_RNS_DB_ID = (
+    os.getenv("NOTION_RNS_DB_ID") or "a7931699-9ab9-4fe6-8a81-74d86146ae1a"
+).strip()
+NOTION_RNS_DATA_SOURCE_ID = (
+    os.getenv("NOTION_RNS_DATA_SOURCE_ID") or "1ccae0d5-0186-4e9b-87d2-6e42f9273ec5"
+).strip()
+
+# ticker -> (fetched_at_epoch, rns_dict|None)
+_rns_cache: dict[str, tuple[float, dict | None]] = {}
+RNS_CACHE_TTL_SECONDS = 120
+
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 if not notion:
@@ -202,6 +223,11 @@ _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
+# user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
+_watchlist_ui: dict[int, dict] = {}
+_watchlist_page: dict[int, int] = {}  # user_id -> page index (0-based)
+_watchlist_sort: dict[int, str] = {}  # user_id -> rns | pct | priority | name
+WATCHLIST_PAGE_SIZE = 3
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
 _authorized_cache: dict = {
@@ -321,38 +347,11 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         page_id = results[0]["id"]
 
-        # Must still be in the Hive group before approval
-        if _require_group_membership():
-            try:
-                tid = int(target_id)
-            except ValueError:
-                tid = None
-            if tid is not None:
-                in_group, detail = await is_group_member(context, tid)
-                if not in_group and not detail.startswith("error:"):
-                    await update.message.reply_text(
-                        f"❌ Cannot approve `{target_id}` – not a Hive group member "
-                        f"({detail}).\n\nUser must rejoin the group first.",
-                        parse_mode="Markdown",
-                    )
-                    return
-                if in_group:
-                    try:
-                        class _U:
-                            id = tid
-                            username = None
-                            full_name = None
-
-                        await mark_group_member_in_notion(_U(), is_member=True)
-                    except Exception:
-                        pass
-
         # Update Status → Authorised
         notion.pages.update(
             page_id=page_id,
             properties={
-                "Status": {"select": {"name": "Authorised"}},
-                "Group Member": {"select": {"name": "Yes"}},
+                "Status": {"select": {"name": "Authorised"}}
             },
         )
 
@@ -587,26 +586,11 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        if action == "approve" and _require_group_membership():
-            try:
-                tid = int(target_id)
-            except ValueError:
-                tid = None
-            if tid is not None:
-                in_group, detail = await is_group_member(context, tid)
-                if not in_group and not detail.startswith("error:"):
-                    await query.message.reply_text(
-                        f"❌ Cannot approve `{target_id}` – not a Hive group member "
-                        f"({detail}).\nUser must rejoin the group first.",
-                        parse_mode="Markdown",
-                    )
-                    return
-
         new_status = "Authorised" if action == "approve" else "Blocked"
-        update_props = {"Status": {"select": {"name": new_status}}}
-        if action == "approve":
-            update_props["Group Member"] = {"select": {"name": "Yes"}}
-        notion.pages.update(page_id=page_id, properties=update_props)
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Status": {"select": {"name": new_status}}},
+        )
         _authorized_cache["expires"] = 0
 
         if action == "approve":
@@ -619,8 +603,7 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     chat_id=int(target_id),
                     text=(
                         "✅ Your access request was *approved*.\n\n"
-                        "Send /start to begin using the bot.\n"
-                        "Access requires you to remain in the Hive Telegram group."
+                        "Send /start to begin using the bot."
                     ),
                     parse_mode="Markdown",
                 )
@@ -746,98 +729,17 @@ def _get_plain_text(prop: dict) -> str:
         return (prop.get("url") or "").strip()
     return ""
 
-
-def _md_escape(text) -> str:
-    """Escape Telegram legacy Markdown special characters in dynamic text."""
-    if text is None:
-        return ""
-    s = str(text)
-    # Order matters: backslash first
-    for ch in ("\\", "_", "*", "`", "["):
-        s = s.replace(ch, f"\\{ch}")
-    return s
-
-
-async def _safe_edit_or_reply(
-    msg,
-    text: str,
-    *,
-    edit: bool = False,
-    reply_markup=None,
-    parse_mode: str | None = "Markdown",
-) -> None:
-    """
-    Send/edit message; on entity parse errors, retry without parse_mode.
-    Prevents 'Can't parse entities' from breaking My Watchlist / Explore.
-    """
-    kwargs = {
-        "reply_markup": reply_markup,
-        "disable_web_page_preview": True,
-    }
-    try:
-        if edit:
-            await msg.edit_text(text, parse_mode=parse_mode, **kwargs)
-        else:
-            await msg.reply_text(text, parse_mode=parse_mode, **kwargs)
-    except Exception as e1:
-        err = str(e1).lower()
-        if "parse" in err or "entities" in err or "can't find end" in err:
-            logger.warning("Markdown parse failed – retry plain text: %s", e1)
-            # Strip simple markdown markers for readable plain fallback
-            plain = (
-                text.replace("\\_", "_")
-                .replace("\\*", "*")
-                .replace("\\`", "`")
-                .replace("\\[", "[")
-            )
-            try:
-                if edit:
-                    await msg.edit_text(plain, parse_mode=None, **kwargs)
-                else:
-                    await msg.reply_text(plain, parse_mode=None, **kwargs)
-            except Exception as e2:
-                # Last resort: short error without markup
-                logger.error("_safe_edit_or_reply plain retry failed: %s", e2)
-                if edit:
-                    try:
-                        await msg.edit_text(
-                            "Could not render this view. Tap Refresh or /start.",
-                            reply_markup=reply_markup,
-                        )
-                    except Exception:
-                        await msg.reply_text(
-                            "Could not render this view. Try /start.",
-                            reply_markup=reply_markup,
-                        )
-                else:
-                    await msg.reply_text(
-                        "Could not render this view. Try /start.",
-                        reply_markup=reply_markup,
-                    )
-        else:
-            raise
-
-
 async def get_authorized_usernames() -> set[str]:
     """Return authorised usernames (wrapper around get_authorized_users)."""
     auth = await get_authorized_users()
     return auth.get("usernames", set())
-
-def _require_group_membership() -> bool:
-    """When TELEGRAM_GROUP_ID is set, group membership is required by default."""
-    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
-    if not group_id:
-        return False
-    flag = (os.getenv("REQUIRE_GROUP_MEMBERSHIP") or "1").strip().lower()
-    return flag not in ("0", "false", "no", "off")
-
 
 async def is_group_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> tuple[bool, str]:
     """
     Returns (is_member, detail).
-    detail is 'status=…', 'TELEGRAM_GROUP_ID not set (skipped)', or 'error: …'.
+    detail is 'yes', 'no', or an error reason.
     """
     group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
     if not group_id:
@@ -864,57 +766,24 @@ async def is_group_member(
             user_id,
             e,
         )
+        # Prefix with error: so is_authorized does not treat this as left/kicked
         return False, f"error: {e}"
-
-
-async def _notion_group_member_flag(user_id: int) -> str | None:
-    """Return 'Yes' / 'No' / None from Notion Group Member column."""
-    if not notion and not NOTION_TOKEN:
-        return None
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not db_id and not ds_id:
-        return None
-    try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user_id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            return None
-        gm = (results[0].get("properties") or {}).get("Group Member") or {}
-        if isinstance(gm, dict):
-            if gm.get("type") == "select" and gm.get("select"):
-                return (gm["select"] or {}).get("name")
-            return _get_plain_text(gm) or None
-    except Exception as e:
-        logger.warning("_notion_group_member_flag failed for %s: %s", user_id, e)
-    return None
-
 
 async def is_authorized(
     update: Update, context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> bool:
     """
-    Access requires ALL of:
-      1) Valid Telegram user (numeric id)
-      2) Admin, OR Notion Status = Authorised
-      3) When TELEGRAM_GROUP_ID is set (REQUIRE_GROUP_MEMBERSHIP=1 default):
-         user must be a current member of the Hive group
+    Authorised if:
+      1) Admin, or
+      2) Notion Hive Bot Authorised Users has Status = Authorised
+         for this Telegram User ID (preferred) or Username.
 
-    On leave/kick: deny and best-effort revoke in Notion.
-    On Telegram API error: fall back to Notion Group Member.
+    Group membership is checked only as a soft signal:
+      - Definite left/kicked → deny
+      - API error / TELEGRAM_GROUP_ID missing → do not deny (Notion wins)
     """
     user = update.effective_user
-    if not user or not user.id:
+    if not user:
         return False
 
     if is_admin(user):
@@ -938,55 +807,19 @@ async def is_authorized(
         )
         return False
 
-    if not _require_group_membership():
-        return True
+    # Soft group check: only block on clear non-membership
+    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
+    if group_id and context is not None:
+        in_group, detail = await is_group_member(context, user.id)
+        if not in_group and detail.startswith("status="):
+            status = detail.replace("status=", "")
+            if status in ("left", "kicked"):
+                logger.info(
+                    "Auth denied for %s – left/kicked group (%s)", user.id, detail
+                )
+                return False
+        # API errors / skipped → still allow if Notion Authorised
 
-    if context is None:
-        notion_gm = await _notion_group_member_flag(user.id)
-        if (notion_gm or "").lower() == "no":
-            logger.info(
-                "Auth denied for %s – Notion Group Member=No (no context)", user.id
-            )
-            return False
-        return True
-
-    in_group, detail = await is_group_member(context, user.id)
-
-    if detail.startswith("error:") or detail.startswith("Invalid TELEGRAM_GROUP_ID"):
-        notion_gm = await _notion_group_member_flag(user.id)
-        if (notion_gm or "").lower() == "no":
-            logger.info(
-                "Auth denied for %s – Telegram check failed and Notion Group Member=No (%s)",
-                user.id,
-                detail,
-            )
-            return False
-        if (notion_gm or "").lower() == "yes":
-            logger.warning(
-                "Auth allow for %s – Telegram check failed, Notion Group Member=Yes (%s)",
-                user.id,
-                detail,
-            )
-            return True
-        logger.info(
-            "Auth denied for %s – group required but membership unknown (%s)",
-            user.id,
-            detail,
-        )
-        return False
-
-    if not in_group:
-        logger.info("Auth denied for %s – not in Hive group (%s)", user.id, detail)
-        try:
-            await mark_group_member_in_notion(user, is_member=False)
-        except Exception:
-            pass
-        return False
-
-    try:
-        await mark_group_member_in_notion(user, is_member=True)
-    except Exception:
-        pass
     return True
 
 
@@ -997,42 +830,12 @@ async def require_authorized(
     if await is_authorized(update, context):
         return True
     msg = update.effective_message
-    if not msg:
-        return False
-
-    user = update.effective_user
-    in_group, detail = (False, "n/a")
-    if user:
-        in_group, detail = await is_group_member(context, user.id)
-
-    if user and not user.id:
+    if msg:
         await msg.reply_text(
-            "🔒 Access denied – no valid Telegram user ID on this account."
+            "🔒 You are not authorised to use this bot service yet.\n\n"
+            "Send /request to ask for access, then /status to check.\n"
+            "An admin must set your Status to Authorised in Notion."
         )
-        return False
-
-    if (
-        _require_group_membership()
-        and user
-        and not in_group
-        and not detail.startswith("error:")
-    ):
-        await msg.reply_text(
-            "🔒 Access denied – you must be a member of the Hive Telegram group "
-            "to use this bot.\n\n"
-            "Join the group first, then send /request.\n"
-            "Check status anytime with /status."
-        )
-        return False
-
-    await msg.reply_text(
-        "🔒 You are not authorised to use this bot service yet.\n\n"
-        "Requirements:\n"
-        "1) Valid Telegram user ID\n"
-        "2) Member of the Hive Telegram group\n"
-        "3) Admin approval (Status = Authorised in Notion)\n\n"
-        "Send /request to ask for access, then /status to check."
-    )
     return False
 
 async def sync_group_member_to_notion(
@@ -1141,14 +944,25 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                         return val
             return ""
 
-        # Last RNS Date (date property)
-        last_rns = ""
-        for rns_name in ("Last RNS Date", "Last RNS", "Last RNS date"):
-            if rns_name in props:
-                rp = props[rns_name]
-                if isinstance(rp, dict) and rp.get("type") == "date" and rp.get("date"):
-                    last_rns = (rp["date"] or {}).get("start") or ""
-                    break
+        def find_number(*names):
+            for name in names:
+                prop = props.get(name)
+                if not prop or not isinstance(prop, dict):
+                    continue
+                if prop.get("type") == "number" and prop.get("number") is not None:
+                    return float(prop["number"])
+                if prop.get("number") is not None:
+                    try:
+                        return float(prop["number"])
+                    except (TypeError, ValueError):
+                        pass
+                # sometimes stored as text
+                raw = _get_plain_text(prop).replace("%", "").replace(",", "").strip()
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+            return None
 
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
@@ -1158,12 +972,14 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
-            "last_rns": last_rns,
-            "group_link": (
-                (props.get("Telegram group ") or {}).get("url")
-                or (props.get("Telegram Group") or {}).get("url")
-                or (props.get("Group Link") or {}).get("url")
-                or ""
+            "day_change_pct": find_number(
+                "Day Change %",
+                "% Change",
+                "Change %",
+                "Price Change %",
+                "1D %",
+                "Daily Change %",
+                "Change",
             ),
         }
 
@@ -1499,130 +1315,129 @@ def extract_hashtag_tickers(text: str) -> list[str]:
 MAX_WATCHLISTS = 3
 
 async def _fetch_user_watchlist_pages(user_id: int) -> list[dict]:
-    """All Notion rows for this Telegram user."""
-    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
-    if not notion or not db_id:
+    """All Notion rows for this Telegram user (multi-source safe)."""
+    db_id = NOTION_WATCHLIST_DB_ID or (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
+    ds_id = NOTION_WATCHLIST_DATA_SOURCE_ID
+    if not (notion or NOTION_TOKEN) or (not db_id and not ds_id):
         return []
 
-    response = notion.databases.query(
-        database_id=db_id,
-        filter={
-            "property": "Telegram User ID",
-            "rich_text": {"equals": str(user_id)},
-        },
-        page_size=100,
-    )
-    return response.get("results", [])
-
-
-def _fetch_pct_on_day(ticker: str) -> float | None:
-    """
-    Live % change on day for an AIM/LSE ticker via Yahoo Finance (TICKER.L).
-    Returns percent as float (e.g. 2.35) or None if unavailable.
-    """
-    if not ticker:
-        return None
-    symbol = f"{ticker.upper().strip()}.L"
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?range=5d&interval=1d"
-    )
     try:
-        import json as _json
-        import urllib.request
-
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HiveBot/1.0)",
-                "Accept": "application/json",
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "rich_text": {"equals": str(user_id)},
             },
+            page_size=100,
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        result = (data.get("chart") or {}).get("result") or []
-        if not result:
-            return None
-        meta = result[0].get("meta") or {}
-        # Prefer regularMarketChangePercent when present
-        if meta.get("regularMarketChangePercent") is not None:
-            return round(float(meta["regularMarketChangePercent"]), 2)
-        # Fallback: compute from last two closes
-        closes = (
-            ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close")
-            or []
-        )
-        closes = [c for c in closes if c is not None]
-        if len(closes) >= 2 and closes[-2]:
-            return round((closes[-1] / closes[-2] - 1.0) * 100.0, 2)
-        if meta.get("regularMarketPrice") and meta.get("previousClose"):
-            prev = float(meta["previousClose"])
-            if prev:
-                return round(
-                    (float(meta["regularMarketPrice"]) / prev - 1.0) * 100.0, 2
-                )
+        return response.get("results", [])
     except Exception as e:
-        logger.warning("pct on day fetch failed for %s: %s", ticker, e)
-    return None
+        logger.error("_fetch_user_watchlist_pages failed: %s", e)
+        return []
 
 
-def _format_pct_on_day(pct: float | None) -> str:
-    if pct is None:
-        return "—"
-    sign = "+" if pct > 0 else ""
-    return f"{sign}{pct:.2f}%"
+def _strip_html(text: str) -> str:
+    if not text:
+        return ""
+    # Light cleanup for AI Summary snippets from Investegate/Notion
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
-async def _sync_watchlist_pct_on_day(
-    pages: list[dict], *, force: bool = False
-) -> dict[str, float | None]:
+async def get_latest_rns_for_ticker(
+    ticker: str, *, force: bool = False
+) -> dict | None:
     """
-    For each watchlist page, fetch live % on day and write to Notion
-    columns \"% On Day\" + \"% On Day Updated\" when present.
-    Returns map ticker -> pct.
+    Latest RNS row for a ticker from RNS News Log.
+    Returns dict: title, date, summary, link, company, source — or None.
     """
-    out: dict[str, float | None] = {}
-    for page in pages:
-        props = page.get("properties") or {}
-        ticker = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
-        if not ticker:
-            continue
-        # Read cached value first
-        cached = None
-        pct_prop = props.get("% On Day") or props.get("Pct On Day") or {}
-        if isinstance(pct_prop, dict) and pct_prop.get("type") == "number":
-            if pct_prop.get("number") is not None:
-                cached = float(pct_prop["number"])
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t:
+        return None
+    if not (notion or NOTION_TOKEN):
+        return None
+    ds_id = NOTION_RNS_DATA_SOURCE_ID
+    db_id = NOTION_RNS_DB_ID
+    if not ds_id and not db_id:
+        return None
 
-        pct = _fetch_pct_on_day(ticker) if force else (cached if cached is not None else _fetch_pct_on_day(ticker))
-        if force or cached is None:
-            pct = _fetch_pct_on_day(ticker)
-        out[ticker] = pct if pct is not None else cached
+    now = time.time()
+    if not force and t in _rns_cache:
+        ts, cached = _rns_cache[t]
+        if now - ts < RNS_CACHE_TTL_SECONDS:
+            return cached
 
-        if pct is None or not notion:
-            continue
-        # Best-effort Notion write-back
-        try:
-            update_props = {
-                "% On Day": {"number": float(pct)},
-                "% On Day Updated": {
-                    "date": {
-                        "start": datetime.now(timezone.utc).isoformat().replace(
-                            "+00:00", "Z"
-                        )
-                    }
-                },
+    try:
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Ticker",
+                "rich_text": {"equals": t},
+            },
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=3,
+        )
+        results = response.get("results", [])
+        # Prefer exact ticker match (case-insensitive)
+        best = None
+        for page in results:
+            props = page.get("properties", {})
+            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
+            if row_t != t:
+                continue
+            title = _get_plain_text(props.get("Title")) or "RNS"
+            summary = _strip_html(_get_plain_text(props.get("AI Summary")))
+            company = _get_plain_text(props.get("Company")) or ""
+            link = ""
+            link_prop = props.get("Link") or {}
+            if isinstance(link_prop, dict):
+                link = (link_prop.get("url") or "").strip()
+            date_str = ""
+            date_prop = props.get("RNS Date") or {}
+            if isinstance(date_prop, dict):
+                d = date_prop.get("date") or {}
+                if isinstance(d, dict):
+                    date_str = (d.get("start") or "")[:10]
+            source = ""
+            src = props.get("Source") or {}
+            if isinstance(src, dict) and src.get("select"):
+                source = (src["select"] or {}).get("name") or ""
+            best = {
+                "ticker": t,
+                "title": title[:120],
+                "summary": summary[:280],
+                "company": company[:80],
+                "link": link,
+                "date": date_str,
+                "source": source,
             }
-            notion.pages.update(page_id=page["id"], properties=update_props)
-        except Exception as e:
-            # Property may not exist yet – log once-level warning
-            logger.warning(
-                "Could not write %% On Day for %s (add number column '%% On Day' "
-                "on Hive Bot Watchlist if missing): %s",
-                ticker,
-                e,
-            )
-        await asyncio.sleep(0.25)  # be polite to Yahoo / Notion
+            break
+
+        _rns_cache[t] = (now, best)
+        return best
+    except Exception as e:
+        logger.warning("get_latest_rns_for_ticker(%s) failed: %s", t, e)
+        _rns_cache[t] = (now, None)
+        return None
+
+
+async def get_latest_rns_for_tickers(
+    tickers: list[str], *, force: bool = False
+) -> dict[str, dict]:
+    """Map ticker -> latest RNS dict for a list of tickers."""
+    out: dict[str, dict] = {}
+    seen: set[str] = set()
+    for raw in tickers:
+        t = (raw or "").lstrip("#").upper().strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        rns = await get_latest_rns_for_ticker(t, force=force)
+        if rns:
+            out[t] = rns
     return out
 
 def _list_names_from_pages(pages: list[dict]) -> list[str]:
@@ -1681,14 +1496,10 @@ def has_intent_keyword(text: str) -> bool:
     return any(kw in lower for kw in INTENT_KEYWORDS)
 
 def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None) -> str:
-    company = _md_escape(data.get("company") or "N/A")
-    summary = _md_escape(data.get("summary") or "No summary available.")
-    red_flags = _md_escape(data.get("red_flags") or "None noted.")
-    safe_ticker = _md_escape(ticker)
     text = (
-        f"🔖📑 *#{safe_ticker}* – {company}\n\n"
-        f"*Snapshot Summary:*\n{summary}\n\n"
-        f"*Red Flags:*\n{red_flags}\n"
+        f"🔖📑 *#{ticker}* – {data.get('company') or 'N/A'}\n\n"
+        f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
+        f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
     )
 
     if stockpickers:
@@ -1856,6 +1667,202 @@ async def send_clean(
             logger.debug("Could not schedule ephemeral delete: %s", e)
 
     return msg
+
+
+
+def _watchlist_nav_keyboard() -> list[list]:
+    """Consistent bottom nav for watchlist screens."""
+    return [
+        [
+            InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+            InlineKeyboardButton("« Hub", callback_data="hub:home"),
+        ]
+    ]
+
+
+async def _remember_watchlist_panel(user_id: int, msg) -> None:
+    if not user_id or not msg:
+        return
+    try:
+        _watchlist_ui[user_id] = {
+            "chat_id": msg.chat_id,
+            "panel_msg_id": msg.message_id,
+        }
+    except Exception:
+        pass
+
+
+async def _delete_watchlist_prompt(context, user_id: int) -> None:
+    """Remove stored prompt message if any."""
+    ui = _watchlist_ui.get(user_id) or {}
+    pid = ui.get("prompt_msg_id")
+    chat_id = ui.get("chat_id")
+    if pid and chat_id and context and context.bot:
+        await safe_delete_message(context.bot, chat_id, pid)
+        ui.pop("prompt_msg_id", None)
+        _watchlist_ui[user_id] = ui
+
+
+async def _watchlist_show_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    awaiting: str,
+) -> None:
+    """
+    Show an input prompt by editing the current panel (clean), with Back.
+    Keeps main reply keyboard by sending a fleeting keyboard pulse.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    if not user:
+        return
+    _awaiting_watchlist[user.id] = awaiting
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("« Back to Watchlist", callback_data="hub:watchlist")],
+            *_watchlist_nav_keyboard(),
+        ]
+    )
+    msg = None
+    if query and query.message:
+        try:
+            msg = await query.message.edit_text(
+                text, parse_mode="Markdown", reply_markup=kb
+            )
+        except Exception:
+            try:
+                msg = await query.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                msg = await context.bot.send_message(
+                    query.message.chat_id, text, parse_mode="Markdown", reply_markup=kb
+                )
+    elif update.effective_chat:
+        msg = await context.bot.send_message(
+            update.effective_chat.id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    if msg:
+        await _remember_watchlist_panel(user.id, msg)
+    # Re-assert persistent bottom keyboard without leaving clutter
+    chat = update.effective_chat
+    if chat and context and context.bot:
+        try:
+            pulse = await context.bot.send_message(
+                chat.id,
+                "⋯",
+                reply_markup=main_reply_keyboard(),
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
+
+
+async def _watchlist_finish_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    summary: str,
+) -> None:
+    """
+    After add/edit/delete: wipe user input, show brief result, return to watchlist panel.
+    """
+    user = update.effective_user
+    if user:
+        await _delete_watchlist_prompt(context, user.id)
+    await cleanup_trigger_message(update, context)
+
+    chat = update.effective_chat
+    if not chat or not context or not context.bot:
+        return
+
+    # Short confirmation then auto-remove
+    try:
+        conf = await context.bot.send_message(
+            chat.id,
+            summary,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+
+        async def _later():
+            try:
+                await asyncio.sleep(2.5)
+                await safe_delete_message(context.bot, conf.chat_id, conf.message_id)
+            except Exception:
+                pass
+
+        asyncio.create_task(_later())
+    except Exception:
+        pass
+
+    # Rebuild clean watchlist view
+    class _Msg:
+        def __init__(self, chat_id, bot):
+            self.chat_id = chat_id
+            self._bot = bot
+            self.message_id = None
+
+        async def reply_text(self, *a, **k):
+            m = await self._bot.send_message(self.chat_id, *a, **k)
+            self.message_id = m.message_id
+            return m
+
+        async def edit_text(self, *a, **k):
+            ui = _watchlist_ui.get(user.id if user else 0) or {}
+            mid = ui.get("panel_msg_id")
+            if mid:
+                try:
+                    m = await self._bot.edit_message_text(
+                        chat_id=self.chat_id, message_id=mid, *a, **k
+                    )
+                    return m
+                except Exception:
+                    pass
+            return await self.reply_text(*a, **k)
+
+    class _Up:
+        def __init__(self, orig, msg):
+            self.effective_user = orig.effective_user
+            self.effective_chat = orig.effective_chat
+            self.message = msg
+            self.callback_query = None
+
+    proxy_msg = _Msg(chat.id, context.bot)
+    # Prefer edit existing panel
+    ui = _watchlist_ui.get(user.id) if user else None
+    if ui and ui.get("panel_msg_id"):
+        # Fake callback-style edit path
+        class _Q:
+            def __init__(self, chat_id, mid, bot, from_user):
+                self.message = type("M", (), {})()
+                self.message.chat_id = chat_id
+                self.message.message_id = mid
+                self.message.edit_text = lambda *a, **k: bot.edit_message_text(
+                    chat_id=chat_id, message_id=mid, *a, **k
+                )
+                self.from_user = from_user
+                self.data = "hub:watchlist"
+
+            async def answer(self, *a, **k):
+                return None
+
+        class _Up2:
+            def __init__(self, orig, q):
+                self.effective_user = orig.effective_user
+                self.effective_chat = orig.effective_chat
+                self.message = q.message
+                self.callback_query = q
+
+        # Use show_watchlist with edit via stored panel — simpler: always send fresh + delete old panel
+        old_mid = ui.get("panel_msg_id")
+        if old_mid:
+            await safe_delete_message(context.bot, chat.id, old_mid)
+        await show_watchlist(_Up(update, proxy_msg), context, edit=False, force_rns=False)
+    else:
+        await show_watchlist(_Up(update, proxy_msg), context, edit=False, force_rns=False)
 
 
 def _extract_telegram_link(props: dict) -> str:
@@ -2401,11 +2408,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if "watchlist" in lower and len(text) < 40:
         try:
-            await show_explore(update, context, tab="feed", edit=False)
+            await show_watchlist(update, context, edit=False)
         except Exception as e:
-            logger.error("My Watchlist / Explore failed: %s", e)
+            logger.error("My Watchlist button failed: %s", e)
             await update.message.reply_text(
-                f"Could not open Explore.\n`{e}`",
+                f"Could not open watchlist.\n`{e}`",
                 parse_mode="Markdown",
             )
         await cleanup_trigger_message(update, context)
@@ -2521,13 +2528,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if page_id:
             _last_stockpick_page[user.id] = page_id
-            await log_member_activity(
-                user,
-                REQUEST_TYPE_STOCKPICK,
-                notes=(
-                    f"#{ticker}" if ticker else clean_text[:200]
-                ),
-            )
+            await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
@@ -2569,11 +2570,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             try:
                 data = await get_ticker_from_notion(t)
                 if data:
-                    await log_member_activity(
-                        user,
-                        REQUEST_TYPE_SNAPSHOT,
-                        notes=f"#{t} snapshot",
-                    )
+                    await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
                     try:
                         stockpickers = await get_stockpickers_for_ticker(t)
                     except Exception as e:
@@ -2585,11 +2582,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     except Exception:
                         await update.message.reply_text(body)
                 else:
-                    await log_member_activity(
-                        user,
-                        REQUEST_TYPE_SNAPSHOT,
-                        notes=f"#{t} snapshot – not found in UK AIM Micro-Cap",
-                    )
                     await update.message.reply_text(
                         f"I don’t have #{t} in the current UK AIM Micro-Cap snapshot."
                     )
@@ -2802,11 +2794,7 @@ async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for t in tickers:
         data = await get_ticker_from_notion(t)
         if data:
-            await log_member_activity(
-                user,
-                REQUEST_TYPE_SNAPSHOT,
-                notes=f"#{t} snapshot",
-            )
+            await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
             stockpickers = await get_stockpickers_for_ticker(t)
             await msg.reply_text(
                 format_reply(t, data, stockpickers),
@@ -2972,347 +2960,17 @@ async def show_my_stockpicks(
         logger.error("show_my_stockpicks failed: %s", e)
         await msg.reply_text("Could not load your stockpicks right now.")
 
-def _watchlist_continue_keyboard() -> InlineKeyboardMarkup:
-    """After add/create – keep user in the list-building flow."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ Add another ticker", callback_data="wl:add"),
-            ],
-            [
-                InlineKeyboardButton(
-                    "✅ Done – Save & view list", callback_data="wl:done"
-                ),
-            ],
-            [
-                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ],
-        ]
-    )
-
-
-def _explore_tab_keyboard(active: str = "feed") -> list[list]:
-    """Top tab row – similar to Explore / News app chrome."""
-    tabs = [
-        ("feed", "📰 Feed"),
-        ("picks", "📌 Picks"),
-        ("list", "👀 List"),
-        ("hub", "🏠 Hub"),
-    ]
-    row = []
-    for key, label in tabs:
-        shown = f"· {label} ·" if key == active else label
-        row.append(InlineKeyboardButton(shown, callback_data=f"exp:tab:{key}"))
-    return [row]
-
-
-async def _user_stockpick_rows(user) -> list[dict]:
-    """Load this user's stockpicks (newest first), max 8."""
-    db_id = os.getenv("NOTION_STOCKPICKS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not notion or not db_id or not user:
-        return []
-    try:
-        response = notion.databases.query(database_id=db_id, page_size=50)
-    except Exception as e:
-        logger.error("_user_stockpick_rows query failed: %s", e)
-        return []
-
-    uid_marker = f"uid:{user.id}"
-    user_name = (user.full_name or "").strip().lower()
-    username = (user.username or "").strip().lower()
-    rows = []
-    for page in response.get("results", []):
-        props = page.get("properties", {})
-        notes = _get_plain_text(props.get("Notes")).lower()
-        posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
-        is_mine = (
-            uid_marker in notes
-            or (user_name and posted_by == user_name)
-            or (username and username in posted_by)
-            or (username and f"@{username}" in posted_by)
-            or (user_name and user_name in posted_by)
-        )
-        if not is_mine:
-            continue
-        ticker = (
-            _get_plain_text(props.get("Ticker"))
-            or _get_plain_text(props.get("Stockpick & Month"))
-            or ""
-        ).upper()
-        # Prefer explicit ticker hashtag inside message
-        msg = _get_plain_text(props.get("Message")) or ""
-        ht = extract_hashtag_tickers(msg)
-        if ht:
-            ticker = ht[0]
-        summary = _get_plain_text(props.get("Summary")) or "—"
-        date_s = "—"
-        for dname in ("Date", "Created", "Date Added"):
-            dp = props.get(dname) or {}
-            if isinstance(dp, dict) and dp.get("type") == "date" and dp.get("date"):
-                date_s = (dp["date"] or {}).get("start") or "—"
-                break
-        if ticker:
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "summary": summary[:120],
-                    "date": date_s[:10],
-                    "page_id": page["id"],
-                }
-            )
-    # Newest first by date string
-    rows.sort(key=lambda r: r.get("date") or "", reverse=True)
-    return rows[:8]
-
-
-async def _watchlist_rns_lines(user_id: int) -> list[dict]:
-    """
-    Build RNS feed lines for tickers on the user's active watchlist.
-    Uses UK AIM Micro-Cap Last RNS Date (+ company). Full headlines come via R_News DMs.
-    """
-    pages = await _fetch_user_watchlist_pages(user_id)
-    active = _active_watchlist_name.get(user_id)
-    list_names = _list_names_from_pages(pages)
-    if not active or active not in list_names:
-        active = list_names[0] if list_names else "Default"
-
-    seen = set()
-    lines = []
-    for page in pages:
-        props = page.get("properties", {})
-        ln = _get_plain_text(props.get("List Name")).strip() or "Default"
-        if ln != active:
-            continue
-        ticker = (_get_plain_text(props.get("Ticker")) or "").upper()
-        if not ticker or ticker in seen:
-            continue
-        seen.add(ticker)
-        name = _get_plain_text(props.get("Name")) or ticker
-        meta = await get_ticker_from_notion(ticker)
-        company = (meta or {}).get("company") or name
-        last_rns = (meta or {}).get("last_rns") or ""
-        summary = ((meta or {}).get("summary") or "").strip()
-        # First line of summary as soft "headline" stand-in
-        headline = ""
-        if summary:
-            headline = summary.split("\n")[0].strip()[:140]
-        lines.append(
-            {
-                "ticker": ticker,
-                "company": company,
-                "last_rns": last_rns,
-                "headline": headline,
-            }
-        )
-    # Sort by last_rns desc when present
-    lines.sort(key=lambda x: x.get("last_rns") or "", reverse=True)
-    return lines[:12]
-
-
-async def show_explore(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    tab: str = "feed",
-    edit: bool = False,
-) -> None:
-    """
-    Tab-frame home inspired by Explore / News apps:
-      · Feed  – stockpick blocks (top) + RNS lines for watchlist (bottom)
-      · Picks – stockpick list only
-      · List  – manage watchlist table
-      · Hub   – stockpick hub shortcuts
-    """
-    user = update.effective_user
-    if update.callback_query:
-        msg = update.callback_query.message
-    else:
-        msg = update.message
-    if not msg or not user:
-        return
-
-    if not await is_authorized(update, context):
-        text = (
-            "🔒 You are not authorised to use this bot service yet.\n"
-            "Send /request then /status."
-        )
-        if edit:
-            try:
-                await msg.edit_text(text)
-            except Exception:
-                await msg.reply_text(text)
-        else:
-            await msg.reply_text(text)
-        return
-
-    tab = (tab or "feed").lower()
-    if tab == "list":
-        await show_watchlist(update, context, edit=edit)
-        return
-    if tab == "hub":
-        text = (
-            "🏠 *Hive Hub*\n\n"
-            "• Edit this month’s stockpick\n"
-            "• Open full picks history\n"
-            "• Manage watchlist tickers\n"
-        )
-        kb = _explore_tab_keyboard("hub")
-        kb.extend(_hub_keyboard().inline_keyboard)
-        markup = InlineKeyboardMarkup(kb)
-        if edit:
-            try:
-                await msg.edit_text(text, parse_mode="Markdown", reply_markup=markup)
-            except Exception:
-                await msg.reply_text(text, parse_mode="Markdown", reply_markup=markup)
-        else:
-            await msg.reply_text(text, parse_mode="Markdown", reply_markup=markup)
-        return
-
-    # --- Feed or Picks ---
-    picks = await _user_stockpick_rows(user)
-    rns_lines = await _watchlist_rns_lines(user.id) if tab == "feed" else []
-
-    lines = ["🐝 *Hive Explore*\n"]
-    keyboard = _explore_tab_keyboard(tab)
-
-    # Part 1 – stockpick blocks
-    lines.append("📌 *Your stockpicks*")
-    if not picks:
-        lines.append("No stockpicks yet. Use #stockpick #TICKER to add one.\n")
-    else:
-        for i, p in enumerate(picks[:6], 1):
-            safe_t = _md_escape(p["ticker"])
-            safe_sum = _md_escape((p.get("summary") or "")[:90])
-            safe_d = _md_escape(p.get("date") or "")
-            lines.append(
-                f"{i}. *#{safe_t}* · {safe_d}\n"
-                f"   {safe_sum}"
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"📊 #{p['ticker']} snapshot",
-                        callback_data=f"exp:snap:{p['ticker'][:16]}",
-                    )
-                ]
-            )
-        lines.append("")
-
-    if tab == "feed":
-        # Part 2 – RNS feed for watchlist tickers
-        lines.append("───")
-        lines.append("📰 *RNS · your watchlist*")
-        if not rns_lines:
-            lines.append(
-                "No watchlist tickers yet. Open List to add names.\n"
-            )
-        else:
-            for r in rns_lines:
-                if r.get("last_rns"):
-                    try:
-                        dt = datetime.fromisoformat(str(r["last_rns"])[:10])
-                        date_bit = dt.strftime("%d %b %Y")
-                    except Exception:
-                        date_bit = _md_escape(str(r["last_rns"])[:10])
-                else:
-                    date_bit = "—"
-                head = _md_escape(
-                    (r.get("headline") or "Latest company update on file")[:120]
-                )
-                safe_t = _md_escape(r["ticker"])
-                safe_c = _md_escape(r.get("company") or "")
-                lines.append(
-                    f"🕒 *{date_bit}* · *#{safe_t}* – {safe_c}\n"
-                    f"   {head}"
-                )
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            f"📊 #{r['ticker']}",
-                            callback_data=f"exp:snap:{r['ticker'][:16]}",
-                        )
-                    ]
-                )
-        lines.append("")
-        lines.append(
-            "Live RNS headlines are also DM'd by R-News when a release hits "
-            "your watchlist."
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"exp:tab:{tab}"),
-        ]
-    )
-
-    text = "\n".join(lines)
-    # Telegram hard limit
-    if len(text) > 3900:
-        text = text[:3900] + "\n…"
-    markup = InlineKeyboardMarkup(keyboard)
-    await _safe_edit_or_reply(
-        msg, text, edit=edit, reply_markup=markup, parse_mode="Markdown"
-    )
-
-
-async def explore_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle exp:tab:* and exp:snap:TICKER callbacks."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    user = query.from_user
-    if not user:
-        return
-
-    if data.startswith("exp:tab:"):
-        tab = data.replace("exp:tab:", "", 1).strip() or "feed"
-        await show_explore(update, context, tab=tab, edit=True)
-        return
-
-    if data.startswith("exp:snap:"):
-        ticker = data.replace("exp:snap:", "", 1).strip().upper()
-        if not ticker:
-            await query.message.reply_text("Missing ticker.")
-            return
-        try:
-            meta = await get_ticker_from_notion(ticker)
-            if not meta:
-                await query.message.reply_text(
-                    f"No snapshot for *#{ticker}* in UK AIM Micro-Cap.",
-                    parse_mode="Markdown",
-                )
-                return
-            try:
-                stockpickers = await get_stockpickers_for_ticker(ticker)
-            except Exception:
-                stockpickers = []
-            body = format_reply(ticker, meta, stockpickers)
-            await query.message.reply_text(
-                body,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
-            try:
-                await log_member_activity(
-                    user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} explore snapshot"
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            logger.error("explore snapshot failed for %s: %s", ticker, e)
-            await query.message.reply_text(f"Snapshot failed: {e}")
-        return
-
-
 async def show_watchlist(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     *,
     edit: bool = False,
-    refresh_pct: bool = False,
+    force_rns: bool = False,
 ) -> None:
+    """
+    Show My Watchlist and auto-sync latest RNS from Notion RNS News Log
+    for each ticker on the active list.
+    """
     user = update.effective_user
     if update.callback_query:
         msg = update.callback_query.message
@@ -3332,8 +2990,8 @@ async def show_watchlist(
             await msg.reply_text(text)
         return
 
-    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
-    if not notion or not db_id:
+    db_id = NOTION_WATCHLIST_DB_ID or (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
+    if not (notion or NOTION_TOKEN) or not db_id:
         await msg.reply_text(
             "Watchlist is not configured.\n"
             "Admin: set NOTION_WATCHLIST_DB_ID in Railway."
@@ -3344,210 +3002,393 @@ async def show_watchlist(
         pages = await _fetch_user_watchlist_pages(user.id)
         list_names = _list_names_from_pages(pages)
 
+        # Active tab
         active = _active_watchlist_name.get(user.id)
         if not active or active not in list_names:
             active = list_names[0] if list_names else "Default"
             _active_watchlist_name[user.id] = active
 
-        # Active-list pages only
-        active_pages = []
+        # Rows for active list only (with priority)
+        rows = []
+        tickers_for_rns: list[str] = []
         for page in pages:
             props = page.get("properties", {})
             ln = _get_plain_text(props.get("List Name")).strip() or "Default"
             if ln != active:
                 continue
-            active_pages.append(page)
-
-        # Sync / read % On Day (force refresh when user taps Refresh)
-        pct_map = await _sync_watchlist_pct_on_day(
-            active_pages, force=refresh_pct
-        )
-
-        rows = []
-        for page in active_pages:
-            props = page.get("properties", {})
-            ticker = (_get_plain_text(props.get("Ticker")) or "-").upper()
+            ticker = (_get_plain_text(props.get("Ticker")) or "-").lstrip("#").upper()
             name = _get_plain_text(props.get("Name")) or "-"
-            url = ((props.get("Group Link") or {}).get("url") or "").strip()
-            # Prefer live map, else Notion number
-            pct = pct_map.get(ticker)
-            if pct is None:
-                pct_prop = props.get("% On Day") or {}
-                if isinstance(pct_prop, dict) and pct_prop.get("number") is not None:
-                    pct = float(pct_prop["number"])
-            rows.append((ticker, name, url, page["id"], pct))
+            gl = props.get("Group Link") or {}
+            url = ""
+            if isinstance(gl, dict):
+                url = (gl.get("url") or "").strip()
+            pri = None
+            pr = props.get("Priority") or {}
+            if isinstance(pr, dict) and pr.get("number") is not None:
+                try:
+                    pri = int(pr["number"])
+                except (TypeError, ValueError):
+                    pri = None
+            page_id = page.get("id")
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "name": name,
+                    "url": url or "-",
+                    "priority": pri,
+                    "page_id": page_id,
+                }
+            )
+            if ticker and ticker != "-":
+                tickers_for_rns.append(ticker)
+
+        # Auto-sync latest RNS for watchlist tickers
+        rns_map = await get_latest_rns_for_tickers(
+            tickers_for_rns, force=force_rns
+        )
+        rns_hits = len(rns_map)
+
+        # Day % change – always load for display (and for sort-by-pct)
+        # 1) Notion UK AIM Micro-Cap number fields
+        # 2) On force_rns (Refresh), also write into Watchlist "% On Day"
+        pct_map: dict[str, float | None] = {}
+        sort_mode = _watchlist_sort.get(user.id, "rns")
+        for t in tickers_for_rns:
+            try:
+                data = await get_ticker_from_notion(t)
+                pct_map[t] = (data or {}).get("day_change_pct")
+            except Exception:
+                pct_map[t] = None
+        # Prefer value already stored on Watchlist row if Micro-Cap has none
+        for page in pages:
+            props = page.get("properties", {})
+            ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+            if ln != active:
+                continue
+            t = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper()
+            if not t or pct_map.get(t) is not None:
+                continue
+            pct_prop = props.get("% On Day") or {}
+            if isinstance(pct_prop, dict) and pct_prop.get("number") is not None:
+                try:
+                    pct_map[t] = float(pct_prop["number"])
+                except (TypeError, ValueError):
+                    pass
+        # On Refresh: persist latest % into Hive Bot Watchlist
+        if force_rns and notion:
+            for page in pages:
+                props = page.get("properties", {})
+                ln = _get_plain_text(props.get("List Name")).strip() or "Default"
+                if ln != active:
+                    continue
+                t = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper()
+                pct = pct_map.get(t)
+                if pct is None or not page.get("id"):
+                    continue
+                try:
+                    notion.pages.update(
+                        page_id=page["id"],
+                        properties={"% On Day": {"number": float(pct)}},
+                    )
+                except Exception as we:
+                    logger.warning(
+                        "Watchlist %% On Day write failed for %s "
+                        "(add Number column '%% On Day' if missing): %s",
+                        t,
+                        we,
+                    )
+
+        # Enrich + sort
+        for r in rows:
+            t = r["ticker"]
+            rns = rns_map.get(t) or {}
+            r["rns"] = rns
+            r["rns_date"] = rns.get("date") or ""
+            r["pct"] = pct_map.get(t)
+
+        def _sort_key(r):
+            if sort_mode == "priority":
+                # Higher priority first; unset last
+                p = r.get("priority")
+                return (0 if p is not None else 1, -(p or 0), r["ticker"])
+            if sort_mode == "pct":
+                v = r.get("pct")
+                return (0 if v is not None else 1, -(v or 0), r["ticker"])
+            if sort_mode == "name":
+                return ((r.get("name") or r["ticker"]).lower(),)
+            # default: latest RNS date desc
+            d = r.get("rns_date") or ""
+            return (0 if d else 1, d, r["ticker"])
+
+        if sort_mode == "rns":
+            rows.sort(key=_sort_key, reverse=True)
+        else:
+            rows.sort(key=_sort_key)
+
+        # Pagination — 3 tickers per page
+        total = len(rows)
+        page_size = WATCHLIST_PAGE_SIZE
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        page_idx = _watchlist_page.get(user.id, 0)
+        if page_idx >= total_pages:
+            page_idx = max(0, total_pages - 1)
+        if page_idx < 0:
+            page_idx = 0
+        _watchlist_page[user.id] = page_idx
+        start_i = page_idx * page_size
+        page_rows = rows[start_i : start_i + page_size]
+
+        sort_labels = {
+            "rns": "Latest RNS",
+            "pct": "% day change",
+            "priority": "Priority 1–10",
+            "name": "Name",
+        }
+        sort_label = sort_labels.get(sort_mode, sort_mode)
 
         lines = [
             f"👀 *My Watchlist*  ({len(list_names)}/{MAX_WATCHLISTS})",
-            f"Active list: *{_md_escape(active)}*",
-            "",
-            "Tap a ticker to open its company snapshot.",
+            f"Active: *{active}* · Sort: *{sort_label}*",
+            f"Page *{page_idx + 1}/{total_pages}* · {total} ticker(s)"
+            + (f" · RNS {rns_hits}/{len(tickers_for_rns)}" if tickers_for_rns else ""),
             "",
         ]
-        keyboard: list[list] = []
-        keyboard.extend(_tab_keyboard(list_names, active))
-
         if not rows:
-            lines.append("Empty — tap Add ticker to start.")
+            lines.append("Empty — use Edit list to add tickers.")
         else:
-            for i, (ticker, name, url, _page_id, pct) in enumerate(rows, 1):
-                meta = await get_ticker_from_notion(ticker)
-                company = (meta or {}).get("company") or name
-                last_rns = (meta or {}).get("last_rns") or ""
-                if last_rns:
-                    try:
-                        dt = datetime.fromisoformat(str(last_rns)[:10])
-                        rns_bit = f"🕒 {dt.strftime('%d %b %Y')}"
-                    except Exception:
-                        rns_bit = f"🕒 {_md_escape(str(last_rns)[:10])}"
+            lines.append("_Tap a #ticker button to open the company snapshot._")
+            lines.append("")
+            for r in page_rows:
+                ticker, name, url = r["ticker"], r["name"], r["url"]
+                pri = r.get("priority")
+                pri_bit = f" · ⭐{pri}" if pri is not None else ""
+                pct = r.get("pct")
+                pct_bit = ""
+                if pct is not None:
+                    sign = "+" if pct >= 0 else ""
+                    pct_bit = f" · {sign}{pct:.2f}%"
+                # Display: #ALRT Defence Holdings · +1.25%
+                lines.append(f"*#{ticker}* {name}{pri_bit}{pct_bit}")
+                if url and url != "-":
+                    lines.append(f"  🔗 {url}")
+                rns = r.get("rns") or {}
+                if rns:
+                    date_bit = f" · {rns['date']}" if rns.get("date") else ""
+                    lines.append(f"  📰 *Latest RNS*{date_bit}")
+                    lines.append(f"  {rns.get('title') or '—'}")
+                    if rns.get("summary"):
+                        lines.append(f"  _{rns['summary']}_")
+                    if rns.get("link"):
+                        lines.append(f"  {rns['link']}")
                 else:
-                    rns_bit = "🕒 No RNS date yet"
-                pct_bit = _format_pct_on_day(pct)
-                # Colour cue via sign only (Telegram has no colour)
-                if pct is not None and pct > 0:
-                    pct_bit = f"🟢 {pct_bit}"
-                elif pct is not None and pct < 0:
-                    pct_bit = f"🔴 {pct_bit}"
-                else:
-                    pct_bit = f"⚪ {pct_bit}"
+                    lines.append("  📰 No RNS in News Log yet")
+                lines.append("")
 
-                safe_company = _md_escape(company)
-                safe_ticker = _md_escape(ticker)
-                # Display line: #ALRT Defence Holdings + % on day
-                lines.append(
-                    f"{i}. *#{safe_ticker}* {safe_company}\n"
-                    f"   {pct_bit}  ·  {rns_bit}"
-                )
-                # Ticker "hyperlink" → snapshot; edit / remove beside it
+        keyboard = []
+        # Tabs
+        keyboard.extend(_tab_keyboard(list_names, active))
+        # Per-ticker "hyperlink" buttons → snapshot (this page only)
+        for r in page_rows:
+            t = r["ticker"]
+            n = (r.get("name") or t)[:28]
+            if t and t != "-":
                 keyboard.append(
                     [
                         InlineKeyboardButton(
-                            f"#{ticker} {company[:28]}",
-                            callback_data=f"wl:snap:{ticker[:20]}",
-                        ),
+                            f"#{t} {n}",
+                            callback_data=f"wl:snap:{t[:20]}",
+                        )
                     ]
                 )
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            f"✏️ #{ticker}",
-                            callback_data=f"wl:ed:{ticker[:20]}",
-                        ),
-                        InlineKeyboardButton(
-                            f"🗑 #{ticker}",
-                            callback_data=f"wl:rm:{ticker[:20]}",
-                        ),
-                    ]
+        # Pagination
+        if total_pages > 1 or total > 0:
+            nav = []
+            if page_idx > 0:
+                nav.append(
+                    InlineKeyboardButton("◀️ Prev", callback_data="wl:page_prev")
                 )
-
-        lines.append("")
-        lines.append(
-            "Refresh updates % on day from the market and saves it to Notion."
-        )
-
+            nav.append(
+                InlineKeyboardButton(
+                    f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
+                )
+            )
+            if page_idx < total_pages - 1:
+                nav.append(
+                    InlineKeyboardButton("Next ▶️", callback_data="wl:page_next")
+                )
+            keyboard.append(nav)
+        # Sort
         keyboard.append(
             [
-                InlineKeyboardButton("➕ Add ticker", callback_data="wl:add"),
-                InlineKeyboardButton("✏️ Edit menu", callback_data="wl:edit_menu"),
+                InlineKeyboardButton(
+                    "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
+                    callback_data="wl:sort_rns",
+                ),
+                InlineKeyboardButton(
+                    "% Day" + (" ✓" if sort_mode == "pct" else ""),
+                    callback_data="wl:sort_pct",
+                ),
+                InlineKeyboardButton(
+                    "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
+                    callback_data="wl:sort_priority",
+                ),
             ]
         )
+        keyboard.append(
+            [
+                InlineKeyboardButton("⭐ Set priority", callback_data="wl:set_priority"),
+                # Refresh RNS + % On Day → Notion
+                InlineKeyboardButton(
+                    "🔄 Refresh", callback_data="wl:refresh_rns"
+                ),
+            ]
+        )
+        # Manage
         keyboard.append(
             [
                 InlineKeyboardButton("Create New", callback_data="wl:create"),
-                InlineKeyboardButton("Rename", callback_data="wl:rename"),
+                InlineKeyboardButton("Edit list", callback_data="wl:edit_menu"),
             ]
         )
         keyboard.append(
             [
+                InlineKeyboardButton("Rename", callback_data="wl:rename"),
                 InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
-                # Refresh forces live % On Day re-fetch + Notion write-back
-                InlineKeyboardButton("🔄 Refresh", callback_data="wl:refresh"),
             ]
         )
         keyboard.append(
-            [InlineKeyboardButton("« Back to Hub", callback_data="hub:home")]
+            [
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ]
         )
 
-        text = "\n".join(lines)
+        text = "\n".join(lines).strip()
+        # Telegram message limit safety
+        if len(text) > 3900:
+            text = text[:3900] + "\n\n…truncated"
         markup = InlineKeyboardMarkup(keyboard)
-        await _safe_edit_or_reply(
-            msg, text, edit=edit, reply_markup=markup, parse_mode="Markdown"
-        )
+        sent = None
+        if edit:
+            try:
+                sent = await msg.edit_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                try:
+                    sent = await msg.edit_text(
+                        text.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    sent = await context.bot.send_message(
+                        msg.chat_id,
+                        text.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+        else:
+            try:
+                sent = await msg.reply_text(
+                    text,
+                    reply_markup=markup,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                sent = await msg.reply_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+        # Track panel for in-place navigation + keep bottom keyboard
+        if sent:
+            await _remember_watchlist_panel(user.id, sent)
+        elif edit and msg:
+            await _remember_watchlist_panel(user.id, msg)
+        try:
+            pulse = await context.bot.send_message(
+                msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
-
-
+        
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data or ""
 
     if data == "hub:watchlist":
-        await show_explore(update, context, tab="feed", edit=True)
+        # Cancel any pending watchlist input and return to clean panel
+        user = update.effective_user
+        if user:
+            _awaiting_watchlist.pop(user.id, None)
+        await show_watchlist(update, context, edit=True, force_rns=False)
     elif data == "hub:mypicks":
-        await show_explore(update, context, tab="picks", edit=True)
+        await show_my_stockpicks(update, context, edit=True)
     elif data == "hub:home":
-        await show_explore(update, context, tab="hub", edit=True)
-
+        await query.edit_message_text(
+            "📌 *My Stockpick hub*\n\nChoose an option:",
+            parse_mode="Markdown",
+            reply_markup=_hub_keyboard(),
+        )
 
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     user = query.from_user
     if not user:
         return
 
-    raw = query.data or ""
-    action = raw.replace("wl:", "", 1)
+    data = query.data or ""
+    action = data.replace("wl:", "")
 
-    # --- Tab switch ---
-    if action.startswith("tab:"):
-        tab = action[4:].strip()
-        if tab:
-            _active_watchlist_name[user.id] = tab
-        await show_watchlist(update, context, edit=True)
+    # Force re-query RNS News Log + refresh % On Day into Notion
+    if action == "refresh_rns":
+        await query.answer("Syncing RNS + % on day…")
+        # Clear ticker cache so day_change_pct is re-read from Notion
+        try:
+            _ticker_cache.clear()
+        except Exception:
+            pass
+        await show_watchlist(update, context, edit=True, force_rns=True)
         return
 
-    # --- Done: leave add mode and show list ---
-    if action == "done":
-        _awaiting_watchlist.pop(user.id, None)
-        await show_watchlist(update, context, edit=False)
-        return
-
-    # --- Refresh: re-fetch % On Day + rewrite Notion ---
-    if action == "refresh":
-        await query.message.reply_text("🔄 Refreshing % on day…")
-        await show_watchlist(update, context, edit=False, refresh_pct=True)
-        return
-
-    # --- Back from snapshot → watchlist ---
+    # « Back to Watchlist from snapshot
     if action == "back":
-        await show_watchlist(update, context, edit=False)
+        await query.answer()
+        await show_watchlist(update, context, edit=True, force_rns=False)
         return
 
-    # --- Ticker "hyperlink" → company snapshot, with Back ---
+    # Ticker "hyperlink" → company snapshot (UK AIM Micro-Cap)
     if action.startswith("snap:"):
+        await query.answer()
         ticker = action[5:].strip().upper()
         if not ticker:
             await query.message.reply_text("Missing ticker.")
             return
+        back_kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "« Back to Watchlist", callback_data="wl:back"
+                    )
+                ]
+            ]
+        )
         try:
             meta = await get_ticker_from_notion(ticker)
             if not meta:
                 await query.message.reply_text(
                     f"No snapshot for #{ticker} in UK AIM Micro-Cap.",
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "« Back to Watchlist",
-                                    callback_data="wl:back",
-                                )
-                            ]
-                        ]
-                    ),
+                    reply_markup=back_kb,
                 )
                 return
             try:
@@ -3555,19 +3396,10 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 stockpickers = []
             body = format_reply(ticker, meta, stockpickers)
-            # Append live % on day when available
-            pct = _fetch_pct_on_day(ticker)
+            pct = meta.get("day_change_pct")
             if pct is not None:
-                body = f"% on day: *{_md_escape(_format_pct_on_day(pct))}*\n\n" + body
-            back_kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "« Back to Watchlist", callback_data="wl:back"
-                        )
-                    ]
-                ]
-            )
+                sign = "+" if pct >= 0 else ""
+                body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
             try:
                 await query.message.reply_text(
                     body,
@@ -3577,94 +3409,107 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             except Exception:
                 await query.message.reply_text(
-                    body,
+                    body.replace("*", "").replace("_", ""),
                     reply_markup=back_kb,
                     disable_web_page_preview=True,
                 )
-            try:
-                await log_member_activity(
-                    user,
-                    REQUEST_TYPE_SNAPSHOT,
-                    notes=f"#{ticker} watchlist snapshot",
-                )
-            except Exception:
-                pass
         except Exception as e:
-            logger.error("watchlist snap failed for %s: %s", ticker, e)
-            await query.message.reply_text(f"Snapshot failed: {e}")
-        return
-
-    # --- Per-row remove ---
-    if action.startswith("rm:"):
-        ticker = action[3:].strip().upper()
-        db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
-        if not notion or not db_id or not ticker:
-            await query.message.reply_text("Could not remove ticker.")
-            return
-        try:
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "and": [
-                        {
-                            "property": "Telegram User ID",
-                            "rich_text": {"equals": str(user.id)},
-                        },
-                        {"property": "Ticker", "title": {"equals": ticker}},
-                    ]
-                },
-                page_size=5,
+            logger.error("wl:snap failed for %s: %s", ticker, e)
+            await query.message.reply_text(
+                f"Snapshot failed: {e}", reply_markup=back_kb
             )
-            results = response.get("results", [])
-            for page in results:
-                notion.pages.update(page_id=page["id"], archived=True)
-            await query.message.reply_text(f"Removed #{ticker} from your watchlist.")
-            await show_watchlist(update, context, edit=False)
-        except Exception as e:
-            await query.message.reply_text(f"Remove failed: {e}")
         return
 
-    # --- Per-row edit ---
-    if action.startswith("ed:"):
-        ticker = action[3:].strip().upper()
-        _awaiting_watchlist[user.id] = "change"
-        await query.message.reply_text(
-            f"✏️ *Edit #{ticker}*\n\n"
-            "Send:\n"
-            f"`#{ticker} | New Name | https://t.me/+newlink`\n\n"
-            "Or change only the name / link.",
-            parse_mode="Markdown",
+    # Pagination
+    if action == "page_prev":
+        await query.answer()
+        _watchlist_page[user.id] = max(0, _watchlist_page.get(user.id, 0) - 1)
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "page_next":
+        await query.answer()
+        _watchlist_page[user.id] = _watchlist_page.get(user.id, 0) + 1
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "page_noop":
+        await query.answer("Use ◀️ / ▶️ to change page")
+        return
+
+    # Sort modes
+    if action.startswith("sort_"):
+        mode = action.replace("sort_", "") or "rns"
+        if mode not in ("rns", "pct", "priority", "name"):
+            mode = "rns"
+        _watchlist_sort[user.id] = mode
+        _watchlist_page[user.id] = 0  # reset to first page
+        labels = {
+            "rns": "Latest RNS",
+            "pct": "% day change",
+            "priority": "Priority",
+            "name": "Name",
+        }
+        await query.answer(f"Sorted by {labels.get(mode, mode)}")
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+
+    if action == "set_priority":
+        await query.answer()
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "⭐ *Set priority (1–10)*\n\n"
+            "Send: `#TICKER 7`\n"
+            "Example: `#ALRT 9`\n\n"
+            "10 = highest priority. Clear with `#ALRT 0`.\n"
+            "_Input is removed after save._",
+            awaiting="set_priority",
         )
         return
 
-    # --- List-level actions ---
+    await query.answer()
+
+    # --- Switch list tab (also reloads RNS for that list) ---
+    if action.startswith("tab:"):
+        tab_name = action[4:].strip() or "Default"
+        _active_watchlist_name[user.id] = tab_name
+        _watchlist_page[user.id] = 0
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+
+    # --- List-level actions (edit in place, Back always available) ---
     if action == "create":
-        _awaiting_watchlist[user.id] = "create_list"
-        await query.message.reply_text(
+        await _watchlist_show_prompt(
+            update,
+            context,
             "🆕 *Create New Watchlist*\n\n"
             "Send a name for the list, e.g.\n"
-            "`UK AIM Growth`",
-            parse_mode="Markdown",
+            "`UK AIM Growth`\n\n"
+            "_Your message will be cleared after create._",
+            awaiting="create_list",
         )
         return
 
     if action == "rename":
-        _awaiting_watchlist[user.id] = "rename_list"
-        await query.message.reply_text(
-            "✏️ *Rename Watchlist*\n\n"
-            "Send the *new name* for the active list.",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "✏️ *Rename active list*\n\n"
+            "Send the *new name* only.\n\n"
+            "_Your message will be cleared after rename._",
+            awaiting="rename_list",
         )
         return
 
     if action == "delete_list":
         active = _active_watchlist_name.get(user.id, "Default")
-        _awaiting_watchlist[user.id] = "delete_list"
-        await query.message.reply_text(
-            f"🗑 *Delete Watchlist*\n\n"
-            f"Active list: *{active}*\n"
-            "Send `YES` to delete **all tickers** in this list.",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            f"🗑 *Delete list* `{active}`\n\n"
+            "This removes **all tickers** in that list.\n"
+            "Send `YES` to confirm, or tap « Back to cancel.\n\n"
+            "_Your message will be cleared after._",
+            awaiting="delete_list",
         )
         return
 
@@ -3678,56 +3523,217 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 InlineKeyboardButton("🗑 Delete ticker", callback_data="wl:delete"),
             ],
             [
-                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
-                InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
+                InlineKeyboardButton("« Back to Watchlist", callback_data="hub:watchlist"),
             ],
+            *_watchlist_nav_keyboard(),
         ]
-        await query.edit_message_text(
-            "✏️ *Edit Watchlist*\n\nChoose what to change:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        try:
+            await query.message.edit_text(
+                "✏️ *Edit Watchlist*\n\nChoose an action:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            await _remember_watchlist_panel(user.id, query.message)
+        except Exception:
+            await query.message.reply_text(
+                "✏️ *Edit Watchlist*\n\nChoose an action:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         return
 
     # --- Ticker-level actions ---
     if action not in ("add", "change", "delete"):
         return
 
-    _awaiting_watchlist[user.id] = action
-
     if action == "add":
-        active = _active_watchlist_name.get(user.id, "Default")
-        await query.message.reply_text(
-            f"➕ *Add ticker* to `{active}`\n\n"
-            "Send one line:\n"
-            "`#TICKER | Company Name | https://t.me/+invite`\n\n"
-            "Example:\n"
-            "`#ALRT | Defence Holdings | https://t.me/+abc123`\n\n"
-            "You can keep adding until you tap *Done – Save & view list*.",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "➕ *Add ticker(s)*\n\n"
+            "Send one or many (saved to Notion):\n\n"
+            "`#ALRT | Name | https://t.me/+…`\n"
+            "or bulk: `#AAA #BBB #CCC`\n\n"
+            "_Input is removed after save._",
+            awaiting="add",
         )
     elif action == "change":
-        await query.message.reply_text(
+        await _watchlist_show_prompt(
+            update,
+            context,
             "✏️ *Change ticker*\n\n"
             "Send:\n"
-            "`#TICKER | New Name | https://t.me/+newlink`",
-            parse_mode="Markdown",
+            "`#TICKER | New Name | https://t.me/+…`\n\n"
+            "_Input is removed after update._",
+            awaiting="change",
         )
     else:
-        await query.message.reply_text(
-            "🗑 *Delete ticker*\n\nSend the ticker only, e.g. `#ALRT`",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "🗑 *Delete ticker*\n\n"
+            "Send ticker(s), e.g. `#ALRT` or `#AAA #BBB`\n\n"
+            "_Input is removed after delete._",
+            awaiting="delete",
         )
 
-# Active list name per user (in-memory)
-_active_watchlist_name: dict[int, str] = {}
+
+async def _watchlist_find_pages(
+    user_id: int, ticker: str, *, list_name: str | None = None
+) -> list[dict]:
+    """Find watchlist rows for user + ticker (optional list filter)."""
+    db_id = NOTION_WATCHLIST_DB_ID
+    ds_id = NOTION_WATCHLIST_DATA_SOURCE_ID
+    t = (ticker or "").lstrip("#").upper().strip()
+    filters: list[dict] = [
+        {
+            "property": "Telegram User ID",
+            "rich_text": {"equals": str(user_id)},
+        },
+        {"property": "Ticker", "title": {"equals": t}},
+    ]
+    if list_name:
+        filters.append(
+            {
+                "property": "List Name",
+                "rich_text": {"equals": list_name},
+            }
+        )
+    response = notion_query_data_source(
+        data_source_id=ds_id,
+        database_id=db_id,
+        filter={"and": filters},
+        page_size=20,
+    )
+    return response.get("results", [])
+
+
+async def _watchlist_upsert_ticker(
+    user,
+    *,
+    ticker: str,
+    name: str = "",
+    link: str = "",
+    list_name: str = "Default",
+) -> tuple[str, str]:
+    """
+    Create or update one ticker row in Hive Bot Watchlist.
+    Returns (status, message) where status is 'added' | 'updated' | 'error'.
+    """
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t:
+        return "error", "Missing ticker"
+    list_name = (list_name or "Default")[:100]
+    display_name = (name or t)[:200]
+    link = (link or "").strip()
+    if link.startswith("t.me/"):
+        link = "https://" + link
+
+    try:
+        existing = await _watchlist_find_pages(
+            user.id, t, list_name=list_name
+        )
+        props: dict = {
+            "Name": {
+                "rich_text": [{"text": {"content": display_name}}]
+            },
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+            "List Name": {
+                "rich_text": [{"text": {"content": list_name}}]
+            },
+        }
+        if user.username:
+            props["Username"] = {
+                "rich_text": [{"text": {"content": user.username[:100]}}]
+            }
+        if link.startswith("http"):
+            props["Group Link"] = {"url": link}
+
+        if existing:
+            page_id = existing[0]["id"]
+            if notion:
+                notion.pages.update(page_id=page_id, properties=props)
+            else:
+                _notion_http(
+                    "PATCH", f"pages/{page_id}", {"properties": props}
+                )
+            return "updated", t
+
+        create_props = {
+            "Ticker": {"title": [{"text": {"content": t}}]},
+            **props,
+        }
+        notion_create_page_in_data_source(
+            properties=create_props,
+            data_source_id=NOTION_WATCHLIST_DATA_SOURCE_ID,
+            database_id=NOTION_WATCHLIST_DB_ID,
+        )
+        return "added", t
+    except Exception as e:
+        logger.error("watchlist upsert failed %s: %s", t, e)
+        return "error", str(e)[:120]
+
+
+def _parse_watchlist_add_lines(text: str) -> list[tuple[str, str, str]]:
+    """
+    Parse one or many tickers from user text.
+    Supports:
+      #ALRT | Company | https://t.me/+x
+      #ALRT
+      #A #B #C
+      multiline mixes of the above
+    Returns list of (ticker, name, link).
+    """
+    items: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for raw_line in (text or "").splitlines() or [text]:
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            ticks = extract_hashtag_tickers(parts[0])
+            # Also accept bare ticker without #
+            if not ticks:
+                bare = parts[0].lstrip("#").upper().strip()
+                if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                    ticks = [bare]
+            if not ticks:
+                continue
+            name = parts[1] if len(parts) > 1 else ""
+            link = parts[2] if len(parts) > 2 else ""
+            for t in ticks:
+                tu = t.upper()
+                if tu in seen:
+                    continue
+                seen.add(tu)
+                items.append((tu, name, link))
+        else:
+            ticks = extract_hashtag_tickers(line)
+            if not ticks:
+                # space-separated bare tickers
+                for tok in re.split(r"[\s,;]+", line):
+                    bare = tok.lstrip("#").upper().strip()
+                    if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                        ticks.append(bare)
+            for t in ticks:
+                tu = t.upper()
+                if tu in seen:
+                    continue
+                seen.add(tu)
+                items.append((tu, "", ""))
+    return items
+
 
 async def handle_watchlist_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str
 ) -> None:
     user = update.effective_user
-    db_id = (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
-    if not notion or not db_id or not user:
+    db_id = NOTION_WATCHLIST_DB_ID or (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
+    ds_id = NOTION_WATCHLIST_DATA_SOURCE_ID
+    if not (notion or NOTION_TOKEN) or (not db_id and not ds_id) or not user:
         await update.message.reply_text("Watchlist is not available right now.")
         return
 
@@ -3755,16 +3761,10 @@ async def handle_watchlist_text(
                 )
                 return
             _active_watchlist_name[user.id] = list_name
-            # Keep user in add flow until they confirm Done
-            _awaiting_watchlist[user.id] = "add"
-            await update.message.reply_text(
-                f'List set to: "{list_name}"\n\n'
-                "Next: continue add ticker?\n\n"
-                "Send:\n"
-                "`#TICKER | Company Name | https://t.me/+invite`\n\n"
-                "Keep adding until you tap *Done – Save & view list*.",
-                parse_mode="Markdown",
-                reply_markup=_watchlist_continue_keyboard(),
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ List *{list_name}* ready — use Edit list to add tickers.",
             )
             return
 
@@ -3782,25 +3782,32 @@ async def handle_watchlist_text(
                 ln = _get_plain_text(props.get("List Name")).strip() or "Default"
                 if ln != old:
                     continue
-                notion.pages.update(
-                    page_id=page["id"],
-                    properties={
-                        "List Name": {
-                            "rich_text": [{"text": {"content": new_name[:100]}}]
-                        }
-                    },
-                )
+                if notion:
+                    notion.pages.update(
+                        page_id=page["id"],
+                        properties={
+                            "List Name": {
+                                "rich_text": [
+                                    {"text": {"content": new_name[:100]}}
+                                ]
+                            }
+                        },
+                    )
                 n += 1
             _active_watchlist_name[user.id] = new_name
-            await update.message.reply_text(
-                f"Renamed '{old}' to '{new_name}' ({n} items)."
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ Renamed *{old}* → *{new_name}* ({n} items).",
             )
             return
 
         # ----- Delete list -----
         if action == "delete_list":
             if text.upper() != "YES":
-                await update.message.reply_text("Cancelled. Send YES to confirm.")
+                await update.message.reply_text(
+                    "To confirm delete, send: YES"
+                )
                 return
             active = _active_watchlist_name.get(user.id, "Default")
             pages = await _fetch_user_watchlist_pages(user.id)
@@ -3810,78 +3817,135 @@ async def handle_watchlist_text(
                 ln = _get_plain_text(props.get("List Name")).strip() or "Default"
                 if ln != active:
                     continue
-                notion.pages.update(page_id=page["id"], archived=True)
+                if notion:
+                    notion.pages.update(page_id=page["id"], archived=True)
                 n += 1
             _active_watchlist_name.pop(user.id, None)
-            await update.message.reply_text(
-                f"Deleted list '{active}' ({n} items)."
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ Deleted list *{active}* ({n} items).",
             )
             return
 
-        # ----- Delete ticker -----
-        if action == "delete":
-            if not ticker:
-                await update.message.reply_text("Send a ticker like #ALRT")
-                return
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "and": [
-                        {
-                            "property": "Telegram User ID",
-                            "rich_text": {"equals": str(user.id)},
-                        },
-                        {"property": "Ticker", "title": {"equals": ticker}},
-                    ]
-                },
-                page_size=5,
+        # ----- Set priority 1-10 -----
+        if action == "set_priority":
+            # Parse: #TICKER 7  or  TICKER 7
+            m = re.search(
+                r"(?:#)?([A-Za-z0-9]{1,6})\s+([0-9]{1,2})\b",
+                text,
             )
-            results = response.get("results", [])
-            if not results:
-                await update.message.reply_text(f"No item #{ticker} found.")
-                return
-            for page in results:
-                notion.pages.update(page_id=page["id"], archived=True)
-            await update.message.reply_text(f"Removed #{ticker}.")
-            return
-
-        # ----- Add ticker -----
-        if action == "add":
-            if not ticker:
+            if not m:
                 await update.message.reply_text(
-                    "Include a ticker, e.g. #ALRT | Name | https://t.me/+..."
+                    "Send like: `#ALRT 7` (1–10, or 0 to clear)",
+                    parse_mode="Markdown",
+                )
+                return
+            t = m.group(1).upper()
+            pri = int(m.group(2))
+            if pri < 0 or pri > 10:
+                await update.message.reply_text("Priority must be 0–10.")
+                return
+            results = await _watchlist_find_pages(user.id, t)
+            if not results:
+                await _watchlist_finish_action(
+                    update, context, f"⚠️ #{t} not on your watchlist."
+                )
+                return
+            props = {
+                "Priority": {"number": None if pri == 0 else pri}
+            }
+            for page in results:
+                if notion:
+                    notion.pages.update(page_id=page["id"], properties=props)
+            msg = (
+                f"✅ #{t} priority cleared."
+                if pri == 0
+                else f"✅ #{t} priority set to *{pri}*/10."
+            )
+            # Prefer priority sort after setting
+            _watchlist_sort[user.id] = "priority"
+            _watchlist_page[user.id] = 0
+            await _watchlist_finish_action(update, context, msg)
+            return
+
+        # ----- Delete ticker (supports multiple) -----
+        if action == "delete":
+            to_delete = [t.upper() for t in tickers]
+            if not to_delete:
+                bare = text.lstrip("#").upper().strip()
+                if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                    to_delete = [bare]
+            if not to_delete:
+                await update.message.reply_text(
+                    "Send ticker(s) like `#ALRT` or `#AAA #BBB`"
+                )
+                return
+            removed = []
+            missing = []
+            for t in to_delete:
+                results = await _watchlist_find_pages(user.id, t)
+                if not results:
+                    missing.append(t)
+                    continue
+                for page in results:
+                    if notion:
+                        notion.pages.update(page_id=page["id"], archived=True)
+                removed.append(t)
+            bits = []
+            if removed:
+                bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+            if missing:
+                bits.append("Not found: " + ", ".join(f"#{x}" for x in missing))
+            await _watchlist_finish_action(
+                update, context, "\n".join(bits) or "Nothing changed."
+            )
+            return
+
+        # ----- Add ticker(s) — bulk-safe, multi-source Notion write -----
+        if action == "add":
+            items = _parse_watchlist_add_lines(text)
+            if not items:
+                await update.message.reply_text(
+                    "Include ticker(s), e.g.\n"
+                    "`#ALRT | Company | https://t.me/+…`\n"
+                    "or several: `#AAA #BBB #CCC`",
+                    parse_mode="Markdown",
                 )
                 return
             list_name = _active_watchlist_name.get(user.id, "Default")
-            props = {
-                "Ticker": {"title": [{"text": {"content": ticker}}]},
-                "Name": {
-                    "rich_text": [{"text": {"content": (name or ticker)[:200]}}]
-                },
-                "Telegram User ID": {
-                    "rich_text": [{"text": {"content": str(user.id)}}]
-                },
-                "List Name": {
-                    "rich_text": [{"text": {"content": list_name[:100]}}]
-                },
-            }
-            if link.startswith("http"):
-                props["Group Link"] = {"url": link}
-            if user.username:
-                props["Username"] = {
-                    "rich_text": [{"text": {"content": user.username}}]
-                }
-            notion.pages.create(parent={"database_id": db_id}, properties=props)
-            # Stay in add mode until user confirms Done
-            _awaiting_watchlist[user.id] = "add"
-            await update.message.reply_text(
-                f'List set to: "{list_name}"\n'
-                f"Added *#{ticker}* ({name or ticker}).\n\n"
-                "Next: continue add ticker?\n\n"
-                "Send another `#TICKER | Name | link` line, or tap "
-                "*Done – Save & view list*.",
-                parse_mode="Markdown",
-                reply_markup=_watchlist_continue_keyboard(),
+            added, updated, errors = [], [], []
+            for t, n, lnk in items:
+                status, info = await _watchlist_upsert_ticker(
+                    user,
+                    ticker=t,
+                    name=n,
+                    link=lnk,
+                    list_name=list_name,
+                )
+                if status == "added":
+                    added.append(t)
+                elif status == "updated":
+                    updated.append(t)
+                else:
+                    errors.append(f"{t}: {info}")
+
+            lines = [f"List: *{list_name}*"]
+            if added:
+                lines.append(
+                    f"✅ Added ({len(added)}): "
+                    + ", ".join(f"#{x}" for x in added)
+                )
+            if updated:
+                lines.append(
+                    f"♻️ Updated ({len(updated)}): "
+                    + ", ".join(f"#{x}" for x in updated)
+                )
+            if errors:
+                lines.append("⚠️ Errors:\n" + "\n".join(errors[:8]))
+            lines.append("\nOpen 👀 My Watchlist or tap Refresh RNS to view.")
+            await _watchlist_finish_action(
+                update, context, "\n".join(lines)
             )
             return
 
@@ -3889,39 +3953,25 @@ async def handle_watchlist_text(
         if action == "change":
             if not ticker:
                 await update.message.reply_text(
-                    "Include a ticker, e.g. #ALRT | New Name | https://t.me/+..."
+                    "Include a ticker, e.g. `#ALRT | New Name | https://t.me/+…`",
+                    parse_mode="Markdown",
                 )
                 return
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "and": [
-                        {
-                            "property": "Telegram User ID",
-                            "rich_text": {"equals": str(user.id)},
-                        },
-                        {"property": "Ticker", "title": {"equals": ticker}},
-                    ]
-                },
-                page_size=1,
+            list_name = _active_watchlist_name.get(user.id, "Default")
+            status, info = await _watchlist_upsert_ticker(
+                user,
+                ticker=ticker,
+                name=name,
+                link=link,
+                list_name=list_name,
             )
-            results = response.get("results", [])
-            if not results:
-                await update.message.reply_text(f"No item #{ticker} found.")
-                return
-            props = {}
-            if name:
-                props["Name"] = {
-                    "rich_text": [{"text": {"content": name[:200]}}]
-                }
-            if link.startswith("http"):
-                props["Group Link"] = {"url": link}
-            if props:
-                notion.pages.update(page_id=results[0]["id"], properties=props)
-            await update.message.reply_text(
-                f"Updated #{ticker}.",
-                reply_markup=_watchlist_continue_keyboard(),
-            )
+            if status == "error":
+                summary = f"⚠️ Could not update #{ticker}: {info}"
+            elif status == "updated":
+                summary = f"✅ Updated #{ticker}."
+            else:
+                summary = f"✅ #{ticker} added to *{list_name}*."
+            await _watchlist_finish_action(update, context, summary)
             return
 
         await update.message.reply_text(
@@ -4086,29 +4136,14 @@ async def request_access(
         )
         return
 
-    # Hard gate: must be a Hive group member before a request is accepted
-    if _require_group_membership() and not in_group:
-        # Still record Group Member = No if a row exists
-        try:
-            await create_access_request(user, is_group_member_flag=False)
-        except Exception:
-            pass
-        try:
-            await sync_group_member_to_notion(context, user)
-        except Exception:
-            pass
-        await update.message.reply_text(
-            "Access request blocked\n\n"
-            f"Name: {user.full_name}\n"
-            f"Telegram User ID: {user.id}  OK\n"
-            f"Group member: No\n\n"
-            "Result: NOT ELIGIBLE\n\n"
-            "You must be a member of the Hive Telegram group before "
-            "requesting bot access.\n"
-            "Join the group, then send /request again.\n"
-            f"(Check detail: {group_detail})"
+    # Group membership is recorded on the request but does NOT block submission.
+    # Admin still gets the DM and can approve/deny from Notion.
+    if os.getenv("TELEGRAM_GROUP_ID") and not in_group:
+        logger.info(
+            "Access request from non-member user_id=%s detail=%s – still creating Pending",
+            user.id,
+            group_detail,
         )
-        return
 
     # Submit Pending request (upsert into Notion)
     success, info = await create_access_request(
@@ -4532,7 +4567,7 @@ def _extract_status_change(
 
 
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """When someone leaves/is kicked from the Hive group → mark Group Member = No + revoke."""
+    """When someone leaves/is kicked from the Hive group → mark Group Member = No."""
     result = update.chat_member or update.my_chat_member
     if not result:
         return
@@ -4555,102 +4590,16 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user or user.is_bot:
         return
 
-    # Left or kicked → disable bot access in Notion
+    # Left or kicked
     if new_status in left_statuses and old_status in member_statuses | {None}:
         await mark_group_member_in_notion(user, is_member=False)
-        logger.info(
-            "User %s left group → Group Member=No, Status revoked", user.id
-        )
+        logger.info("User %s left group → Group Member = No", user.id)
         return
 
-    # Joined / re-joined → flag as group member (admin must re-approve if revoked)
+    # Joined / re-joined
     if new_status in member_statuses and old_status in left_statuses | {None}:
         await mark_group_member_in_notion(user, is_member=True)
         logger.info("User %s joined group → Group Member = Yes", user.id)
-
-
-async def sync_all_authorised_memberships(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Periodic job: re-check every Notion Authorised user against the Hive group.
-    Non-members are revoked (Group Member=No, Status=Revoked/Pending).
-    """
-    if not _require_group_membership():
-        return
-    if not notion and not NOTION_TOKEN:
-        return
-
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not db_id and not ds_id:
-        return
-
-    logger.info("Starting periodic group membership sync for Authorised users")
-    try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={"property": "Status", "select": {"equals": "Authorised"}},
-            page_size=100,
-        )
-        results = response.get("results", [])
-    except Exception as e:
-        logger.error("sync_all_authorised_memberships query failed: %s", e)
-        return
-
-    revoked = 0
-    confirmed = 0
-    for page in results:
-        props = page.get("properties") or {}
-        uid_raw = _get_plain_text(props.get("Telegram User ID"))
-        if not uid_raw:
-            continue
-        try:
-            uid = int(str(uid_raw).strip())
-        except ValueError:
-            continue
-
-        in_group, detail = await is_group_member(context, uid)
-        if detail.startswith("error:"):
-            logger.warning(
-                "Membership sync skip user %s – Telegram API error: %s", uid, detail
-            )
-            continue
-
-        class _U:
-            id = uid
-            username = None
-            full_name = None
-
-        if in_group:
-            try:
-                await mark_group_member_in_notion(_U(), is_member=True)
-                confirmed += 1
-            except Exception as e:
-                logger.warning("sync confirm failed for %s: %s", uid, e)
-        else:
-            try:
-                await mark_group_member_in_notion(_U(), is_member=False)
-                revoked += 1
-                logger.info(
-                    "Membership sync revoked user %s – not in group (%s)",
-                    uid,
-                    detail,
-                )
-            except Exception as e:
-                logger.warning("sync revoke failed for %s: %s", uid, e)
-
-        # Gentle rate limit for Telegram / Notion
-        await asyncio.sleep(0.35)
-
-    _authorized_cache["expires"] = 0
-    logger.info(
-        "Membership sync done: confirmed=%d revoked=%d total=%d",
-        confirmed,
-        revoked,
-        len(results),
-    )
 
 async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
     """Update Group Member (and optionally Status) in the auth database."""
@@ -4684,40 +4633,14 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
             },
         }
 
-        # Auto-revoke bot access when they leave / are kicked
+        # Optional: auto-revoke Authorised when they leave
         if not is_member:
-            # Prefer explicit Revoked; fall back to Pending if select option missing
-            for status_name in ("Revoked", "Pending"):
-                try:
-                    props["Status"] = {"select": {"name": status_name}}
-                    if notion:
-                        notion.pages.update(page_id=page_id, properties=props)
-                    else:
-                        _notion_http(
-                            "PATCH", f"pages/{page_id}", {"properties": props}
-                        )
-                    break
-                except Exception as se:
-                    logger.warning(
-                        "Status=%s update failed for %s: %s",
-                        status_name,
-                        user.id,
-                        se,
-                    )
-                    props.pop("Status", None)
-            else:
-                if notion:
-                    notion.pages.update(page_id=page_id, properties=props)
-                else:
-                    _notion_http(
-                        "PATCH", f"pages/{page_id}", {"properties": props}
-                    )
-        else:
-            if notion:
-                notion.pages.update(page_id=page_id, properties=props)
-            else:
-                _notion_http("PATCH", f"pages/{page_id}", {"properties": props})
+            props["Status"] = {"select": {"name": "Pending"}}
 
+        if notion:
+            notion.pages.update(page_id=page_id, properties=props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": props})
         _authorized_cache["expires"] = 0
     except Exception as e:
         logger.error("mark_group_member_in_notion failed for %s: %s", user.id, e)
@@ -4762,14 +4685,9 @@ async def append_request_history(
     } else "Other")
 
     now = datetime.now(timezone.utc)
-    # Title includes Telegram ID so admins can search/filter by ID in Notion
-    name_part = (user.full_name or "Unknown").strip()[:40]
-    title = (
-        f"{notion_type} · {name_part} · {user.id} · "
-        f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
     props = {
-        "Request": {"title": [{"text": {"content": title[:200]}}]},
+        "Request": {"title": [{"text": {"content": title[:100]}}]},
         "Telegram User ID": {
             "rich_text": [{"text": {"content": str(user.id)}}]
         },
@@ -4812,28 +4730,14 @@ async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
-    1) ALWAYS write one row to Hive Bot Request History (audit trail).
-    2) Best-effort update Hive Bot Authorised Users (last request + count).
-
-    Authorised Users = one row per member (summary only).
-    Request History  = one row per inquiry (full trail).
+    Update Hive Bot Authorised Users with last request date/type and increment count.
+    Uses data-source API so multi-source Auth DB updates reliably.
     """
     if not user:
         return
     if not notion and not NOTION_TOKEN:
         return
 
-    # --- 1) Full audit trail: one history row per inquiry (never skip) ---
-    try:
-        await append_request_history(
-            user, request_type, details=notes, status="Logged"
-        )
-    except Exception as e:
-        logger.error(
-            "append_request_history from log_member_activity failed: %s", e
-        )
-
-    # --- 2) Summary fields on the member's Authorised Users row ---
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
     )
@@ -4853,11 +4757,7 @@ async def log_member_activity(
         )
         results = response.get("results", [])
         if not results:
-            logger.info(
-                "log_member_activity: no auth row for user %s "
-                "(history row still written)",
-                user.id,
-            )
+            logger.info("log_member_activity: no auth row for user %s", user.id)
             return
 
         page = results[0]
@@ -4880,43 +4780,32 @@ async def log_member_activity(
                     "start": datetime.now(timezone.utc).date().isoformat()
                 }
             },
+            "Last Request Type": {"select": {"name": request_type}},
             "Request Count": {"number": count + 1},
         }
-        # Prefer "Last Request Type", fall back to "Request Type"
-        for type_prop in ("Last Request Type", "Request Type"):
-            if type_prop in props:
-                ptype = (props.get(type_prop) or {}).get("type")
-                if ptype == "select":
-                    update_props[type_prop] = {"select": {"name": request_type}}
-                elif ptype == "rich_text":
-                    update_props[type_prop] = {
-                        "rich_text": [{"text": {"content": request_type[:2000]}}]
-                    }
-                break
-        else:
-            update_props["Last Request Type"] = {"select": {"name": request_type}}
-
         if notes:
-            for notes_prop in ("Notes", "Last Request Detail"):
-                if notes_prop in props or notes_prop == "Notes":
-                    update_props[notes_prop] = {
-                        "rich_text": [{"text": {"content": notes[:1800]}}]
-                    }
-                    break
+            update_props["Notes"] = {
+                "rich_text": [{"text": {"content": notes[:1800]}}]
+            }
 
+        # pages.update still works by page_id regardless of multi-source
         if notion:
             notion.pages.update(page_id=page_id, properties=update_props)
         else:
             _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
 
         logger.info(
-            "Logged activity summary user=%s type=%s count=%s",
+            "Logged activity user=%s type=%s count=%s",
             user.id,
             request_type,
             count + 1,
         )
+        # Standalone history row (one row per request)
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
+        )
     except Exception as e:
-        logger.error("log_member_activity auth-row update failed for %s: %s", user.id, e)
+        logger.error("log_member_activity failed for %s: %s", user.id, e)
 
         
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4958,34 +4847,8 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-async def _post_init(app: Application) -> None:
-    """Schedule periodic Hive group membership sync for Authorised users."""
-    if not _require_group_membership():
-        logger.info("Group membership requirement off – skip periodic sync job")
-        return
-    hours = float(os.getenv("GROUP_SYNC_INTERVAL_HOURS") or "6")
-    hours = max(1.0, hours)
-    try:
-        app.job_queue.run_repeating(
-            sync_all_authorised_memberships,
-            interval=hours * 3600,
-            first=120,  # first run 2 minutes after boot
-            name="group_membership_sync",
-        )
-        logger.info(
-            "Scheduled group membership sync every %s hour(s)", hours
-        )
-    except Exception as e:
-        logger.warning("Could not schedule membership sync job: %s", e)
-
-
 def main() -> None:
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(TOKEN).build()
 
     # Commands — with_command_cleanup removes /status, /mystockpick, etc. after run
     app.add_handler(CommandHandler("start", with_command_cleanup(start)))
@@ -5008,7 +4871,6 @@ def main() -> None:
 
     # Inline buttons (once each — no duplicates)
     app.add_handler(CallbackQueryHandler(stockpick_button, pattern=r"^sp:"))
-    app.add_handler(CallbackQueryHandler(explore_button, pattern=r"^exp:"))
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
@@ -5019,11 +4881,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info(
-        "Hive SupportBot starting... TELEGRAM_GROUP_ID=%s REQUIRE_GROUP=%s",
-        os.getenv("TELEGRAM_GROUP_ID") or "(not set)",
-        _require_group_membership(),
-    )
+    logger.info("Hive SupportBot starting...")
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
