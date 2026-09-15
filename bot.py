@@ -218,6 +218,8 @@ _awaiting_field: dict[int, str] = {}
 _awaiting_watchlist: dict[int, str] = {}
 # user_id -> True while waiting for link search query
 _awaiting_link: dict[int, bool] = {}
+# user_id -> waiting for ticker input after Stock Snapshot button
+_awaiting_snapshot: dict[int, bool] = {}
 # admin_id -> Group Links request they are fulfilling (paste URL next)
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
@@ -1676,16 +1678,23 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
     return text
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Full persistent keyboard (4 feature buttons + Hide)."""
+    """
+    Home navigation – always-on persistent reply keyboard.
+    Stays visible after /start and after every menu selection.
+    """
     return ReplyKeyboardMarkup(
         [
             [
-                KeyboardButton("📋 Menu"),
+                KeyboardButton("👀 My Watchlist"),
                 KeyboardButton("📌 My Stockpick"),
             ],
             [
-                KeyboardButton("👀 My Watchlist"),
+                KeyboardButton("📊 Stock Snapshot"),
                 KeyboardButton("🔗 Group Links"),
+            ],
+            [
+                KeyboardButton("📋 Menu"),
+                KeyboardButton("✨ What's new?"),
             ],
             [
                 KeyboardButton("🙈 Hide"),
@@ -1698,7 +1707,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Collapsed keyboard – single button to restore the full menu."""
+    """Collapsed keyboard – single button to restore Home."""
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("☰ Show menu")],
@@ -1708,20 +1717,89 @@ def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
     )
 
+
+async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
+    """
+    Re-assert the persistent Home reply keyboard without leaving clutter.
+    Telegram only updates reply keyboards when a message is sent with reply_markup.
+    """
+    if not bot or chat_id is None:
+        return
+    try:
+        pulse = await bot.send_message(
+            chat_id, "⋯", reply_markup=main_reply_keyboard()
+        )
+        await safe_delete_message(bot, pulse.chat_id, pulse.message_id)
+    except Exception:
+        pass
+
+
 def menu_inline_keyboard() -> InlineKeyboardMarkup:
-    """Inline buttons for /menu."""
+    """Simplified Menu – access + help only."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("🏠 Start", callback_data="cmd:start"),
+                InlineKeyboardButton("🔐 Status", callback_data="cmd:status"),
+            ],
+            [
+                InlineKeyboardButton("📨 Request access", callback_data="cmd:request"),
                 InlineKeyboardButton("❓ FAQ", callback_data="cmd:faq"),
             ],
             [
-                InlineKeyboardButton("📊 Snap (ticker help)", callback_data="cmd:snap"),
-                InlineKeyboardButton("📌 My🐝 Stockpick", callback_data="cmd:mystockpick"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ],
+        ]
+    )
+
+
+def hub_back_keyboard() -> InlineKeyboardMarkup:
+    """Single « Hub row for any submenu."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
+    )
+
+
+def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    """Inline actions under a company snapshot."""
+    t = (ticker or "").upper()[:20]
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "➕ Save to My Watchlist",
+                    callback_data=f"snap:save:{t}",
+                )
             ],
             [
-                InlineKeyboardButton("🔗 Group Links", callback_data="cmd:link"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ],
+        ]
+    )
+
+
+def hub_home_keyboard() -> InlineKeyboardMarkup:
+    """Inline shortcut row pointing back at Home features."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "👀 My Watchlist", callback_data="hub:watchlist"
+                ),
+                InlineKeyboardButton(
+                    "📌 My Stockpick", callback_data="hub:mypicks"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Stock Snapshot", callback_data="cmd:snap"
+                ),
+                InlineKeyboardButton(
+                    "🔗 Group Links", callback_data="cmd:link"
+                ),
+            ],
+            [
+                InlineKeyboardButton("📋 Menu", callback_data="cmd:menu"),
             ],
         ]
     )
@@ -2503,6 +2581,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
+    # Stock Snapshot – Home keyboard
+    if text in (
+        "📊 Stock Snapshot",
+        "Stock Snapshot",
+        "📊 Snapshot",
+        "Snapshot",
+    ) or lower in (
+        "stock snapshot",
+        "📊 stock snapshot",
+        "snapshot",
+    ):
+        await stock_snapshot_prompt(update, context)
+        return
+
+    # What's new?
+    if text in (
+        "✨ What's new?",
+        "What's new?",
+        "Whats new?",
+        "What's new",
+        "Whats new",
+    ) or lower in (
+        "what's new?",
+        "whats new?",
+        "what's new",
+        "whats new",
+        "✨ what's new?",
+    ):
+        await whats_new_cmd(update, context)
+        return
+
     # Match Link button even if emoji/spacing differs
     if (
         text in (
@@ -2527,6 +2636,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info("Link button matched text=%r", text)
         await link_cmd(update, context)
         await cleanup_trigger_message(update, context)
+        return
+
+    # Stock Snapshot follow-up – user typed a ticker after tapping the button
+    if user and user.id in _awaiting_snapshot:
+        _awaiting_snapshot.pop(user.id, None)
+        raw = text.strip()
+        tickers = extract_hashtag_tickers(raw)
+        if not tickers:
+            t = raw.lstrip("#").upper().strip()
+            if t and re.fullmatch(r"[A-Z0-9]{1,6}", t):
+                tickers = [t]
+        if not tickers:
+            await update.message.reply_text(
+                "Please send a ticker like `ALRT` or `#KEFI`.",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+        for t in tickers[:3]:
+            await deliver_stock_snapshot(update, context, t)
         return
 
     # Link search follow-up (private only) after tapping 🔗 Link
@@ -2780,10 +2909,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
             "✅ You are *Authorised* and can use the bot.\n\n"
-            "Use the buttons below, or in the group:\n"
-            "• `@Bot #KEFI summary` → lookup\n"
-            "• `#KEFI snapshot` → lookup\n"
-            "• `#stockpick my idea...` → save your pick"
+            "Home keyboard (always available):\n"
+            "• 👀 My Watchlist\n"
+            "• 📌 My Stockpick\n"
+            "• 📊 Stock Snapshot\n"
+            "• 🔗 Group Links\n"
+            "• 📋 Menu · ✨ What's new?\n\n"
+            "In the group: `@Bot #KEFI summary` or `#stockpick …`"
         )
     else:
         text = (
@@ -2811,35 +2943,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_reply_keyboard(),
         )
 
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Simplified Menu – access & help only; features live on Home keyboard."""
     text = (
         "🐝 *BuzzBot Menu*\n\n"
         "• /start – Welcome & status\n"
         "• /status – Check if you are authorised\n"
         "• /request – Request access\n"
-        "• /snap – How to look up a ticker\n"
-        "• /mystockpick – Your stockpick this month\n"
-        "• /link – Group Link (private chat only)\n"
         "• /faq – FAQ\n\n"
-        "In the group: `@Bot #TICKER` to look up a stock\n"
-        "Or use `#stockpick your idea` to save one.\n"
-        "🔗 *Group Link* works only in a private 1-to-1 chat."
+        "Features are on the Home keyboard:\n"
+        "My Watchlist · My Stockpick · Stock Snapshot · Group Links"
     )
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
+    markup_inline = menu_inline_keyboard()
     if chat:
         await context.bot.send_message(
             chat_id=chat.id,
             text=text,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=markup_inline,
         )
+        # Keep persistent Home keyboard on top
+        try:
+            pulse = await context.bot.send_message(
+                chat.id, "⋯", reply_markup=main_reply_keyboard()
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
     elif update.message:
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=markup_inline,
         )
+
+
+async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lightweight changelog for the What's new? Home button."""
+    text = (
+        "✨ *What's new*\n\n"
+        "• 📊 *Stock Snapshot* – look up any AIM ticker from the Home keyboard\n"
+        "• 👀 *My Watchlist* – % on day, RNS, sort, and 📌 month stockpick badge\n"
+        "• Sleeker watchlist keyboard (Sort ▾ · Manage ▾)\n"
+        "• Snapshot → Save to Watchlist + « Hub\n"
+        "• Persistent Home keyboard stays available while you navigate\n\n"
+        "_Not financial advice. DYOR._"
+    )
+    await cleanup_trigger_message(update, context)
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
+        ),
+    )
+    try:
+        pulse = await context.bot.send_message(
+            msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+        )
+        await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+    except Exception:
+        pass
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2847,74 +3017,195 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
     data = (query.data or "").replace("cmd:", "")
 
-    # Remove the inline menu message after a button is pressed (clean chat)
-    if query and query.message and _is_private(update):
-        await safe_delete_message(
-            context.bot, query.message.chat_id, query.message.message_id
-        )
+    # Build a minimal update proxy when only callback_query is present
+    def _proxy_update():
+        if update.message:
+            return update
+        chat = update.effective_chat
+        if not chat or not query or not query.message:
+            return update
+
+        class _MsgProxy:
+            def __init__(self, msg, bot):
+                self._msg = msg
+                self._bot = bot
+                self.chat = msg.chat
+                self.chat_id = msg.chat_id
+                self.message_id = msg.message_id
+
+            async def reply_text(self, *a, **k):
+                return await self._bot.send_message(self.chat_id, *a, **k)
+
+        class _Up:
+            def __init__(self, orig, msg):
+                self.effective_user = orig.effective_user
+                self.effective_chat = orig.effective_chat
+                self.message = msg
+                self.callback_query = orig.callback_query
+
+        return _Up(update, _MsgProxy(query.message, context.bot))
 
     if data == "start":
         await start(update, context)
     elif data == "faq":
-        # faq expects update.message – send via bot if needed
-        if update.message:
-            await faq(update, context)
-        else:
-            chat = update.effective_chat
-            if chat:
-                # minimal proxy
-                class _MsgProxy:
-                    def __init__(self, bot, chat_id):
-                        self._bot = bot
-                        self.chat_id = chat_id
-                    async def reply_text(self, *a, **k):
-                        return await self._bot.send_message(self.chat_id, *a, **k)
-                class _Up:
-                    def __init__(self, orig, msg):
-                        self.effective_user = orig.effective_user
-                        self.effective_chat = orig.effective_chat
-                        self.message = msg
-                await faq(
-                    _Up(update, _MsgProxy(context.bot, chat.id)), context
-                )
+        await faq(_proxy_update(), context)
+    elif data == "status":
+        await status_cmd(_proxy_update(), context)
+    elif data == "request":
+        await request_access(_proxy_update(), context)
+    elif data == "menu":
+        await menu_cmd(_proxy_update(), context)
     elif data == "snap":
-        await snap_cmd(update, context)
+        # Same entry as Home "Stock Snapshot" – prompt for ticker
+        await stock_snapshot_prompt(_proxy_update(), context)
     elif data == "mystockpick":
-        await mystockpick_cmd(update, context)
+        await mystockpick_cmd(_proxy_update(), context)
     elif data == "link":
-        query = update.callback_query
-        if query and query.message:
-            class _MsgProxy:
-                def __init__(self, msg, bot):
-                    self._msg = msg
-                    self._bot = bot
-                    self.chat = msg.chat
-                async def reply_text(self, *a, **k):
-                    return await self._bot.send_message(self._msg.chat_id, *a, **k)
-            class _UpdateProxy:
-                def __init__(self, orig, msg):
-                    self.effective_user = orig.effective_user
-                    self.effective_chat = msg.chat
-                    self.message = msg
-            await link_cmd(
-                _UpdateProxy(update, _MsgProxy(query.message, context.bot)),
-                context,
-            )
+        await link_cmd(_proxy_update(), context)
+    elif data == "whatsnew":
+        await whats_new_cmd(_proxy_update(), context)
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+    msg = update.effective_message
+    if not msg:
+        return
+    await msg.reply_text(
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
+        "• 📊 *Stock Snapshot* on the Home keyboard looks up any AIM ticker.\n"
         "• Use `#stockpick` in the group to log ideas.\n"
         "• Contact a human admin in The Hive group if something looks wrong.",
         parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
+        reply_markup=hub_back_keyboard(),
     )
+    chat = update.effective_chat
+    if chat:
+        await ensure_home_keyboard(context.bot, chat.id)
+
+async def stock_snapshot_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Home keyboard → Stock Snapshot: ask for a ticker."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not msg or not user:
+        return
+    if not await is_authorized(update, context):
+        await msg.reply_text(
+            "🔒 Only authorised members can request snapshots.\n"
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+    _awaiting_snapshot[user.id] = True
+    await cleanup_trigger_message(update, context)
+    await msg.reply_text(
+        "📊 *Stock Snapshot*\n\n"
+        "Send a ticker to look up, for example:\n"
+        "• `ALRT`\n"
+        "• `#KEFI`\n"
+        "• `EPP`\n\n"
+        "I'll return the company snapshot from UK AIM Micro-Cap.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
+        ),
+    )
+    try:
+        pulse = await context.bot.send_message(
+            msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+        )
+        await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+    except Exception:
+        pass
+
+
+async def deliver_stock_snapshot(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ticker: str,
+) -> None:
+    """Look up ticker and show snapshot + Save to Watchlist / Hub."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not msg:
+        return
+    ticker = (ticker or "").lstrip("#").upper().strip()
+    if not ticker:
+        await msg.reply_text(
+            "Please send a valid ticker (e.g. ALRT).",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+    if not await is_authorized(update, context):
+        await msg.reply_text(
+            "🔒 Only authorised members can request snapshots.\n"
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+    try:
+        meta = await get_ticker_from_notion(ticker)
+        if not meta:
+            await msg.reply_text(
+                f"No snapshot for *#{ticker}* in UK AIM Micro-Cap.\n"
+                "Try another ticker or contact an admin.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
+                ),
+            )
+            return
+        try:
+            stockpickers = await get_stockpickers_for_ticker(ticker)
+        except Exception:
+            stockpickers = []
+        body = format_reply(ticker, meta, stockpickers)
+        pct = meta.get("day_change_pct")
+        if pct is None:
+            pct = _fetch_pct_on_day_live(ticker)
+        if pct is not None:
+            sign = "+" if pct >= 0 else ""
+            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
+        try:
+            await msg.reply_text(
+                body,
+                parse_mode="Markdown",
+                reply_markup=snapshot_action_keyboard(ticker),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await msg.reply_text(
+                body.replace("*", "").replace("_", ""),
+                reply_markup=snapshot_action_keyboard(ticker),
+                disable_web_page_preview=True,
+            )
+        try:
+            await log_member_activity(
+                user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} stock snapshot"
+            )
+        except Exception:
+            pass
+        try:
+            pulse = await context.bot.send_message(
+                msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("deliver_stock_snapshot failed for %s: %s", ticker, e)
+        await msg.reply_text(
+            f"Lookup failed for #{ticker}. Please try again.\n`{e}`",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+
 
 async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /snap              → short help
+    /snap              → prompt (same as Stock Snapshot button)
     /snap #80M         → snapshot for authorised users
     /snap 80M          → same
     """
@@ -2933,41 +3224,21 @@ async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 tickers.append(t)
 
     if not tickers:
-        await msg.reply_text(
-            "📊 *Company snapshot*\n\n"
-            "Use one of:\n"
-            "• `/snap #80M`\n"
-            "• `#80M #summary`\n"
-            "• `#KEFI #snapshot`\n\n"
-            "A bare `#TICKER` alone is ignored.",
-            parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
-        )
+        # No args → same UX as Home Stock Snapshot button
+        await stock_snapshot_prompt(update, context)
         return
 
     if not await is_authorized(update, context):
         await msg.reply_text(
             "🔒 Only authorised members can request snapshots.\n"
-            "Send /request to ask for access."
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
         )
         return
 
     for t in tickers:
-        data = await get_ticker_from_notion(t)
-        if data:
-            await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
-            stockpickers = await get_stockpickers_for_ticker(t)
-            await msg.reply_text(
-                format_reply(t, data, stockpickers),
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(),
-            )
-        else:
-            await msg.reply_text(
-                f"I don’t have *#{t}* in the current UK AIM Micro-Cap snapshot.",
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(),
-            )
+        await deliver_stock_snapshot(update, context, t)
+
 
 async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -2977,6 +3248,17 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await require_authorized(update, context):
         return
 
+    kb = _hub_keyboard()
+    # Ensure « Hub is always present on stockpick hub
+    rows = list(kb.inline_keyboard)
+    if not any(
+        (b.callback_data or "") == "hub:home"
+        for row in rows
+        for b in row
+    ):
+        rows.append(
+            [InlineKeyboardButton("« Hub", callback_data="hub:home")]
+        )
     await update.message.reply_text(
         "📌 *My Stockpick hub*\n\n"
         "• Edit **this month’s** pick with the buttons below\n"
@@ -2984,8 +3266,15 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "• Open **My Watchlist** to manage tickers\n\n"
         "_Past months’ stockpicks are locked (admin can still change them)._",
         parse_mode="Markdown",
-        reply_markup=_hub_keyboard(),
+        reply_markup=InlineKeyboardMarkup(rows),
     )
+    try:
+        pulse = await context.bot.send_message(
+            update.message.chat_id, "⋯", reply_markup=main_reply_keyboard()
+        )
+        await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+    except Exception:
+        pass
 
 async def show_my_stockpicks(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
@@ -3593,25 +3882,141 @@ async def show_watchlist(
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
+async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle snap:save:TICKER from Stock Snapshot inline actions."""
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not query or not user:
+        return
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("snap:save:"):
+        return
+    ticker = data.replace("snap:save:", "", 1).strip().upper()
+    if not ticker:
+        await query.message.reply_text("Missing ticker.")
+        return
+    if not await is_authorized(update, context):
+        await query.message.reply_text(
+            "🔒 Only authorised members can use My Watchlist.\n"
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+    list_name = _active_watchlist_name.get(user.id, "Default")
+    company = ""
+    try:
+        meta = await get_ticker_from_notion(ticker)
+        if meta:
+            company = meta.get("company") or ""
+    except Exception:
+        pass
+    try:
+        status, info = await _watchlist_upsert_ticker(
+            user,
+            ticker=ticker,
+            name=company,
+            link="",
+            list_name=list_name,
+        )
+        if status in ("added", "updated"):
+            verb = "Added to" if status == "added" else "Updated on"
+            msg = (
+                f"✅ *#{ticker}* {verb} My Watchlist "
+                f"(*{list_name}*)."
+            )
+        else:
+            msg = f"⚠️ Could not save *#{ticker}*: {info}"
+        await query.message.reply_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "👀 Open My Watchlist",
+                            callback_data="hub:watchlist",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "« Hub", callback_data="hub:home"
+                        )
+                    ],
+                ]
+            ),
+        )
+        try:
+            pulse = await context.bot.send_message(
+                query.message.chat_id,
+                "⋯",
+                reply_markup=main_reply_keyboard(),
+            )
+            await safe_delete_message(
+                context.bot, pulse.chat_id, pulse.message_id
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("snap:save failed for %s: %s", ticker, e)
+        await query.message.reply_text(
+            f"Could not save #{ticker} to watchlist.\n`{e}`",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+
+
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    user = update.effective_user
 
     if data == "hub:watchlist":
         # Cancel any pending watchlist input and return to clean panel
-        user = update.effective_user
         if user:
             _awaiting_watchlist.pop(user.id, None)
+            _awaiting_snapshot.pop(user.id, None)
         await show_watchlist(update, context, edit=True, force_rns=False)
     elif data == "hub:mypicks":
         await show_my_stockpicks(update, context, edit=True)
     elif data == "hub:home":
-        await query.edit_message_text(
-            "📌 *My Stockpick hub*\n\nChoose an option:",
-            parse_mode="Markdown",
-            reply_markup=_hub_keyboard(),
+        # Return to Home – restore message + persistent Home keyboard
+        if user:
+            _awaiting_snapshot.pop(user.id, None)
+            _awaiting_watchlist.pop(user.id, None)
+            _awaiting_link.pop(user.id, None)
+        text = (
+            "🏠 *Home*\n\n"
+            "Use the keyboard below:\n"
+            "• 👀 My Watchlist\n"
+            "• 📌 My Stockpick\n"
+            "• 📊 Stock Snapshot\n"
+            "• 🔗 Group Links\n"
+            "• 📋 Menu · ✨ What's new?\n"
+            "• 🙈 Hide"
         )
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=hub_home_keyboard(),
+            )
+        except Exception:
+            try:
+                await query.message.reply_text(
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=hub_home_keyboard(),
+                )
+            except Exception:
+                pass
+        # Always re-assert the persistent Home reply keyboard
+        await ensure_home_keyboard(
+            context.bot, query.message.chat_id if query.message else None
+        )
+        return
+
 
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -5203,6 +5608,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
+    app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
