@@ -225,6 +225,9 @@ _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 # user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
 _watchlist_ui: dict[int, dict] = {}
+_watchlist_page: dict[int, int] = {}  # user_id -> page index (0-based)
+_watchlist_sort: dict[int, str] = {}  # user_id -> rns | pct | priority | name
+WATCHLIST_PAGE_SIZE = 3
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
 _authorized_cache: dict = {
@@ -941,6 +944,26 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                         return val
             return ""
 
+        def find_number(*names):
+            for name in names:
+                prop = props.get(name)
+                if not prop or not isinstance(prop, dict):
+                    continue
+                if prop.get("type") == "number" and prop.get("number") is not None:
+                    return float(prop["number"])
+                if prop.get("number") is not None:
+                    try:
+                        return float(prop["number"])
+                    except (TypeError, ValueError):
+                        pass
+                # sometimes stored as text
+                raw = _get_plain_text(prop).replace("%", "").replace(",", "").strip()
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    pass
+            return None
+
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
             "summary": find_prop(
@@ -949,6 +972,15 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
+            "day_change_pct": find_number(
+                "Day Change %",
+                "% Change",
+                "Change %",
+                "Price Change %",
+                "1D %",
+                "Daily Change %",
+                "Change",
+            ),
         }
 
         _ticker_cache[ticker] = {
@@ -2976,7 +3008,7 @@ async def show_watchlist(
             active = list_names[0] if list_names else "Default"
             _active_watchlist_name[user.id] = active
 
-        # Rows for active list only
+        # Rows for active list only (with priority)
         rows = []
         tickers_for_rns: list[str] = []
         for page in pages:
@@ -2990,7 +3022,23 @@ async def show_watchlist(
             url = ""
             if isinstance(gl, dict):
                 url = (gl.get("url") or "").strip()
-            rows.append((ticker, name, url or "-"))
+            pri = None
+            pr = props.get("Priority") or {}
+            if isinstance(pr, dict) and pr.get("number") is not None:
+                try:
+                    pri = int(pr["number"])
+                except (TypeError, ValueError):
+                    pri = None
+            page_id = page.get("id")
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "name": name,
+                    "url": url or "-",
+                    "priority": pri,
+                    "page_id": page_id,
+                }
+            )
             if ticker and ticker != "-":
                 tickers_for_rns.append(ticker)
 
@@ -3000,21 +3048,88 @@ async def show_watchlist(
         )
         rns_hits = len(rns_map)
 
+        # Day % change from UK AIM Micro-Cap (when property exists)
+        pct_map: dict[str, float | None] = {}
+        sort_mode = _watchlist_sort.get(user.id, "rns")
+        if sort_mode == "pct":
+            for t in tickers_for_rns:
+                try:
+                    data = await get_ticker_from_notion(t)
+                    pct_map[t] = (data or {}).get("day_change_pct")
+                except Exception:
+                    pct_map[t] = None
+
+        # Enrich + sort
+        for r in rows:
+            t = r["ticker"]
+            rns = rns_map.get(t) or {}
+            r["rns"] = rns
+            r["rns_date"] = rns.get("date") or ""
+            r["pct"] = pct_map.get(t)
+
+        def _sort_key(r):
+            if sort_mode == "priority":
+                # Higher priority first; unset last
+                p = r.get("priority")
+                return (0 if p is not None else 1, -(p or 0), r["ticker"])
+            if sort_mode == "pct":
+                v = r.get("pct")
+                return (0 if v is not None else 1, -(v or 0), r["ticker"])
+            if sort_mode == "name":
+                return ((r.get("name") or r["ticker"]).lower(),)
+            # default: latest RNS date desc
+            d = r.get("rns_date") or ""
+            return (0 if d else 1, d, r["ticker"])
+
+        if sort_mode == "rns":
+            rows.sort(key=_sort_key, reverse=True)
+        else:
+            rows.sort(key=_sort_key)
+
+        # Pagination — 3 tickers per page
+        total = len(rows)
+        page_size = WATCHLIST_PAGE_SIZE
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        page_idx = _watchlist_page.get(user.id, 0)
+        if page_idx >= total_pages:
+            page_idx = max(0, total_pages - 1)
+        if page_idx < 0:
+            page_idx = 0
+        _watchlist_page[user.id] = page_idx
+        start_i = page_idx * page_size
+        page_rows = rows[start_i : start_i + page_size]
+
+        sort_labels = {
+            "rns": "Latest RNS",
+            "pct": "% day change",
+            "priority": "Priority 1–10",
+            "name": "Name",
+        }
+        sort_label = sort_labels.get(sort_mode, sort_mode)
+
         lines = [
             f"👀 *My Watchlist*  ({len(list_names)}/{MAX_WATCHLISTS})",
-            f"Active: *{active}*",
-            f"RNS synced: {rns_hits}/{len(tickers_for_rns)} ticker(s)"
-            + (" · refreshed" if force_rns else ""),
+            f"Active: *{active}* · Sort: *{sort_label}*",
+            f"Page *{page_idx + 1}/{total_pages}* · {total} ticker(s)"
+            + (f" · RNS {rns_hits}/{len(tickers_for_rns)}" if tickers_for_rns else ""),
             "",
         ]
         if not rows:
             lines.append("Empty — use Edit list to add tickers.")
         else:
-            for ticker, name, url in rows:
-                lines.append(f"*{ticker}* · {name}")
+            for r in page_rows:
+                ticker, name, url = r["ticker"], r["name"], r["url"]
+                pri = r.get("priority")
+                pri_bit = f" · ⭐{pri}" if pri is not None else ""
+                pct = r.get("pct")
+                pct_bit = ""
+                if pct is not None:
+                    sign = "+" if pct >= 0 else ""
+                    pct_bit = f" · {sign}{pct:.2f}%"
+                lines.append(f"*{ticker}* · {name}{pri_bit}{pct_bit}")
                 if url and url != "-":
                     lines.append(f"  🔗 {url}")
-                rns = rns_map.get(ticker)
+                rns = r.get("rns") or {}
                 if rns:
                     date_bit = f" · {rns['date']}" if rns.get("date") else ""
                     lines.append(f"  📰 *Latest RNS*{date_bit}")
@@ -3030,6 +3145,46 @@ async def show_watchlist(
         keyboard = []
         # Tabs
         keyboard.extend(_tab_keyboard(list_names, active))
+        # Pagination
+        if total_pages > 1 or total > 0:
+            nav = []
+            if page_idx > 0:
+                nav.append(
+                    InlineKeyboardButton("◀️ Prev", callback_data="wl:page_prev")
+                )
+            nav.append(
+                InlineKeyboardButton(
+                    f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
+                )
+            )
+            if page_idx < total_pages - 1:
+                nav.append(
+                    InlineKeyboardButton("Next ▶️", callback_data="wl:page_next")
+                )
+            keyboard.append(nav)
+        # Sort
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
+                    callback_data="wl:sort_rns",
+                ),
+                InlineKeyboardButton(
+                    "% Day" + (" ✓" if sort_mode == "pct" else ""),
+                    callback_data="wl:sort_pct",
+                ),
+                InlineKeyboardButton(
+                    "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
+                    callback_data="wl:sort_priority",
+                ),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton("⭐ Set priority", callback_data="wl:set_priority"),
+                InlineKeyboardButton("🔄 Refresh RNS", callback_data="wl:refresh_rns"),
+            ]
+        )
         # Manage
         keyboard.append(
             [
@@ -3045,9 +3200,6 @@ async def show_watchlist(
         )
         keyboard.append(
             [
-                InlineKeyboardButton(
-                    "🔄 Refresh RNS", callback_data="wl:refresh_rns"
-                ),
                 InlineKeyboardButton("« Hub", callback_data="hub:home"),
             ]
         )
@@ -3146,12 +3298,59 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await show_watchlist(update, context, edit=True, force_rns=True)
         return
 
+    # Pagination
+    if action == "page_prev":
+        await query.answer()
+        _watchlist_page[user.id] = max(0, _watchlist_page.get(user.id, 0) - 1)
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "page_next":
+        await query.answer()
+        _watchlist_page[user.id] = _watchlist_page.get(user.id, 0) + 1
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+    if action == "page_noop":
+        await query.answer("Use ◀️ / ▶️ to change page")
+        return
+
+    # Sort modes
+    if action.startswith("sort_"):
+        mode = action.replace("sort_", "") or "rns"
+        if mode not in ("rns", "pct", "priority", "name"):
+            mode = "rns"
+        _watchlist_sort[user.id] = mode
+        _watchlist_page[user.id] = 0  # reset to first page
+        labels = {
+            "rns": "Latest RNS",
+            "pct": "% day change",
+            "priority": "Priority",
+            "name": "Name",
+        }
+        await query.answer(f"Sorted by {labels.get(mode, mode)}")
+        await show_watchlist(update, context, edit=True, force_rns=False)
+        return
+
+    if action == "set_priority":
+        await query.answer()
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "⭐ *Set priority (1–10)*\n\n"
+            "Send: `#TICKER 7`\n"
+            "Example: `#ALRT 9`\n\n"
+            "10 = highest priority. Clear with `#ALRT 0`.\n"
+            "_Input is removed after save._",
+            awaiting="set_priority",
+        )
+        return
+
     await query.answer()
 
     # --- Switch list tab (also reloads RNS for that list) ---
     if action.startswith("tab:"):
         tab_name = action[4:].strip() or "Default"
         _active_watchlist_name[user.id] = tab_name
+        _watchlist_page[user.id] = 0
         await show_watchlist(update, context, edit=True, force_rns=False)
         return
 
@@ -3505,6 +3704,47 @@ async def handle_watchlist_text(
                 context,
                 f"✅ Deleted list *{active}* ({n} items).",
             )
+            return
+
+        # ----- Set priority 1-10 -----
+        if action == "set_priority":
+            # Parse: #TICKER 7  or  TICKER 7
+            m = re.search(
+                r"(?:#)?([A-Za-z0-9]{1,6})\s+([0-9]{1,2})\b",
+                text,
+            )
+            if not m:
+                await update.message.reply_text(
+                    "Send like: `#ALRT 7` (1–10, or 0 to clear)",
+                    parse_mode="Markdown",
+                )
+                return
+            t = m.group(1).upper()
+            pri = int(m.group(2))
+            if pri < 0 or pri > 10:
+                await update.message.reply_text("Priority must be 0–10.")
+                return
+            results = await _watchlist_find_pages(user.id, t)
+            if not results:
+                await _watchlist_finish_action(
+                    update, context, f"⚠️ #{t} not on your watchlist."
+                )
+                return
+            props = {
+                "Priority": {"number": None if pri == 0 else pri}
+            }
+            for page in results:
+                if notion:
+                    notion.pages.update(page_id=page["id"], properties=props)
+            msg = (
+                f"✅ #{t} priority cleared."
+                if pri == 0
+                else f"✅ #{t} priority set to *{pri}*/10."
+            )
+            # Prefer priority sort after setting
+            _watchlist_sort[user.id] = "priority"
+            _watchlist_page[user.id] = 0
+            await _watchlist_finish_action(update, context, msg)
             return
 
         # ----- Delete ticker (supports multiple) -----
