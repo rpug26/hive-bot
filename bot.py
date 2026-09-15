@@ -223,6 +223,8 @@ _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
+# user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
+_watchlist_ui: dict[int, dict] = {}
 MAX_WATCHLISTS = 3
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
 _authorized_cache: dict = {
@@ -1635,6 +1637,202 @@ async def send_clean(
     return msg
 
 
+
+def _watchlist_nav_keyboard() -> list[list]:
+    """Consistent bottom nav for watchlist screens."""
+    return [
+        [
+            InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
+            InlineKeyboardButton("« Hub", callback_data="hub:home"),
+        ]
+    ]
+
+
+async def _remember_watchlist_panel(user_id: int, msg) -> None:
+    if not user_id or not msg:
+        return
+    try:
+        _watchlist_ui[user_id] = {
+            "chat_id": msg.chat_id,
+            "panel_msg_id": msg.message_id,
+        }
+    except Exception:
+        pass
+
+
+async def _delete_watchlist_prompt(context, user_id: int) -> None:
+    """Remove stored prompt message if any."""
+    ui = _watchlist_ui.get(user_id) or {}
+    pid = ui.get("prompt_msg_id")
+    chat_id = ui.get("chat_id")
+    if pid and chat_id and context and context.bot:
+        await safe_delete_message(context.bot, chat_id, pid)
+        ui.pop("prompt_msg_id", None)
+        _watchlist_ui[user_id] = ui
+
+
+async def _watchlist_show_prompt(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    awaiting: str,
+) -> None:
+    """
+    Show an input prompt by editing the current panel (clean), with Back.
+    Keeps main reply keyboard by sending a fleeting keyboard pulse.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    if not user:
+        return
+    _awaiting_watchlist[user.id] = awaiting
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("« Back to Watchlist", callback_data="hub:watchlist")],
+            *_watchlist_nav_keyboard(),
+        ]
+    )
+    msg = None
+    if query and query.message:
+        try:
+            msg = await query.message.edit_text(
+                text, parse_mode="Markdown", reply_markup=kb
+            )
+        except Exception:
+            try:
+                msg = await query.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                msg = await context.bot.send_message(
+                    query.message.chat_id, text, parse_mode="Markdown", reply_markup=kb
+                )
+    elif update.effective_chat:
+        msg = await context.bot.send_message(
+            update.effective_chat.id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    if msg:
+        await _remember_watchlist_panel(user.id, msg)
+    # Re-assert persistent bottom keyboard without leaving clutter
+    chat = update.effective_chat
+    if chat and context and context.bot:
+        try:
+            pulse = await context.bot.send_message(
+                chat.id,
+                "⋯",
+                reply_markup=main_reply_keyboard(),
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
+
+
+async def _watchlist_finish_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    summary: str,
+) -> None:
+    """
+    After add/edit/delete: wipe user input, show brief result, return to watchlist panel.
+    """
+    user = update.effective_user
+    if user:
+        await _delete_watchlist_prompt(context, user.id)
+    await cleanup_trigger_message(update, context)
+
+    chat = update.effective_chat
+    if not chat or not context or not context.bot:
+        return
+
+    # Short confirmation then auto-remove
+    try:
+        conf = await context.bot.send_message(
+            chat.id,
+            summary,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+
+        async def _later():
+            try:
+                await asyncio.sleep(2.5)
+                await safe_delete_message(context.bot, conf.chat_id, conf.message_id)
+            except Exception:
+                pass
+
+        asyncio.create_task(_later())
+    except Exception:
+        pass
+
+    # Rebuild clean watchlist view
+    class _Msg:
+        def __init__(self, chat_id, bot):
+            self.chat_id = chat_id
+            self._bot = bot
+            self.message_id = None
+
+        async def reply_text(self, *a, **k):
+            m = await self._bot.send_message(self.chat_id, *a, **k)
+            self.message_id = m.message_id
+            return m
+
+        async def edit_text(self, *a, **k):
+            ui = _watchlist_ui.get(user.id if user else 0) or {}
+            mid = ui.get("panel_msg_id")
+            if mid:
+                try:
+                    m = await self._bot.edit_message_text(
+                        chat_id=self.chat_id, message_id=mid, *a, **k
+                    )
+                    return m
+                except Exception:
+                    pass
+            return await self.reply_text(*a, **k)
+
+    class _Up:
+        def __init__(self, orig, msg):
+            self.effective_user = orig.effective_user
+            self.effective_chat = orig.effective_chat
+            self.message = msg
+            self.callback_query = None
+
+    proxy_msg = _Msg(chat.id, context.bot)
+    # Prefer edit existing panel
+    ui = _watchlist_ui.get(user.id) if user else None
+    if ui and ui.get("panel_msg_id"):
+        # Fake callback-style edit path
+        class _Q:
+            def __init__(self, chat_id, mid, bot, from_user):
+                self.message = type("M", (), {})()
+                self.message.chat_id = chat_id
+                self.message.message_id = mid
+                self.message.edit_text = lambda *a, **k: bot.edit_message_text(
+                    chat_id=chat_id, message_id=mid, *a, **k
+                )
+                self.from_user = from_user
+                self.data = "hub:watchlist"
+
+            async def answer(self, *a, **k):
+                return None
+
+        class _Up2:
+            def __init__(self, orig, q):
+                self.effective_user = orig.effective_user
+                self.effective_chat = orig.effective_chat
+                self.message = q.message
+                self.callback_query = q
+
+        # Use show_watchlist with edit via stored panel — simpler: always send fresh + delete old panel
+        old_mid = ui.get("panel_msg_id")
+        if old_mid:
+            await safe_delete_message(context.bot, chat.id, old_mid)
+        await show_watchlist(_Up(update, proxy_msg), context, edit=False, force_rns=False)
+    else:
+        await show_watchlist(_Up(update, proxy_msg), context, edit=False, force_rns=False)
+
+
 def _extract_telegram_link(props: dict) -> str:
     """Pull Telegram group URL from Notion properties (URL or text)."""
     # Prefer known property names (including trailing-space variant)
@@ -2850,7 +3048,7 @@ async def show_watchlist(
                 InlineKeyboardButton(
                     "🔄 Refresh RNS", callback_data="wl:refresh_rns"
                 ),
-                InlineKeyboardButton("Back to Hub", callback_data="hub:home"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
             ]
         )
 
@@ -2859,35 +3057,55 @@ async def show_watchlist(
         if len(text) > 3900:
             text = text[:3900] + "\n\n…truncated"
         markup = InlineKeyboardMarkup(keyboard)
+        sent = None
         if edit:
             try:
-                await msg.edit_text(
+                sent = await msg.edit_text(
                     text,
                     reply_markup=markup,
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
             except Exception:
-                # Markdown can fail on odd RNS characters — plain fallback
-                await msg.edit_text(
-                    text.replace("*", "").replace("_", ""),
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
+                try:
+                    sent = await msg.edit_text(
+                        text.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    sent = await context.bot.send_message(
+                        msg.chat_id,
+                        text.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
         else:
             try:
-                await msg.reply_text(
+                sent = await msg.reply_text(
                     text,
                     reply_markup=markup,
                     parse_mode="Markdown",
                     disable_web_page_preview=True,
                 )
             except Exception:
-                await msg.reply_text(
+                sent = await msg.reply_text(
                     text.replace("*", "").replace("_", ""),
                     reply_markup=markup,
                     disable_web_page_preview=True,
                 )
+        # Track panel for in-place navigation + keep bottom keyboard
+        if sent:
+            await _remember_watchlist_panel(user.id, sent)
+        elif edit and msg:
+            await _remember_watchlist_panel(user.id, msg)
+        try:
+            pulse = await context.bot.send_message(
+                msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+            )
+            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error("show_watchlist failed: %s", e)
@@ -2899,6 +3117,10 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     data = query.data or ""
 
     if data == "hub:watchlist":
+        # Cancel any pending watchlist input and return to clean panel
+        user = update.effective_user
+        if user:
+            _awaiting_watchlist.pop(user.id, None)
         await show_watchlist(update, context, edit=True, force_rns=False)
     elif data == "hub:mypicks":
         await show_my_stockpicks(update, context, edit=True)
@@ -2933,33 +3155,40 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await show_watchlist(update, context, edit=True, force_rns=False)
         return
 
-    # --- List-level actions ---
+    # --- List-level actions (edit in place, Back always available) ---
     if action == "create":
-        _awaiting_watchlist[user.id] = "create_list"
-        await query.message.reply_text(
+        await _watchlist_show_prompt(
+            update,
+            context,
             "🆕 *Create New Watchlist*\n\n"
             "Send a name for the list, e.g.\n"
-            "`UK AIM Growth`",
-            parse_mode="Markdown",
+            "`UK AIM Growth`\n\n"
+            "_Your message will be cleared after create._",
+            awaiting="create_list",
         )
         return
 
     if action == "rename":
-        _awaiting_watchlist[user.id] = "rename_list"
-        await query.message.reply_text(
-            "✏️ *Rename Watchlist*\n\n"
-            "Send: `Old Name | New Name`",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "✏️ *Rename active list*\n\n"
+            "Send the *new name* only.\n\n"
+            "_Your message will be cleared after rename._",
+            awaiting="rename_list",
         )
         return
 
     if action == "delete_list":
-        _awaiting_watchlist[user.id] = "delete_list"
-        await query.message.reply_text(
-            "🗑 *Delete Watchlist*\n\n"
-            "Send the list name to delete, e.g. `UK AIM Growth`\n"
-            "This removes **all tickers** in that list.",
-            parse_mode="Markdown",
+        active = _active_watchlist_name.get(user.id, "Default")
+        await _watchlist_show_prompt(
+            update,
+            context,
+            f"🗑 *Delete list* `{active}`\n\n"
+            "This removes **all tickers** in that list.\n"
+            "Send `YES` to confirm, or tap « Back to cancel.\n\n"
+            "_Your message will be cleared after._",
+            awaiting="delete_list",
         )
         return
 
@@ -2973,51 +3202,217 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 InlineKeyboardButton("🗑 Delete ticker", callback_data="wl:delete"),
             ],
             [
-                InlineKeyboardButton("👀 My Watchlist", callback_data="hub:watchlist"),
-                InlineKeyboardButton("« Back to Hub", callback_data="hub:home"),
+                InlineKeyboardButton("« Back to Watchlist", callback_data="hub:watchlist"),
             ],
+            *_watchlist_nav_keyboard(),
         ]
-        await query.edit_message_text(
-            "✏️ *Edit Watchlist*\n\nChoose what to change:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        try:
+            await query.message.edit_text(
+                "✏️ *Edit Watchlist*\n\nChoose an action:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            await _remember_watchlist_panel(user.id, query.message)
+        except Exception:
+            await query.message.reply_text(
+                "✏️ *Edit Watchlist*\n\nChoose an action:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         return
 
     # --- Ticker-level actions ---
     if action not in ("add", "change", "delete"):
         return
 
-    _awaiting_watchlist[user.id] = action
-
     if action == "add":
-        await query.message.reply_text(
-            "➕ *Add ticker*\n\n"
-            "Send one line:\n"
-            "`#TICKER | Company Name | https://t.me/+invite`\n\n"
-            "Example:\n"
-            "`#ALRT | Defence Holdings | https://t.me/+abc123`",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "➕ *Add ticker(s)*\n\n"
+            "Send one or many (saved to Notion):\n\n"
+            "`#ALRT | Name | https://t.me/+…`\n"
+            "or bulk: `#AAA #BBB #CCC`\n\n"
+            "_Input is removed after save._",
+            awaiting="add",
         )
     elif action == "change":
-        await query.message.reply_text(
+        await _watchlist_show_prompt(
+            update,
+            context,
             "✏️ *Change ticker*\n\n"
             "Send:\n"
-            "`#TICKER | New Name | https://t.me/+newlink`",
-            parse_mode="Markdown",
+            "`#TICKER | New Name | https://t.me/+…`\n\n"
+            "_Input is removed after update._",
+            awaiting="change",
         )
     else:
-        await query.message.reply_text(
-            "🗑 *Delete ticker*\n\nSend the ticker only, e.g. `#ALRT`",
-            parse_mode="Markdown",
+        await _watchlist_show_prompt(
+            update,
+            context,
+            "🗑 *Delete ticker*\n\n"
+            "Send ticker(s), e.g. `#ALRT` or `#AAA #BBB`\n\n"
+            "_Input is removed after delete._",
+            awaiting="delete",
         )
+
+
+async def _watchlist_find_pages(
+    user_id: int, ticker: str, *, list_name: str | None = None
+) -> list[dict]:
+    """Find watchlist rows for user + ticker (optional list filter)."""
+    db_id = NOTION_WATCHLIST_DB_ID
+    ds_id = NOTION_WATCHLIST_DATA_SOURCE_ID
+    t = (ticker or "").lstrip("#").upper().strip()
+    filters: list[dict] = [
+        {
+            "property": "Telegram User ID",
+            "rich_text": {"equals": str(user_id)},
+        },
+        {"property": "Ticker", "title": {"equals": t}},
+    ]
+    if list_name:
+        filters.append(
+            {
+                "property": "List Name",
+                "rich_text": {"equals": list_name},
+            }
+        )
+    response = notion_query_data_source(
+        data_source_id=ds_id,
+        database_id=db_id,
+        filter={"and": filters},
+        page_size=20,
+    )
+    return response.get("results", [])
+
+
+async def _watchlist_upsert_ticker(
+    user,
+    *,
+    ticker: str,
+    name: str = "",
+    link: str = "",
+    list_name: str = "Default",
+) -> tuple[str, str]:
+    """
+    Create or update one ticker row in Hive Bot Watchlist.
+    Returns (status, message) where status is 'added' | 'updated' | 'error'.
+    """
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t:
+        return "error", "Missing ticker"
+    list_name = (list_name or "Default")[:100]
+    display_name = (name or t)[:200]
+    link = (link or "").strip()
+    if link.startswith("t.me/"):
+        link = "https://" + link
+
+    try:
+        existing = await _watchlist_find_pages(
+            user.id, t, list_name=list_name
+        )
+        props: dict = {
+            "Name": {
+                "rich_text": [{"text": {"content": display_name}}]
+            },
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+            "List Name": {
+                "rich_text": [{"text": {"content": list_name}}]
+            },
+        }
+        if user.username:
+            props["Username"] = {
+                "rich_text": [{"text": {"content": user.username[:100]}}]
+            }
+        if link.startswith("http"):
+            props["Group Link"] = {"url": link}
+
+        if existing:
+            page_id = existing[0]["id"]
+            if notion:
+                notion.pages.update(page_id=page_id, properties=props)
+            else:
+                _notion_http(
+                    "PATCH", f"pages/{page_id}", {"properties": props}
+                )
+            return "updated", t
+
+        create_props = {
+            "Ticker": {"title": [{"text": {"content": t}}]},
+            **props,
+        }
+        notion_create_page_in_data_source(
+            properties=create_props,
+            data_source_id=NOTION_WATCHLIST_DATA_SOURCE_ID,
+            database_id=NOTION_WATCHLIST_DB_ID,
+        )
+        return "added", t
+    except Exception as e:
+        logger.error("watchlist upsert failed %s: %s", t, e)
+        return "error", str(e)[:120]
+
+
+def _parse_watchlist_add_lines(text: str) -> list[tuple[str, str, str]]:
+    """
+    Parse one or many tickers from user text.
+    Supports:
+      #ALRT | Company | https://t.me/+x
+      #ALRT
+      #A #B #C
+      multiline mixes of the above
+    Returns list of (ticker, name, link).
+    """
+    items: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for raw_line in (text or "").splitlines() or [text]:
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            ticks = extract_hashtag_tickers(parts[0])
+            # Also accept bare ticker without #
+            if not ticks:
+                bare = parts[0].lstrip("#").upper().strip()
+                if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                    ticks = [bare]
+            if not ticks:
+                continue
+            name = parts[1] if len(parts) > 1 else ""
+            link = parts[2] if len(parts) > 2 else ""
+            for t in ticks:
+                tu = t.upper()
+                if tu in seen:
+                    continue
+                seen.add(tu)
+                items.append((tu, name, link))
+        else:
+            ticks = extract_hashtag_tickers(line)
+            if not ticks:
+                # space-separated bare tickers
+                for tok in re.split(r"[\s,;]+", line):
+                    bare = tok.lstrip("#").upper().strip()
+                    if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                        ticks.append(bare)
+            for t in ticks:
+                tu = t.upper()
+                if tu in seen:
+                    continue
+                seen.add(tu)
+                items.append((tu, "", ""))
+    return items
+
 
 async def handle_watchlist_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str
 ) -> None:
     user = update.effective_user
     db_id = NOTION_WATCHLIST_DB_ID or (os.getenv("NOTION_WATCHLIST_DB_ID") or "").strip()
-    if not (notion or NOTION_TOKEN) or not db_id or not user:
+    ds_id = NOTION_WATCHLIST_DATA_SOURCE_ID
+    if not (notion or NOTION_TOKEN) or (not db_id and not ds_id) or not user:
         await update.message.reply_text("Watchlist is not available right now.")
         return
 
@@ -3045,16 +3440,10 @@ async def handle_watchlist_text(
                 )
                 return
             _active_watchlist_name[user.id] = list_name
-            keyboard = [
-                [
-                    InlineKeyboardButton("Add ticker", callback_data="wl:add"),
-                    InlineKeyboardButton("My Watchlist", callback_data="hub:watchlist"),
-                ],
-                [InlineKeyboardButton("Back to Hub", callback_data="hub:home")],
-            ]
-            await update.message.reply_text(
-                f"List set to: {list_name}\n\nNext: add your first ticker.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ List *{list_name}* ready — use Edit list to add tickers.",
             )
             return
 
@@ -3072,25 +3461,32 @@ async def handle_watchlist_text(
                 ln = _get_plain_text(props.get("List Name")).strip() or "Default"
                 if ln != old:
                     continue
-                notion.pages.update(
-                    page_id=page["id"],
-                    properties={
-                        "List Name": {
-                            "rich_text": [{"text": {"content": new_name[:100]}}]
-                        }
-                    },
-                )
+                if notion:
+                    notion.pages.update(
+                        page_id=page["id"],
+                        properties={
+                            "List Name": {
+                                "rich_text": [
+                                    {"text": {"content": new_name[:100]}}
+                                ]
+                            }
+                        },
+                    )
                 n += 1
             _active_watchlist_name[user.id] = new_name
-            await update.message.reply_text(
-                f"Renamed '{old}' to '{new_name}' ({n} items)."
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ Renamed *{old}* → *{new_name}* ({n} items).",
             )
             return
 
         # ----- Delete list -----
         if action == "delete_list":
             if text.upper() != "YES":
-                await update.message.reply_text("Cancelled. Send YES to confirm.")
+                await update.message.reply_text(
+                    "To confirm delete, send: YES"
+                )
                 return
             active = _active_watchlist_name.get(user.id, "Default")
             pages = await _fetch_user_watchlist_pages(user.id)
@@ -3100,70 +3496,94 @@ async def handle_watchlist_text(
                 ln = _get_plain_text(props.get("List Name")).strip() or "Default"
                 if ln != active:
                     continue
-                notion.pages.update(page_id=page["id"], archived=True)
+                if notion:
+                    notion.pages.update(page_id=page["id"], archived=True)
                 n += 1
             _active_watchlist_name.pop(user.id, None)
-            await update.message.reply_text(
-                f"Deleted list '{active}' ({n} items)."
+            await _watchlist_finish_action(
+                update,
+                context,
+                f"✅ Deleted list *{active}* ({n} items).",
             )
             return
 
-        # ----- Delete ticker -----
+        # ----- Delete ticker (supports multiple) -----
         if action == "delete":
-            if not ticker:
-                await update.message.reply_text("Send a ticker like #ALRT")
+            to_delete = [t.upper() for t in tickers]
+            if not to_delete:
+                bare = text.lstrip("#").upper().strip()
+                if re.fullmatch(r"[A-Z0-9]{1,6}", bare or ""):
+                    to_delete = [bare]
+            if not to_delete:
+                await update.message.reply_text(
+                    "Send ticker(s) like `#ALRT` or `#AAA #BBB`"
+                )
                 return
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "and": [
-                        {
-                            "property": "Telegram User ID",
-                            "rich_text": {"equals": str(user.id)},
-                        },
-                        {"property": "Ticker", "title": {"equals": ticker}},
-                    ]
-                },
-                page_size=5,
+            removed = []
+            missing = []
+            for t in to_delete:
+                results = await _watchlist_find_pages(user.id, t)
+                if not results:
+                    missing.append(t)
+                    continue
+                for page in results:
+                    if notion:
+                        notion.pages.update(page_id=page["id"], archived=True)
+                removed.append(t)
+            bits = []
+            if removed:
+                bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+            if missing:
+                bits.append("Not found: " + ", ".join(f"#{x}" for x in missing))
+            await _watchlist_finish_action(
+                update, context, "\n".join(bits) or "Nothing changed."
             )
-            results = response.get("results", [])
-            if not results:
-                await update.message.reply_text(f"No item #{ticker} found.")
-                return
-            for page in results:
-                notion.pages.update(page_id=page["id"], archived=True)
-            await update.message.reply_text(f"Removed #{ticker}.")
             return
 
-        # ----- Add ticker -----
+        # ----- Add ticker(s) — bulk-safe, multi-source Notion write -----
         if action == "add":
-            if not ticker:
+            items = _parse_watchlist_add_lines(text)
+            if not items:
                 await update.message.reply_text(
-                    "Include a ticker, e.g. #ALRT | Name | https://t.me/+..."
+                    "Include ticker(s), e.g.\n"
+                    "`#ALRT | Company | https://t.me/+…`\n"
+                    "or several: `#AAA #BBB #CCC`",
+                    parse_mode="Markdown",
                 )
                 return
             list_name = _active_watchlist_name.get(user.id, "Default")
-            props = {
-                "Ticker": {"title": [{"text": {"content": ticker}}]},
-                "Name": {
-                    "rich_text": [{"text": {"content": (name or ticker)[:200]}}]
-                },
-                "Telegram User ID": {
-                    "rich_text": [{"text": {"content": str(user.id)}}]
-                },
-                "List Name": {
-                    "rich_text": [{"text": {"content": list_name[:100]}}]
-                },
-            }
-            if link.startswith("http"):
-                props["Group Link"] = {"url": link}
-            if user.username:
-                props["Username"] = {
-                    "rich_text": [{"text": {"content": user.username}}]
-                }
-            notion.pages.create(parent={"database_id": db_id}, properties=props)
-            await update.message.reply_text(
-                f"Added #{ticker} to list: {list_name}"
+            added, updated, errors = [], [], []
+            for t, n, lnk in items:
+                status, info = await _watchlist_upsert_ticker(
+                    user,
+                    ticker=t,
+                    name=n,
+                    link=lnk,
+                    list_name=list_name,
+                )
+                if status == "added":
+                    added.append(t)
+                elif status == "updated":
+                    updated.append(t)
+                else:
+                    errors.append(f"{t}: {info}")
+
+            lines = [f"List: *{list_name}*"]
+            if added:
+                lines.append(
+                    f"✅ Added ({len(added)}): "
+                    + ", ".join(f"#{x}" for x in added)
+                )
+            if updated:
+                lines.append(
+                    f"♻️ Updated ({len(updated)}): "
+                    + ", ".join(f"#{x}" for x in updated)
+                )
+            if errors:
+                lines.append("⚠️ Errors:\n" + "\n".join(errors[:8]))
+            lines.append("\nOpen 👀 My Watchlist or tap Refresh RNS to view.")
+            await _watchlist_finish_action(
+                update, context, "\n".join(lines)
             )
             return
 
@@ -3171,36 +3591,25 @@ async def handle_watchlist_text(
         if action == "change":
             if not ticker:
                 await update.message.reply_text(
-                    "Include a ticker, e.g. #ALRT | New Name | https://t.me/+..."
+                    "Include a ticker, e.g. `#ALRT | New Name | https://t.me/+…`",
+                    parse_mode="Markdown",
                 )
                 return
-            response = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "and": [
-                        {
-                            "property": "Telegram User ID",
-                            "rich_text": {"equals": str(user.id)},
-                        },
-                        {"property": "Ticker", "title": {"equals": ticker}},
-                    ]
-                },
-                page_size=1,
+            list_name = _active_watchlist_name.get(user.id, "Default")
+            status, info = await _watchlist_upsert_ticker(
+                user,
+                ticker=ticker,
+                name=name,
+                link=link,
+                list_name=list_name,
             )
-            results = response.get("results", [])
-            if not results:
-                await update.message.reply_text(f"No item #{ticker} found.")
-                return
-            props = {}
-            if name:
-                props["Name"] = {
-                    "rich_text": [{"text": {"content": name[:200]}}]
-                }
-            if link.startswith("http"):
-                props["Group Link"] = {"url": link}
-            if props:
-                notion.pages.update(page_id=results[0]["id"], properties=props)
-            await update.message.reply_text(f"Updated #{ticker}.")
+            if status == "error":
+                summary = f"⚠️ Could not update #{ticker}: {info}"
+            elif status == "updated":
+                summary = f"✅ Updated #{ticker}."
+            else:
+                summary = f"✅ #{ticker} added to *{list_name}*."
+            await _watchlist_finish_action(update, context, summary)
             return
 
         await update.message.reply_text(
