@@ -1679,7 +1679,7 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    Home navigation – always-on persistent reply keyboard.
+    Home navigation – always-on persistent reply keyboard (7 items).
     Stays visible after /start and after every menu selection.
     """
     return ReplyKeyboardMarkup(
@@ -1694,7 +1694,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton("📋 Menu"),
-                KeyboardButton("✨ What's new?"),
+                KeyboardButton("🏆 Stock of the Day"),
             ],
             [
                 KeyboardButton("🙈 Hide"),
@@ -1779,7 +1779,10 @@ def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
 
 
 def hub_home_keyboard() -> InlineKeyboardMarkup:
-    """Inline shortcut row pointing back at Home features."""
+    """
+    Lightweight inline mirror of Home (optional).
+    Prefer main_reply_keyboard() for the real 7-button Home bar.
+    """
     return InlineKeyboardMarkup(
         [
             [
@@ -1792,13 +1795,16 @@ def hub_home_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "📊 Stock Snapshot", callback_data="cmd:snap"
+                    "📊 Snapshot", callback_data="cmd:snap"
                 ),
                 InlineKeyboardButton(
-                    "🔗 Group Links", callback_data="cmd:link"
+                    "🏆 Stock of Day", callback_data="cmd:sotd"
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    "🔗 Links", callback_data="cmd:link"
+                ),
                 InlineKeyboardButton("📋 Menu", callback_data="cmd:menu"),
             ],
         ]
@@ -2595,21 +2601,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await stock_snapshot_prompt(update, context)
         return
 
-    # What's new?
+    # Stock of the Day (replaces What's new?)
     if text in (
+        "🏆 Stock of the Day",
+        "Stock of the Day",
+        "Stock of Day",
         "✨ What's new?",
         "What's new?",
-        "Whats new?",
-        "What's new",
-        "Whats new",
     ) or lower in (
+        "stock of the day",
+        "🏆 stock of the day",
+        "stock of day",
         "what's new?",
         "whats new?",
-        "what's new",
-        "whats new",
-        "✨ what's new?",
     ):
-        await whats_new_cmd(update, context)
+        await cleanup_trigger_message(update, context)
+        await stock_of_the_day_cmd(update, context)
         return
 
     # Match Link button even if emoji/spacing differs
@@ -2914,7 +2921,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• 📌 My Stockpick\n"
             "• 📊 Stock Snapshot\n"
             "• 🔗 Group Links\n"
-            "• 📋 Menu · ✨ What's new?\n\n"
+            "• 📋 Menu\n"
+            "• 🏆 Stock of the Day\n"
+            "• 🙈 Hide\n\n"
             "In the group: `@Bot #KEFI summary` or `#stockpick …`"
         )
     else:
@@ -2981,35 +2990,173 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lightweight changelog for the What's new? Home button."""
-    text = (
-        "✨ *What's new*\n\n"
-        "• 📊 *Stock Snapshot* – look up any AIM ticker from the Home keyboard\n"
-        "• 👀 *My Watchlist* – % on day, RNS, sort, and 📌 month stockpick badge\n"
-        "• Sleeker watchlist keyboard (Sort ▾ · Manage ▾)\n"
-        "• Snapshot → Save to Watchlist + « Hub\n"
-        "• Persistent Home keyboard stays available while you navigate\n\n"
-        "_Not financial advice. DYOR._"
-    )
-    await cleanup_trigger_message(update, context)
+async def _load_microcap_tickers(limit: int = 80) -> list[tuple[str, str]]:
+    """
+    Return [(ticker, company), ...] from UK AIM Micro-Cap.
+    Used by Stock of the Day ranking.
+    """
+    out: list[tuple[str, str]] = []
+    if not notion:
+        return out
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
+    if not db_id:
+        return out
+    try:
+        cursor = None
+        while len(out) < limit:
+            kwargs = {"database_id": db_id, "page_size": min(50, limit - len(out))}
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            resp = notion.databases.query(**kwargs)
+            for page in resp.get("results", []):
+                props = page.get("properties") or {}
+                t = (
+                    _get_plain_text(props.get("Ticker"))
+                    or _get_plain_text(props.get("Name"))
+                    or ""
+                ).lstrip("#").upper().strip()
+                if not t or not re.fullmatch(r"[A-Z0-9]{1,6}", t):
+                    continue
+                company = (
+                    _get_plain_text(props.get("Company"))
+                    or _get_plain_text(props.get("Company Name"))
+                    or _get_plain_text(props.get("Name"))
+                    or t
+                )
+                out.append((t, company))
+                if len(out) >= limit:
+                    break
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+            if not cursor:
+                break
+    except Exception as e:
+        logger.error("_load_microcap_tickers failed: %s", e)
+    # de-dupe preserve order
+    seen = set()
+    uniq = []
+    for t, c in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append((t, c))
+    return uniq
+
+
+async def stock_of_the_day_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Rank UK AIM Micro-Cap names by live day % and show top movers
+    with Save to Watchlist + Hub actions.
+    """
+    user = update.effective_user
     msg = update.effective_message
     if not msg:
         return
-    await msg.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
-        ),
-    )
-    try:
-        pulse = await context.bot.send_message(
-            msg.chat_id, "⋯", reply_markup=main_reply_keyboard()
+    if not await is_authorized(update, context):
+        await msg.reply_text(
+            "🔒 Only authorised members can use Stock of the Day.\n"
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
         )
-        await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
-    except Exception:
-        pass
+        return
+
+    await cleanup_trigger_message(update, context)
+    status = await msg.reply_text(
+        "🏆 Scanning UK AIM Micro-Cap for today’s top movers…",
+        reply_markup=main_reply_keyboard(),
+    )
+
+    try:
+        pairs = await _load_microcap_tickers(limit=60)
+        ranked: list[tuple[str, str, float]] = []
+        for t, company in pairs:
+            pct = _fetch_pct_on_day_live(t)
+            if pct is None:
+                continue
+            ranked.append((t, company, float(pct)))
+            await asyncio.sleep(0.08)
+        ranked.sort(key=lambda x: x[2], reverse=True)
+        top = ranked[:5]
+
+        if not top:
+            try:
+                await status.edit_text(
+                    "🏆 *Stock of the Day*\n\n"
+                    "Could not load live % changes right now. Try again shortly.",
+                    parse_mode="Markdown",
+                    reply_markup=hub_back_keyboard(),
+                )
+            except Exception:
+                await msg.reply_text(
+                    "Could not load Stock of the Day right now.",
+                    reply_markup=main_reply_keyboard(),
+                )
+            return
+
+        # Header board
+        lines = [
+            "🏆 *Stock of the Day*",
+            "_Top movers by session % change (UK AIM Micro-Cap)_",
+            "",
+        ]
+        for i, (t, company, pct) in enumerate(top, 1):
+            sign = "+" if pct >= 0 else ""
+            arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+            lines.append(f"{i}. *#{t}* {company}")
+            lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
+        lines.append("")
+        lines.append("_Tap a ticker below for the full snapshot._")
+        lines.append("_Not financial advice. DYOR._")
+
+        kb_rows = []
+        for t, company, pct in top:
+            sign = "+" if pct >= 0 else ""
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"#{t}  {sign}{pct:.2f}%",
+                        callback_data=f"sotd:snap:{t[:20]}",
+                    )
+                ]
+            )
+        kb_rows.append(
+            [InlineKeyboardButton("« Hub", callback_data="hub:home")]
+        )
+        body = "\n".join(lines)
+        try:
+            await status.edit_text(
+                body,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_rows),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await msg.reply_text(
+                body.replace("*", ""),
+                reply_markup=InlineKeyboardMarkup(kb_rows),
+                disable_web_page_preview=True,
+            )
+        await ensure_home_keyboard(context.bot, msg.chat_id)
+    except Exception as e:
+        logger.error("stock_of_the_day_cmd failed: %s", e)
+        try:
+            await status.edit_text(
+                f"Stock of the Day failed: {e}",
+                reply_markup=hub_back_keyboard(),
+            )
+        except Exception:
+            await msg.reply_text(
+                f"Stock of the Day failed: {e}",
+                reply_markup=main_reply_keyboard(),
+            )
+
+
+async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Back-compat alias → Stock of the Day."""
+    await stock_of_the_day_cmd(update, context)
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3063,7 +3210,9 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data == "link":
         await link_cmd(_proxy_update(), context)
     elif data == "whatsnew":
-        await whats_new_cmd(_proxy_update(), context)
+        await stock_of_the_day_cmd(_proxy_update(), context)
+    elif data == "sotd":
+        await stock_of_the_day_cmd(_proxy_update(), context)
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -3882,6 +4031,65 @@ async def show_watchlist(
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
+async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stock of the Day → open snapshot in place with Save + Hub."""
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not query or not user:
+        return
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("sotd:snap:"):
+        return
+    ticker = data.replace("sotd:snap:", "", 1).strip().upper()
+    if not ticker:
+        return
+    # Reuse snapshot delivery into this chat; keep Home keyboard
+    try:
+        meta = await get_ticker_from_notion(ticker)
+        if not meta:
+            await query.edit_message_text(
+                f"No snapshot for #{ticker} in UK AIM Micro-Cap.",
+                reply_markup=hub_back_keyboard(),
+            )
+            return
+        try:
+            stockpickers = await get_stockpickers_for_ticker(ticker)
+        except Exception:
+            stockpickers = []
+        body = format_reply(ticker, meta, stockpickers)
+        pct = meta.get("day_change_pct")
+        if pct is None:
+            pct = _fetch_pct_on_day_live(ticker)
+        if pct is not None:
+            sign = "+" if pct >= 0 else ""
+            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
+        try:
+            await query.edit_message_text(
+                body,
+                parse_mode="Markdown",
+                reply_markup=snapshot_action_keyboard(ticker),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await query.edit_message_text(
+                body.replace("*", "").replace("_", ""),
+                reply_markup=snapshot_action_keyboard(ticker),
+                disable_web_page_preview=True,
+            )
+        await ensure_home_keyboard(
+            context.bot, query.message.chat_id if query.message else None
+        )
+    except Exception as e:
+        logger.error("sotd:snap failed for %s: %s", ticker, e)
+        try:
+            await query.edit_message_text(
+                f"Snapshot failed: {e}", reply_markup=hub_back_keyboard()
+            )
+        except Exception:
+            pass
+
+
 async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle snap:save:TICKER from Stock Snapshot inline actions."""
     query = update.callback_query
@@ -3981,7 +4189,7 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "hub:mypicks":
         await show_my_stockpicks(update, context, edit=True)
     elif data == "hub:home":
-        # Return to Home – restore message + persistent Home keyboard
+        # Return to Home – full 7-button reply keyboard (not a partial inline set)
         if user:
             _awaiting_snapshot.pop(user.id, None)
             _awaiting_watchlist.pop(user.id, None)
@@ -3993,28 +4201,30 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "• 📌 My Stockpick\n"
             "• 📊 Stock Snapshot\n"
             "• 🔗 Group Links\n"
-            "• 📋 Menu · ✨ What's new?\n"
+            "• 📋 Menu\n"
+            "• 🏆 Stock of the Day\n"
             "• 🙈 Hide"
         )
+        chat_id = query.message.chat_id if query.message else None
+        # Prefer a fresh message with the REAL reply keyboard attached
+        # (edit_message cannot set ReplyKeyboardMarkup – that was the 4-menu bug)
         try:
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=hub_home_keyboard(),
-            )
+            await query.message.delete()
         except Exception:
             try:
-                await query.message.reply_text(
-                    text,
-                    parse_mode="Markdown",
-                    reply_markup=hub_home_keyboard(),
-                )
+                await query.edit_message_text("🏠 Returning to Home…")
             except Exception:
                 pass
-        # Always re-assert the persistent Home reply keyboard
-        await ensure_home_keyboard(
-            context.bot, query.message.chat_id if query.message else None
-        )
+        if chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=main_reply_keyboard(),
+                )
+            except Exception:
+                await ensure_home_keyboard(context.bot, chat_id)
         return
 
 
@@ -5609,6 +5819,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
+    app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
