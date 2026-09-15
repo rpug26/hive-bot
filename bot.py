@@ -1737,32 +1737,56 @@ def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
 async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
     """
     Re-assert the persistent Home reply keyboard.
-    Telegram only applies ReplyKeyboardMarkup when a message is sent with it.
-    We keep a short delay before deleting the pulse so clients lock the keyboard in.
+
+    Never delete the message that carries ReplyKeyboardMarkup — many Telegram
+    clients drop the keyboard when that message is removed.
     """
     if not bot or chat_id is None:
         return
     try:
-        pulse = await bot.send_message(
+        await bot.send_message(
             chat_id,
-            "🏠",
+            "🏠 Home",
             reply_markup=main_reply_keyboard(),
         )
-        # Give the client time to attach the keyboard before removing the pulse
-        async def _delayed_clear():
-            try:
-                await asyncio.sleep(1.2)
-                await safe_delete_message(bot, pulse.chat_id, pulse.message_id)
-            except Exception:
-                pass
-
-        try:
-            asyncio.create_task(_delayed_clear())
-        except Exception:
-            # Fallback: leave the 🏠 anchor if task scheduling fails
-            pass
     except Exception as e:
         logger.debug("ensure_home_keyboard failed: %s", e)
+
+
+async def send_home_menu(bot, chat_id: int | None) -> None:
+    """
+    Land on Home with the full 7-button reply keyboard.
+    Message is kept on purpose so the keyboard stays visible.
+    """
+    if not bot or chat_id is None:
+        return
+    text = (
+        "🏠 *Home*\n\n"
+        "• 👀 My Watchlist\n"
+        "• 📌 My Stockpick\n"
+        "• 📊 Stock Snapshot\n"
+        "• 🔗 Group Links\n"
+        "• 📋 Menu\n"
+        "• 🏆 Stock of the Day\n"
+        "• 🙈 Hide"
+    )
+    try:
+        await bot.send_message(
+            chat_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+    except Exception as e:
+        logger.error("send_home_menu failed: %s", e)
+        try:
+            await bot.send_message(
+                chat_id,
+                "Home",
+                reply_markup=main_reply_keyboard(),
+            )
+        except Exception:
+            pass
 
 
 def menu_inline_keyboard() -> InlineKeyboardMarkup:
@@ -4615,17 +4639,10 @@ async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 ]
             ),
         )
-        try:
-            pulse = await context.bot.send_message(
-                query.message.chat_id,
-                "⋯",
-                reply_markup=main_reply_keyboard(),
-            )
-            await safe_delete_message(
-                context.bot, pulse.chat_id, pulse.message_id
-            )
-        except Exception:
-            pass
+        await ensure_home_keyboard(
+            context.bot,
+            query.message.chat_id if query.message else None,
+        )
     except Exception as e:
         logger.error("snap:save failed for %s: %s", ticker, e)
         await query.message.reply_text(
@@ -4650,7 +4667,7 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "hub:mypicks":
         await show_stockpick_hub(update, context, edit=True)
     elif data == "hub:home":
-        # Wipe panel text + hard-restore full 7-button Home keyboard
+        # Wipe previous panel, then land on Home with keyboard that STAYS
         if user:
             _awaiting_snapshot.pop(user.id, None)
             _awaiting_watchlist.pop(user.id, None)
@@ -4658,6 +4675,7 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             _awaiting_field.pop(user.id, None)
             await clear_nav_panel(context.bot, user.id)
         chat_id = query.message.chat_id if query.message else None
+        # Remove the inline panel (snapshot / sotd / stockpick / etc.)
         try:
             await query.message.delete()
         except Exception:
@@ -4665,30 +4683,9 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await query.edit_message_text("…")
             except Exception:
                 pass
-        # Send keyboard on a real message (not only a deleted pulse)
-        if chat_id and context.bot:
-            try:
-                anchor = await context.bot.send_message(
-                    chat_id,
-                    "🏠",
-                    reply_markup=main_reply_keyboard(),
-                )
-                # Keep keyboard; clear the tiny anchor after clients attach it
-                async def _clear_anchor():
-                    try:
-                        await asyncio.sleep(1.5)
-                        await safe_delete_message(
-                            context.bot, anchor.chat_id, anchor.message_id
-                        )
-                    except Exception:
-                        pass
-
-                try:
-                    asyncio.create_task(_clear_anchor())
-                except Exception:
-                    pass
-            except Exception:
-                await ensure_home_keyboard(context.bot, chat_id)
+        # Must send a non-deleted message with ReplyKeyboardMarkup
+        # or Telegram clients drop the Home menu entirely
+        await send_home_menu(context.bot, chat_id)
         return
 
 
