@@ -1318,7 +1318,12 @@ MAX_WATCHLISTS = 3
 def _fetch_pct_on_day_live(ticker: str) -> float | None:
     """
     Live day % change for AIM/LSE ticker via Yahoo Finance (TICKER.L).
-    Returns percent points e.g. 1.25 meaning +1.25%, or None.
+    Returns percent points e.g. 13.70 meaning +13.70%, or None.
+
+    Source priority (validated vs LSE prints):
+      1) meta.regularMarketChangePercent  (official session % — most reliable)
+      2) last two daily closes from the chart series
+      3) price / previousClose (NOT chartPreviousClose — that can lag and inflate %)
     """
     if not ticker:
         return None
@@ -1344,27 +1349,119 @@ def _fetch_pct_on_day_live(ticker: str) -> float | None:
         if not result:
             return None
         meta = result[0].get("meta") or {}
-        # Prefer price vs previous close (Yahoo % field is often stale/zero)
-        price = meta.get("regularMarketPrice")
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-        if price is not None and prev:
-            try:
-                return round((float(price) / float(prev) - 1.0) * 100.0, 2)
-            except (TypeError, ValueError, ZeroDivisionError):
-                pass
+
+        # 1) Official session day-change % (e.g. EPP → 13.70, not 17.73)
         if meta.get("regularMarketChangePercent") is not None:
-            return round(float(meta["regularMarketChangePercent"]), 2)
-        # Fallback from last two daily closes
+            try:
+                return round(float(meta["regularMarketChangePercent"]), 2)
+            except (TypeError, ValueError):
+                pass
+
+        # 2) Last two daily closes on the chart
         closes = (
             ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close")
             or []
         )
         closes = [c for c in closes if c is not None]
         if len(closes) >= 2 and closes[-2]:
-            return round((float(closes[-1]) / float(closes[-2]) - 1.0) * 100.0, 2)
+            try:
+                return round(
+                    (float(closes[-1]) / float(closes[-2]) - 1.0) * 100.0, 2
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+        # 3) Price vs previousClose only (skip chartPreviousClose — often wrong)
+        price = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose")
+        if price is not None and prev:
+            try:
+                return round((float(price) / float(prev) - 1.0) * 100.0, 2)
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
     except Exception as e:
         logger.warning("live %% on day failed for %s: %s", ticker, e)
     return None
+
+
+async def _user_stockpick_tickers_this_month(user) -> set[str]:
+    """
+    Tickers this Telegram user has as a #stockpick in Hive Stock Picks
+    for the current calendar month. Used to badge My Watchlist rows.
+    """
+    out: set[str] = set()
+    if not notion or not user:
+        return out
+    db_id = (
+        os.getenv("NOTION_STOCKPICKS_DB_ID")
+        or os.getenv("NOTION_DATABASE_ID")
+        or ""
+    ).strip()
+    if not db_id:
+        return out
+    try:
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1).date().isoformat()
+        if now.month == 12:
+            next_month = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month = now.replace(month=now.month + 1, day=1)
+        month_end = next_month.date().isoformat()
+        response = notion.databases.query(
+            database_id=db_id,
+            filter={
+                "and": [
+                    {
+                        "property": "Telegram Date",
+                        "date": {"on_or_after": month_start},
+                    },
+                    {
+                        "property": "Telegram Date",
+                        "date": {"before": month_end},
+                    },
+                ]
+            },
+            page_size=100,
+        )
+        uid_marker = f"uid:{user.id}"
+        user_name = (user.full_name or "").strip().lower()
+        uname = (user.username or "").strip().lower()
+        for page in response.get("results", []):
+            props = page.get("properties", {})
+            notes = _get_plain_text(props.get("Notes")).lower()
+            posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
+            is_mine = uid_marker in notes
+            if not is_mine and user_name and posted_by == user_name:
+                is_mine = True
+            if not is_mine and uname and uname in posted_by:
+                is_mine = True
+            if not is_mine:
+                continue
+            # Ticker property (rich_text) or parse from title
+            t = _get_plain_text(props.get("Ticker")).lstrip("#").upper().strip()
+            if not t:
+                title = _get_plain_text(
+                    props.get("Stockpick & Month") or props.get("Name")
+                )
+                m = re.search(r"#([A-Z0-9]{2,6})\b", (title or "").upper())
+                if m:
+                    t = m.group(1)
+            if t:
+                out.add(t)
+    except Exception as e:
+        logger.warning("_user_stockpick_tickers_this_month failed: %s", e)
+    return out
+
+
+def _month_picks_label() -> str:
+    """e.g. 'Sept Picks' for current calendar month."""
+    now = datetime.now(timezone.utc)
+    # Short month labels
+    labels = {
+        1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+        7: "Jul", 8: "Aug", 9: "Sept", 10: "Oct", 11: "Nov", 12: "Dec",
+    }
+    return f"{labels.get(now.month, now.strftime('%b'))} Picks"
 
 
 async def _fetch_user_watchlist_pages(user_id: int) -> list[dict]:
@@ -3102,24 +3199,29 @@ async def show_watchlist(
         rns_hits = len(rns_map)
 
         # Day % change – always load for display (and for sort-by-pct)
-        # Priority: live Yahoo (on Refresh or if missing) → Micro-Cap → Watchlist cache
+        # Priority: live Yahoo (session %) → Micro-Cap → Watchlist cache
+        # Live is preferred: Micro-Cap day-% is often empty/stale.
         pct_map: dict[str, float | None] = {}
         sort_mode = _watchlist_sort.get(user.id, "rns")
         for t in tickers_for_rns:
             pct_map[t] = None
-            # 1) Notion UK AIM Micro-Cap
-            try:
-                data = await get_ticker_from_notion(t)
-                if data and data.get("day_change_pct") is not None:
-                    pct_map[t] = data.get("day_change_pct")
-            except Exception:
-                pass
-            # 2) Live market (always on Refresh; otherwise only if still missing)
-            if force_rns or pct_map[t] is None:
-                live = _fetch_pct_on_day_live(t)
-                if live is not None:
-                    pct_map[t] = live
-                await asyncio.sleep(0.15)
+            live = _fetch_pct_on_day_live(t)
+            if live is not None:
+                pct_map[t] = live
+            else:
+                try:
+                    data = await get_ticker_from_notion(t)
+                    if data and data.get("day_change_pct") is not None:
+                        pct_map[t] = data.get("day_change_pct")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.12)
+        # User's this-month stockpick tickers (for 📌 badge)
+        try:
+            my_pick_tickers = await _user_stockpick_tickers_this_month(user)
+        except Exception:
+            my_pick_tickers = set()
+        picks_label = _month_picks_label()
         # 3) Watchlist row cache if still missing
         for page in pages:
             props = page.get("properties", {})
@@ -3247,8 +3349,14 @@ async def show_watchlist(
                     pct_bit = f" · {arrow} {sign}{pct:.2f}%"
                 else:
                     pct_bit = " · ⚪ —%"
-                # Display: #ALRT Defence Holdings · 🟢 +1.25%
-                lines.append(f"*#{ticker}* {company}{pri_bit}{pct_bit}")
+                # Badge if this ticker is the user's stockpick this month
+                pick_bit = ""
+                if ticker in my_pick_tickers:
+                    pick_bit = f" 📌 {picks_label}"
+                # e.g. #EPP Energy Pathways · 🟢 +13.70% 📌 Sept Picks
+                lines.append(
+                    f"*#{ticker}* {company}{pri_bit}{pct_bit}{pick_bit}"
+                )
                 if url and url != "-":
                     lines.append(f"  🔗 {url}")
                 rns = r.get("rns") or {}
