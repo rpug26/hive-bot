@@ -3441,19 +3441,16 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await show_watchlist(update, context, edit=True, force_rns=True)
         return
 
-    # « Back to Watchlist from snapshot
+    # « Back to Watchlist from snapshot – restore same panel in place
     if action == "back":
         await query.answer()
         await show_watchlist(update, context, edit=True, force_rns=False)
         return
 
-    # Ticker "hyperlink" → company snapshot (UK AIM Micro-Cap)
+    # Ticker "hyperlink" → company snapshot in the SAME message (edit in place)
     if action.startswith("snap:"):
         await query.answer()
         ticker = action[5:].strip().upper()
-        if not ticker:
-            await query.message.reply_text("Missing ticker.")
-            return
         back_kb = InlineKeyboardMarkup(
             [
                 [
@@ -3463,13 +3460,24 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 ]
             ]
         )
+        if not ticker:
+            try:
+                await query.edit_message_text(
+                    "Missing ticker.", reply_markup=back_kb
+                )
+            except Exception:
+                await query.message.reply_text(
+                    "Missing ticker.", reply_markup=back_kb
+                )
+            return
         try:
             meta = await get_ticker_from_notion(ticker)
             if not meta:
-                await query.message.reply_text(
-                    f"No snapshot for #{ticker} in UK AIM Micro-Cap.",
-                    reply_markup=back_kb,
-                )
+                body = f"No snapshot for #{ticker} in UK AIM Micro-Cap."
+                try:
+                    await query.edit_message_text(body, reply_markup=back_kb)
+                except Exception:
+                    await query.message.reply_text(body, reply_markup=back_kb)
                 return
             try:
                 stockpickers = await get_stockpickers_for_ticker(ticker)
@@ -3482,24 +3490,38 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if pct is not None:
                 sign = "+" if pct >= 0 else ""
                 body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
+            # Stay in the same view: replace watchlist message with snapshot
             try:
-                await query.message.reply_text(
+                await query.edit_message_text(
                     body,
                     parse_mode="Markdown",
                     reply_markup=back_kb,
                     disable_web_page_preview=True,
                 )
             except Exception:
-                await query.message.reply_text(
-                    body.replace("*", "").replace("_", ""),
-                    reply_markup=back_kb,
-                    disable_web_page_preview=True,
-                )
+                try:
+                    await query.edit_message_text(
+                        body.replace("*", "").replace("_", ""),
+                        reply_markup=back_kb,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    logger.warning("wl:snap edit failed, fallback reply: %s", e2)
+                    await query.message.reply_text(
+                        body.replace("*", "").replace("_", ""),
+                        reply_markup=back_kb,
+                        disable_web_page_preview=True,
+                    )
         except Exception as e:
             logger.error("wl:snap failed for %s: %s", ticker, e)
-            await query.message.reply_text(
-                f"Snapshot failed: {e}", reply_markup=back_kb
-            )
+            try:
+                await query.edit_message_text(
+                    f"Snapshot failed: {e}", reply_markup=back_kb
+                )
+            except Exception:
+                await query.message.reply_text(
+                    f"Snapshot failed: {e}", reply_markup=back_kb
+                )
         return
 
     # Pagination
