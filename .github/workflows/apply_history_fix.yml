@@ -15,8 +15,12 @@ jobs:
       - name: Apply patch
         run: |
           set -e
-          patch -p1 < patches/request_history_fix.patch
+          patch -p1 --forward < patches/request_history_fix.patch || {
+            echo "Trying with fuzz..."
+            patch -p1 --forward --fuzz=3 < patches/request_history_fix.patch
+          }
           echo "Patch applied"
+          rg -n "History must never depend|Watchlist add:" bot.py | head
 
       - name: Commit and push
         run: |
@@ -26,6 +30,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes (already applied?)"
           else
-            git commit -m "Apply Request History auto-sync fix"
+            git commit -m "Apply Notion auto-sync: History first + watchlist logging"
             git push origin HEAD
           fi
