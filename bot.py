@@ -3773,6 +3773,14 @@ async def handle_watchlist_text(
             bits = []
             if removed:
                 bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist remove: {', '.join('#'+x for x in removed)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist remove history log failed: %s", le)
             if missing:
                 bits.append("Not found: " + ", ".join(f"#{x}" for x in missing))
             await _watchlist_finish_action(
@@ -3814,6 +3822,14 @@ async def handle_watchlist_text(
                     f"✅ Added ({len(added)}): "
                     + ", ".join(f"#{x}" for x in added)
                 )
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist add: {', '.join('#'+x for x in added)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist add history log failed: %s", le)
             if updated:
                 lines.append(
                     f"♻️ Updated ({len(updated)}): "
@@ -4527,6 +4543,7 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
 REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
+REQUEST_TYPE_WATCHLIST = "Other"
 
 
 async def append_request_history(
