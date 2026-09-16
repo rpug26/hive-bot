@@ -212,40 +212,23 @@ CACHE_TTL_SECONDS = 600  # 10 minutes
 
 # user_id -> last stockpick Notion page_id this month
 _last_stockpick_page: dict[int, str] = {}
-# Minimal UI: track the single "active panel" message per user to delete on next nav
-_nav_panel: dict[int, dict] = {}  # user_id -> {chat_id, message_id}
-# My Stockpick hub expand/collapse + month cursor
-_msp_ui: dict[int, dict] = {}  # user_id -> flags + league_ym / hist_ym
 # user_id -> waiting field name ("Summary" | "Next Catalyst" | "Target Price" | "Change")
 _awaiting_field: dict[int, str] = {}
 # user_id -> "add" | "change" | "delete"
 _awaiting_watchlist: dict[int, str] = {}
 # user_id -> True while waiting for link search query
 _awaiting_link: dict[int, bool] = {}
-# user_id -> waiting for ticker input after Stock Snapshot button
-_awaiting_snapshot: dict[int, bool] = {}
 # admin_id -> Group Links request they are fulfilling (paste URL next)
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
 _active_watchlist_name: dict[int, str] = {}
 # user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
-_watchlist_ui: dict[int, dict] = {}  # panel msg tracking: chat_id, panel_msg_id, ...
+_watchlist_ui: dict[int, dict] = {}
 _watchlist_page: dict[int, int] = {}  # user_id -> page index (0-based)
 _watchlist_sort: dict[int, str] = {}  # user_id -> rns | pct | priority | name
-# Expand/collapse flags for My Watchlist keyboard sections (separate from panel ids)
-_watchlist_kb: dict[int, dict] = {}  # user_id -> {sort_open, manage_open, lists_open}
 WATCHLIST_PAGE_SIZE = 3
 MAX_WATCHLISTS = 3
-
-
-def _wl_ui(user_id: int) -> dict:
-    """Keyboard expand/collapse state for My Watchlist (not panel message ids)."""
-    st = _watchlist_kb.get(user_id)
-    if not st:
-        st = {"sort_open": False, "manage_open": False, "lists_open": False}
-        _watchlist_kb[user_id] = st
-    return st
 # Single auth cache: usernames + user_ids where Notion Status = Authorised
 _authorized_cache: dict = {
     "usernames": set(),
@@ -1299,30 +1282,18 @@ async def stockpick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.warning("Could not verify stockpick month: %s", e)
 
     _awaiting_field[user.id] = field
-    # Replace hub panel with a short prompt (minimal footprint)
-    prompt = (
-        "Send your *new* stockpick text now (include #MONTH #TICKER).\n"
-        "This updates *this month’s* pick only."
-        if field == "Change"
-        else f"Send your *{field}* now and I’ll add it to your stockpick."
-    )
-    try:
-        await query.edit_message_text(
-            prompt,
+
+    if field == "Change":
+        await query.message.reply_text(
+            "Send your **new** stockpick text now (include #TICKER).\n"
+            "This updates **this month’s** pick only.",
             parse_mode="Markdown",
-            reply_markup=hub_back_keyboard(),
         )
-        await remember_nav_panel(user.id, query.message)
-    except Exception:
-        sent = await query.message.reply_text(
-            prompt,
+    else:
+        await query.message.reply_text(
+            f"Send your **{field}** now and I’ll add it to your stockpick.",
             parse_mode="Markdown",
-            reply_markup=hub_back_keyboard(),
         )
-        await remember_nav_panel(user.id, sent)
-    await ensure_home_keyboard(
-        context.bot, query.message.chat_id if query.message else None
-    )
         
 # ------------------------------------------------------------
 # Helpers
@@ -1342,156 +1313,6 @@ def extract_hashtag_tickers(text: str) -> list[str]:
     return found
 
 MAX_WATCHLISTS = 3
-
-
-def _fetch_pct_on_day_live(ticker: str) -> float | None:
-    """
-    Live day % change for AIM/LSE ticker via Yahoo Finance (TICKER.L).
-    Returns percent points e.g. 13.70 meaning +13.70%, or None.
-
-    Source priority (validated vs LSE prints):
-      1) meta.regularMarketChangePercent  (official session % — most reliable)
-      2) last two daily closes from the chart series
-      3) price / previousClose (NOT chartPreviousClose — that can lag and inflate %)
-    """
-    if not ticker:
-        return None
-    symbol = f"{ticker.upper().strip()}.L"
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?range=5d&interval=1d"
-    )
-    try:
-        import json as _json
-        import urllib.request
-
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; HiveBot/1.0)",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        result = (data.get("chart") or {}).get("result") or []
-        if not result:
-            return None
-        meta = result[0].get("meta") or {}
-
-        # 1) Official session day-change % (e.g. EPP → 13.70, not 17.73)
-        if meta.get("regularMarketChangePercent") is not None:
-            try:
-                return round(float(meta["regularMarketChangePercent"]), 2)
-            except (TypeError, ValueError):
-                pass
-
-        # 2) Last two daily closes on the chart
-        closes = (
-            ((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close")
-            or []
-        )
-        closes = [c for c in closes if c is not None]
-        if len(closes) >= 2 and closes[-2]:
-            try:
-                return round(
-                    (float(closes[-1]) / float(closes[-2]) - 1.0) * 100.0, 2
-                )
-            except (TypeError, ValueError, ZeroDivisionError):
-                pass
-
-        # 3) Price vs previousClose only (skip chartPreviousClose — often wrong)
-        price = meta.get("regularMarketPrice")
-        prev = meta.get("previousClose")
-        if price is not None and prev:
-            try:
-                return round((float(price) / float(prev) - 1.0) * 100.0, 2)
-            except (TypeError, ValueError, ZeroDivisionError):
-                pass
-    except Exception as e:
-        logger.warning("live %% on day failed for %s: %s", ticker, e)
-    return None
-
-
-async def _user_stockpick_tickers_this_month(user) -> set[str]:
-    """
-    Tickers this Telegram user has as a #stockpick in Hive Stock Picks
-    for the current calendar month. Used to badge My Watchlist rows.
-    """
-    out: set[str] = set()
-    if not notion or not user:
-        return out
-    db_id = (
-        os.getenv("NOTION_STOCKPICKS_DB_ID")
-        or os.getenv("NOTION_DATABASE_ID")
-        or ""
-    ).strip()
-    if not db_id:
-        return out
-    try:
-        now = datetime.now(timezone.utc)
-        month_start = now.replace(day=1).date().isoformat()
-        if now.month == 12:
-            next_month = now.replace(year=now.year + 1, month=1, day=1)
-        else:
-            next_month = now.replace(month=now.month + 1, day=1)
-        month_end = next_month.date().isoformat()
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "and": [
-                    {
-                        "property": "Telegram Date",
-                        "date": {"on_or_after": month_start},
-                    },
-                    {
-                        "property": "Telegram Date",
-                        "date": {"before": month_end},
-                    },
-                ]
-            },
-            page_size=100,
-        )
-        uid_marker = f"uid:{user.id}"
-        user_name = (user.full_name or "").strip().lower()
-        uname = (user.username or "").strip().lower()
-        for page in response.get("results", []):
-            props = page.get("properties", {})
-            notes = _get_plain_text(props.get("Notes")).lower()
-            posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
-            is_mine = uid_marker in notes
-            if not is_mine and user_name and posted_by == user_name:
-                is_mine = True
-            if not is_mine and uname and uname in posted_by:
-                is_mine = True
-            if not is_mine:
-                continue
-            # Ticker property (rich_text) or parse from title
-            t = _get_plain_text(props.get("Ticker")).lstrip("#").upper().strip()
-            if not t:
-                title = _get_plain_text(
-                    props.get("Stockpick & Month") or props.get("Name")
-                )
-                m = re.search(r"#([A-Z0-9]{2,6})\b", (title or "").upper())
-                if m:
-                    t = m.group(1)
-            if t:
-                out.add(t)
-    except Exception as e:
-        logger.warning("_user_stockpick_tickers_this_month failed: %s", e)
-    return out
-
-
-def _month_picks_label() -> str:
-    """e.g. 'Sept Picks' for current calendar month."""
-    now = datetime.now(timezone.utc)
-    # Short month labels
-    labels = {
-        1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-        7: "Jul", 8: "Aug", 9: "Sept", 10: "Oct", 11: "Nov", 12: "Dec",
-    }
-    return f"{labels.get(now.month, now.strftime('%b'))} Picks"
-
 
 async def _fetch_user_watchlist_pages(user_id: int) -> list[dict]:
     """All Notion rows for this Telegram user (multi-source safe)."""
@@ -1694,23 +1515,16 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
     return text
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Home navigation – always-on persistent reply keyboard (7 items).
-    Stays visible after /start and after every menu selection.
-    """
+    """Full persistent keyboard (4 feature buttons + Hide)."""
     return ReplyKeyboardMarkup(
         [
             [
-                KeyboardButton("👀 My Watchlist"),
+                KeyboardButton("📋 Menu"),
                 KeyboardButton("📌 My Stockpick"),
             ],
             [
-                KeyboardButton("📊 Stock Snapshot"),
+                KeyboardButton("👀 My Watchlist"),
                 KeyboardButton("🔗 Group Links"),
-            ],
-            [
-                KeyboardButton("📋 Menu"),
-                KeyboardButton("🏆 Stock of the Day"),
             ],
             [
                 KeyboardButton("🙈 Hide"),
@@ -1723,7 +1537,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 
 def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Collapsed keyboard – single button to restore Home."""
+    """Collapsed keyboard – single button to restore the full menu."""
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("☰ Show menu")],
@@ -1733,134 +1547,20 @@ def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
     )
 
-
-async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
-    """
-    Re-assert the persistent Home reply keyboard.
-
-    Never delete the message that carries ReplyKeyboardMarkup — many Telegram
-    clients drop the keyboard when that message is removed.
-    """
-    if not bot or chat_id is None:
-        return
-    try:
-        await bot.send_message(
-            chat_id,
-            "🏠 Home",
-            reply_markup=main_reply_keyboard(),
-        )
-    except Exception as e:
-        logger.debug("ensure_home_keyboard failed: %s", e)
-
-
-async def send_home_menu(bot, chat_id: int | None) -> None:
-    """
-    Land on Home with the full 7-button reply keyboard.
-    Message is kept on purpose so the keyboard stays visible.
-    """
-    if not bot or chat_id is None:
-        return
-    text = (
-        "🏠 *Home*\n\n"
-        "• 👀 My Watchlist\n"
-        "• 📌 My Stockpick\n"
-        "• 📊 Stock Snapshot\n"
-        "• 🔗 Group Links\n"
-        "• 📋 Menu\n"
-        "• 🏆 Stock of the Day\n"
-        "• 🙈 Hide"
-    )
-    try:
-        await bot.send_message(
-            chat_id,
-            text,
-            parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
-        )
-    except Exception as e:
-        logger.error("send_home_menu failed: %s", e)
-        try:
-            await bot.send_message(
-                chat_id,
-                "Home",
-                reply_markup=main_reply_keyboard(),
-            )
-        except Exception:
-            pass
-
-
 def menu_inline_keyboard() -> InlineKeyboardMarkup:
-    """Simplified Menu – access + help only."""
+    """Inline buttons for /menu."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("🏠 Start", callback_data="cmd:start"),
-                InlineKeyboardButton("🔐 Status", callback_data="cmd:status"),
-            ],
-            [
-                InlineKeyboardButton("📨 Request access", callback_data="cmd:request"),
                 InlineKeyboardButton("❓ FAQ", callback_data="cmd:faq"),
             ],
             [
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ],
-        ]
-    )
-
-
-def hub_back_keyboard() -> InlineKeyboardMarkup:
-    """Single « Hub row for any submenu."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
-    )
-
-
-def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
-    """Inline actions under a company snapshot."""
-    t = (ticker or "").upper()[:20]
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "➕ Save to My Watchlist",
-                    callback_data=f"snap:save:{t}",
-                )
+                InlineKeyboardButton("📊 Snap (ticker help)", callback_data="cmd:snap"),
+                InlineKeyboardButton("📌 My🐝 Stockpick", callback_data="cmd:mystockpick"),
             ],
             [
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ],
-        ]
-    )
-
-
-def hub_home_keyboard() -> InlineKeyboardMarkup:
-    """
-    Lightweight inline mirror of Home (optional).
-    Prefer main_reply_keyboard() for the real 7-button Home bar.
-    """
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "👀 My Watchlist", callback_data="hub:watchlist"
-                ),
-                InlineKeyboardButton(
-                    "📌 My Stockpick", callback_data="hub:mypicks"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📊 Snapshot", callback_data="cmd:snap"
-                ),
-                InlineKeyboardButton(
-                    "🏆 Stock of Day", callback_data="cmd:sotd"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔗 Links", callback_data="cmd:link"
-                ),
-                InlineKeyboardButton("📋 Menu", callback_data="cmd:menu"),
+                InlineKeyboardButton("🔗 Group Links", callback_data="cmd:link"),
             ],
         ]
     )
@@ -1928,46 +1628,6 @@ async def cleanup_callback_message(
     await safe_delete_message(
         context.bot, query.message.chat_id, query.message.message_id
     )
-
-
-async def remember_nav_panel(user_id: int | None, msg) -> None:
-    """Remember the bot panel message so the next navigation can wipe it."""
-    if not user_id or not msg:
-        return
-    try:
-        _nav_panel[user_id] = {
-            "chat_id": msg.chat_id,
-            "message_id": msg.message_id,
-        }
-    except Exception:
-        pass
-
-
-async def clear_nav_panel(bot, user_id: int | None) -> None:
-    """Delete the last remembered panel for a minimal footprint."""
-    if not bot or not user_id:
-        return
-    info = _nav_panel.pop(user_id, None)
-    if not info:
-        return
-    await safe_delete_message(bot, info.get("chat_id"), info.get("message_id"))
-
-
-def _msp_state(user_id: int) -> dict:
-    st = _msp_ui.get(user_id)
-    if not st:
-        now = datetime.now(timezone.utc)
-        st = {
-            "league_open": False,
-            "mine_open": False,
-            "hist_open": False,
-            "league_y": now.year,
-            "league_m": now.month,
-            "hist_y": now.year,
-            "hist_m": now.month,
-        }
-        _msp_ui[user_id] = st
-    return st
 
 
 async def send_clean(
@@ -2682,38 +2342,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    # Stock Snapshot – Home keyboard
-    if text in (
-        "📊 Stock Snapshot",
-        "Stock Snapshot",
-        "📊 Snapshot",
-        "Snapshot",
-    ) or lower in (
-        "stock snapshot",
-        "📊 stock snapshot",
-        "snapshot",
-    ):
-        await stock_snapshot_prompt(update, context)
-        return
-
-    # Stock of the Day (replaces What's new?)
-    if text in (
-        "🏆 Stock of the Day",
-        "Stock of the Day",
-        "Stock of Day",
-        "✨ What's new?",
-        "What's new?",
-    ) or lower in (
-        "stock of the day",
-        "🏆 stock of the day",
-        "stock of day",
-        "what's new?",
-        "whats new?",
-    ):
-        await cleanup_trigger_message(update, context)
-        await stock_of_the_day_cmd(update, context)
-        return
-
     # Match Link button even if emoji/spacing differs
     if (
         text in (
@@ -2738,26 +2366,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info("Link button matched text=%r", text)
         await link_cmd(update, context)
         await cleanup_trigger_message(update, context)
-        return
-
-    # Stock Snapshot follow-up – user typed a ticker after tapping the button
-    if user and user.id in _awaiting_snapshot:
-        _awaiting_snapshot.pop(user.id, None)
-        raw = text.strip()
-        tickers = extract_hashtag_tickers(raw)
-        if not tickers:
-            t = raw.lstrip("#").upper().strip()
-            if t and re.fullmatch(r"[A-Z0-9]{1,6}", t):
-                tickers = [t]
-        if not tickers:
-            await update.message.reply_text(
-                "Please send a ticker like `ALRT` or `#KEFI`.",
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(),
-            )
-            return
-        for t in tickers[:3]:
-            await deliver_stock_snapshot(update, context, t)
         return
 
     # Link search follow-up (private only) after tapping 🔗 Link
@@ -2816,21 +2424,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_watchlist_text(update, context, action, text)
         return
 
-    # Stockpick field follow-up (Summary / Catalyst / Target / Change)
+    # Stockpick field follow-up
     if user and user.id in _awaiting_field:
         field = _awaiting_field.pop(user.id)
         page_id = _last_stockpick_page.get(user.id)
-        # Clear user's typed text + any prior panel for a clean UI
-        await cleanup_trigger_message(update, context)
-        await clear_nav_panel(context.bot, user.id)
-        chat_id = update.effective_chat.id if update.effective_chat else None
         if not page_id or not notion:
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id,
-                    "Could not update your stockpick. Please try again.",
-                    reply_markup=main_reply_keyboard(),
-                )
+            await update.message.reply_text(
+                "Could not update your stockpick. Please try again."
+            )
             return
 
         try:
@@ -2849,7 +2450,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         "title": [{"text": {"content": f"#{tickers[0]}"[:100]}}]
                     }
                 notion.pages.update(page_id=page_id, properties=props)
-                confirm = "✅ Stockpick updated."
+                await update.message.reply_text("✅ Your stockpick has been updated.")
             else:
                 notion.pages.update(
                     page_id=page_id,
@@ -2859,32 +2460,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         }
                     },
                 )
-                confirm = f"✅ Added {field}."
-            if chat_id:
-                sent = await context.bot.send_message(
-                    chat_id,
-                    confirm,
-                    reply_markup=main_reply_keyboard(),
+                await update.message.reply_text(
+                    f"✅ Added **{field}** to your stockpick.",
+                    parse_mode="Markdown",
                 )
-                await remember_nav_panel(user.id, sent)
-                # Refresh My Stockpick hub in place (clean)
-                try:
-                    await show_stockpick_hub(update, context, edit=False)
-                    # Remove the brief confirm once hub is up
-                    await safe_delete_message(
-                        context.bot, sent.chat_id, sent.message_id
-                    )
-                except Exception:
-                    pass
-            await ensure_home_keyboard(context.bot, chat_id)
         except Exception as e:
             logger.error("Failed to update stockpick field %s: %s", field, e)
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id,
-                    "Could not save that update. Please try again later.",
-                    reply_markup=main_reply_keyboard(),
-                )
+            await update.message.reply_text(
+                "Could not save that update. Please try again later."
+            )
         return
 
     if not await should_reply(update, context):
@@ -2919,18 +2503,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
                 ],
             ]
-            await cleanup_trigger_message(update, context)
-            chat_id = update.effective_chat.id if update.effective_chat else None
-            if chat_id:
-                sent = await context.bot.send_message(
-                    chat_id,
-                    f"⚠️ You already submitted a #stockpick for *{month_name}*.\n"
-                    "One pick per month — add details or change it:",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
-                await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(context.bot, chat_id)
+            await update.message.reply_text(
+                f"⚠️ You have already submitted a #stockpick for **{month_name}**.\n\n"
+                "Each member may submit only **one** stockpick per month.\n"
+                "You can still add details or change this month’s pick:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
             return
 
         user_name = user.full_name if user else "Unknown"
@@ -2947,11 +2526,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             user_id=user.id if user else None,
         )
 
-        # Wipe the user's #stockpick message for a clean chat
-        await cleanup_trigger_message(update, context)
-        await clear_nav_panel(context.bot, user.id if user else None)
-        chat_id = update.effective_chat.id if update.effective_chat else None
-
         if page_id:
             _last_stockpick_page[user.id] = page_id
             await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
@@ -2960,38 +2534,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply += f" (#{ticker})"
             if period_type and period_value:
                 reply += f"\n📅 {period_type}: *{period_value}*"
-            reply += "\nSaved. Expand *My pick this month* to add details."
+            reply += "\nYour pick has been saved.\n\nWhat would you like to do next?"
 
             keyboard = [
                 [
-                    InlineKeyboardButton(
-                        "✏️ My pick this month ▾", callback_data="msp:ui_mine"
-                    )
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "📌 Open My Stockpick", callback_data="hub:mypicks"
-                    )
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
                 ],
-                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
             ]
-            if chat_id:
-                sent = await context.bot.send_message(
-                    chat_id,
-                    reply,
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
-                await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(context.bot, chat_id)
+            await update.message.reply_text(
+                reply,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         else:
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id,
-                    "Could not save your #stockpick right now.\n"
-                    f"Error: {save_error or 'unknown'}",
-                    reply_markup=main_reply_keyboard(),
-                )
+            await update.message.reply_text(
+                "✅ Received your #stockpick.\n"
+                f"(Could not save it right now.)\n\n"
+                f"Error: `{save_error or 'unknown'}`\n\n"
+                "Admin: check NOTION_STOCKPICKS_DB_ID + integration sharing.",
+                parse_mode="Markdown",
+            )
         return
 
     # 2. Ticker lookup (snapshot / summary) – authorised only
@@ -3052,15 +2619,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Hi {name}! 👋\n\n"
             "It's 🐝 BuzzBot here.\n"
             "✅ You are *Authorised* and can use the bot.\n\n"
-            "Home keyboard (always available):\n"
-            "• 👀 My Watchlist\n"
-            "• 📌 My Stockpick\n"
-            "• 📊 Stock Snapshot\n"
-            "• 🔗 Group Links\n"
-            "• 📋 Menu\n"
-            "• 🏆 Stock of the Day\n"
-            "• 🙈 Hide\n\n"
-            "In the group: `@Bot #KEFI summary` or `#stockpick …`"
+            "Use the buttons below, or in the group:\n"
+            "• `@Bot #KEFI summary` → lookup\n"
+            "• `#KEFI snapshot` → lookup\n"
+            "• `#stockpick my idea...` → save your pick"
         )
     else:
         text = (
@@ -3088,213 +2650,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_reply_keyboard(),
         )
 
-
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Simplified Menu – access & help only; features live on Home keyboard."""
     text = (
         "🐝 *BuzzBot Menu*\n\n"
         "• /start – Welcome & status\n"
         "• /status – Check if you are authorised\n"
         "• /request – Request access\n"
+        "• /snap – How to look up a ticker\n"
+        "• /mystockpick – Your stockpick this month\n"
+        "• /link – Group Link (private chat only)\n"
         "• /faq – FAQ\n\n"
-        "Features are on the Home keyboard:\n"
-        "My Watchlist · My Stockpick · Stock Snapshot · Group Links"
+        "In the group: `@Bot #TICKER` to look up a stock\n"
+        "Or use `#stockpick your idea` to save one.\n"
+        "🔗 *Group Link* works only in a private 1-to-1 chat."
     )
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
-    markup_inline = menu_inline_keyboard()
     if chat:
         await context.bot.send_message(
             chat_id=chat.id,
             text=text,
             parse_mode="Markdown",
-            reply_markup=markup_inline,
+            reply_markup=main_reply_keyboard(),
         )
-        # Keep persistent Home keyboard on top
-        try:
-            pulse = await context.bot.send_message(
-                chat.id, "⋯", reply_markup=main_reply_keyboard()
-            )
-            await safe_delete_message(context.bot, pulse.chat_id, pulse.message_id)
-        except Exception:
-            pass
     elif update.message:
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
-            reply_markup=markup_inline,
-        )
-
-
-async def _load_microcap_tickers(limit: int = 80) -> list[tuple[str, str]]:
-    """
-    Return [(ticker, company), ...] from UK AIM Micro-Cap.
-    Used by Stock of the Day ranking.
-    """
-    out: list[tuple[str, str]] = []
-    if not notion:
-        return out
-    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
-    if not db_id:
-        return out
-    try:
-        cursor = None
-        while len(out) < limit:
-            kwargs = {"database_id": db_id, "page_size": min(50, limit - len(out))}
-            if cursor:
-                kwargs["start_cursor"] = cursor
-            resp = notion.databases.query(**kwargs)
-            for page in resp.get("results", []):
-                props = page.get("properties") or {}
-                t = (
-                    _get_plain_text(props.get("Ticker"))
-                    or _get_plain_text(props.get("Name"))
-                    or ""
-                ).lstrip("#").upper().strip()
-                if not t or not re.fullmatch(r"[A-Z0-9]{1,6}", t):
-                    continue
-                company = (
-                    _get_plain_text(props.get("Company"))
-                    or _get_plain_text(props.get("Company Name"))
-                    or _get_plain_text(props.get("Name"))
-                    or t
-                )
-                out.append((t, company))
-                if len(out) >= limit:
-                    break
-            if not resp.get("has_more"):
-                break
-            cursor = resp.get("next_cursor")
-            if not cursor:
-                break
-    except Exception as e:
-        logger.error("_load_microcap_tickers failed: %s", e)
-    # de-dupe preserve order
-    seen = set()
-    uniq = []
-    for t, c in out:
-        if t in seen:
-            continue
-        seen.add(t)
-        uniq.append((t, c))
-    return uniq
-
-
-async def stock_of_the_day_cmd(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """
-    Rank UK AIM Micro-Cap names by live day % and show top movers
-    with Save to Watchlist + Hub actions.
-    """
-    user = update.effective_user
-    msg = update.effective_message
-    if not msg:
-        return
-    if not await is_authorized(update, context):
-        await msg.reply_text(
-            "🔒 Only authorised members can use Stock of the Day.\n"
-            "Send /request to ask for access.",
             reply_markup=main_reply_keyboard(),
         )
-        return
-
-    await cleanup_trigger_message(update, context)
-    await clear_nav_panel(context.bot, user.id if user else None)
-    status = await msg.reply_text(
-        "🏆 Scanning…",
-        reply_markup=main_reply_keyboard(),
-    )
-    await remember_nav_panel(user.id if user else None, status)
-
-    try:
-        pairs = await _load_microcap_tickers(limit=60)
-        ranked: list[tuple[str, str, float]] = []
-        for t, company in pairs:
-            pct = _fetch_pct_on_day_live(t)
-            if pct is None:
-                continue
-            ranked.append((t, company, float(pct)))
-            await asyncio.sleep(0.08)
-        ranked.sort(key=lambda x: x[2], reverse=True)
-        top = ranked[:5]
-
-        if not top:
-            try:
-                await status.edit_text(
-                    "🏆 *Stock of the Day*\n\n"
-                    "Could not load live % changes right now. Try again shortly.",
-                    parse_mode="Markdown",
-                    reply_markup=hub_back_keyboard(),
-                )
-            except Exception:
-                await msg.reply_text(
-                    "Could not load Stock of the Day right now.",
-                    reply_markup=main_reply_keyboard(),
-                )
-            return
-
-        # Header board
-        lines = [
-            "🏆 *Stock of the Day*",
-            "_Top movers by session % change (UK AIM Micro-Cap)_",
-            "",
-        ]
-        for i, (t, company, pct) in enumerate(top, 1):
-            sign = "+" if pct >= 0 else ""
-            arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
-            lines.append(f"{i}. *#{t}* {company}")
-            lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
-        lines.append("")
-        lines.append("_Tap a ticker below for the full snapshot._")
-        lines.append("_Not financial advice. DYOR._")
-
-        kb_rows = []
-        for t, company, pct in top:
-            sign = "+" if pct >= 0 else ""
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        f"#{t}  {sign}{pct:.2f}%",
-                        callback_data=f"sotd:snap:{t[:20]}",
-                    )
-                ]
-            )
-        kb_rows.append(
-            [InlineKeyboardButton("« Hub", callback_data="hub:home")]
-        )
-        body = "\n".join(lines)
-        try:
-            await status.edit_text(
-                body,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb_rows),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            await msg.reply_text(
-                body.replace("*", ""),
-                reply_markup=InlineKeyboardMarkup(kb_rows),
-                disable_web_page_preview=True,
-            )
-        await ensure_home_keyboard(context.bot, msg.chat_id)
-    except Exception as e:
-        logger.error("stock_of_the_day_cmd failed: %s", e)
-        try:
-            await status.edit_text(
-                f"Stock of the Day failed: {e}",
-                reply_markup=hub_back_keyboard(),
-            )
-        except Exception:
-            await msg.reply_text(
-                f"Stock of the Day failed: {e}",
-                reply_markup=main_reply_keyboard(),
-            )
-
-
-async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Back-compat alias → Stock of the Day."""
-    await stock_of_the_day_cmd(update, context)
 
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3302,193 +2686,74 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
     data = (query.data or "").replace("cmd:", "")
 
-    # Build a minimal update proxy when only callback_query is present
-    def _proxy_update():
-        if update.message:
-            return update
-        chat = update.effective_chat
-        if not chat or not query or not query.message:
-            return update
-
-        class _MsgProxy:
-            def __init__(self, msg, bot):
-                self._msg = msg
-                self._bot = bot
-                self.chat = msg.chat
-                self.chat_id = msg.chat_id
-                self.message_id = msg.message_id
-
-            async def reply_text(self, *a, **k):
-                return await self._bot.send_message(self.chat_id, *a, **k)
-
-        class _Up:
-            def __init__(self, orig, msg):
-                self.effective_user = orig.effective_user
-                self.effective_chat = orig.effective_chat
-                self.message = msg
-                self.callback_query = orig.callback_query
-
-        return _Up(update, _MsgProxy(query.message, context.bot))
+    # Remove the inline menu message after a button is pressed (clean chat)
+    if query and query.message and _is_private(update):
+        await safe_delete_message(
+            context.bot, query.message.chat_id, query.message.message_id
+        )
 
     if data == "start":
         await start(update, context)
     elif data == "faq":
-        await faq(_proxy_update(), context)
-    elif data == "status":
-        await status_cmd(_proxy_update(), context)
-    elif data == "request":
-        await request_access(_proxy_update(), context)
-    elif data == "menu":
-        await menu_cmd(_proxy_update(), context)
+        # faq expects update.message – send via bot if needed
+        if update.message:
+            await faq(update, context)
+        else:
+            chat = update.effective_chat
+            if chat:
+                # minimal proxy
+                class _MsgProxy:
+                    def __init__(self, bot, chat_id):
+                        self._bot = bot
+                        self.chat_id = chat_id
+                    async def reply_text(self, *a, **k):
+                        return await self._bot.send_message(self.chat_id, *a, **k)
+                class _Up:
+                    def __init__(self, orig, msg):
+                        self.effective_user = orig.effective_user
+                        self.effective_chat = orig.effective_chat
+                        self.message = msg
+                await faq(
+                    _Up(update, _MsgProxy(context.bot, chat.id)), context
+                )
     elif data == "snap":
-        # Same entry as Home "Stock Snapshot" – prompt for ticker
-        await stock_snapshot_prompt(_proxy_update(), context)
+        await snap_cmd(update, context)
     elif data == "mystockpick":
-        await mystockpick_cmd(_proxy_update(), context)
+        await mystockpick_cmd(update, context)
     elif data == "link":
-        await link_cmd(_proxy_update(), context)
-    elif data == "whatsnew":
-        await stock_of_the_day_cmd(_proxy_update(), context)
-    elif data == "sotd":
-        await stock_of_the_day_cmd(_proxy_update(), context)
+        query = update.callback_query
+        if query and query.message:
+            class _MsgProxy:
+                def __init__(self, msg, bot):
+                    self._msg = msg
+                    self._bot = bot
+                    self.chat = msg.chat
+                async def reply_text(self, *a, **k):
+                    return await self._bot.send_message(self._msg.chat_id, *a, **k)
+            class _UpdateProxy:
+                def __init__(self, orig, msg):
+                    self.effective_user = orig.effective_user
+                    self.effective_chat = msg.chat
+                    self.message = msg
+            await link_cmd(
+                _UpdateProxy(update, _MsgProxy(query.message, context.bot)),
+                context,
+            )
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    await msg.reply_text(
+    await update.message.reply_text(
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
-        "• 📊 *Stock Snapshot* on the Home keyboard looks up any AIM ticker.\n"
         "• Use `#stockpick` in the group to log ideas.\n"
         "• Contact a human admin in The Hive group if something looks wrong.",
         parse_mode="Markdown",
-        reply_markup=hub_back_keyboard(),
+        reply_markup=main_reply_keyboard(),
     )
-    chat = update.effective_chat
-    if chat:
-        await ensure_home_keyboard(context.bot, chat.id)
-
-async def stock_snapshot_prompt(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Home keyboard → Stock Snapshot: ask for a ticker."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not msg or not user:
-        return
-    if not await is_authorized(update, context):
-        await msg.reply_text(
-            "🔒 Only authorised members can request snapshots.\n"
-            "Send /request to ask for access.",
-            reply_markup=main_reply_keyboard(),
-        )
-        return
-    _awaiting_snapshot[user.id] = True
-    await cleanup_trigger_message(update, context)
-    await clear_nav_panel(context.bot, user.id)
-    sent = await msg.reply_text(
-        "📊 *Stock Snapshot*\n\n"
-        "Send a ticker (e.g. `ALRT` or `#KEFI`).",
-        parse_mode="Markdown",
-        reply_markup=hub_back_keyboard(),
-    )
-    await remember_nav_panel(user.id, sent)
-    await ensure_home_keyboard(context.bot, msg.chat_id)
-
-
-async def deliver_stock_snapshot(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    ticker: str,
-) -> None:
-    """Look up ticker and show snapshot + Save to Watchlist / Hub (minimal UI)."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not msg:
-        return
-    ticker = (ticker or "").lstrip("#").upper().strip()
-    # Wipe prompt + user's ticker message for a clean panel
-    if user:
-        await clear_nav_panel(context.bot, user.id)
-    await cleanup_trigger_message(update, context)
-    if not ticker:
-        sent = await context.bot.send_message(
-            msg.chat_id,
-            "Please send a valid ticker (e.g. ALRT).",
-            reply_markup=main_reply_keyboard(),
-        )
-        if user:
-            await remember_nav_panel(user.id, sent)
-        return
-    if not await is_authorized(update, context):
-        await context.bot.send_message(
-            msg.chat_id,
-            "🔒 Only authorised members can request snapshots.\n"
-            "Send /request to ask for access.",
-            reply_markup=main_reply_keyboard(),
-        )
-        return
-    try:
-        meta = await get_ticker_from_notion(ticker)
-        if not meta:
-            sent = await context.bot.send_message(
-                msg.chat_id,
-                f"No snapshot for #{ticker} in UK AIM Micro-Cap.",
-                reply_markup=hub_back_keyboard(),
-            )
-            if user:
-                await remember_nav_panel(user.id, sent)
-            await ensure_home_keyboard(context.bot, msg.chat_id)
-            return
-        try:
-            stockpickers = await get_stockpickers_for_ticker(ticker)
-        except Exception:
-            stockpickers = []
-        body = format_reply(ticker, meta, stockpickers)
-        pct = meta.get("day_change_pct")
-        if pct is None:
-            pct = _fetch_pct_on_day_live(ticker)
-        if pct is not None:
-            sign = "+" if pct >= 0 else ""
-            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
-        try:
-            sent = await context.bot.send_message(
-                msg.chat_id,
-                body,
-                parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            sent = await context.bot.send_message(
-                msg.chat_id,
-                body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker),
-                disable_web_page_preview=True,
-            )
-        if user:
-            await remember_nav_panel(user.id, sent)
-        try:
-            await log_member_activity(
-                user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} stock snapshot"
-            )
-        except Exception:
-            pass
-        await ensure_home_keyboard(context.bot, msg.chat_id)
-    except Exception as e:
-        logger.error("deliver_stock_snapshot failed for %s: %s", ticker, e)
-        await context.bot.send_message(
-            msg.chat_id,
-            f"Lookup failed for #{ticker}. Please try again.\n{e}",
-            reply_markup=main_reply_keyboard(),
-        )
-
 
 async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /snap              → prompt (same as Stock Snapshot button)
+    /snap              → short help
     /snap #80M         → snapshot for authorised users
     /snap 80M          → same
     """
@@ -3507,333 +2772,59 @@ async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 tickers.append(t)
 
     if not tickers:
-        # No args → same UX as Home Stock Snapshot button
-        await stock_snapshot_prompt(update, context)
+        await msg.reply_text(
+            "📊 *Company snapshot*\n\n"
+            "Use one of:\n"
+            "• `/snap #80M`\n"
+            "• `#80M #summary`\n"
+            "• `#KEFI #snapshot`\n\n"
+            "A bare `#TICKER` alone is ignored.",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
         return
 
     if not await is_authorized(update, context):
         await msg.reply_text(
             "🔒 Only authorised members can request snapshots.\n"
-            "Send /request to ask for access.",
-            reply_markup=main_reply_keyboard(),
+            "Send /request to ask for access."
         )
         return
 
     for t in tickers:
-        await deliver_stock_snapshot(update, context, t)
-
-
-async def _fetch_stockpicks_month(
-    year: int, month: int, *, mine_user=None
-) -> list[dict]:
-    """
-    Load Hive Stock Picks rows for a calendar month.
-    If mine_user is set, only that user's rows; else all (for league).
-    """
-    db_id = os.getenv("NOTION_STOCKPICKS_DB_ID") or os.getenv("NOTION_DATABASE_ID")
-    if not notion or not db_id:
-        return []
-    try:
-        month_start = datetime(year, month, 1, tzinfo=timezone.utc).date().isoformat()
-        if month == 12:
-            month_end = datetime(year + 1, 1, 1, tzinfo=timezone.utc).date().isoformat()
-        else:
-            month_end = (
-                datetime(year, month + 1, 1, tzinfo=timezone.utc).date().isoformat()
+        data = await get_ticker_from_notion(t)
+        if data:
+            await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
+            stockpickers = await get_stockpickers_for_ticker(t)
+            await msg.reply_text(
+                format_reply(t, data, stockpickers),
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
             )
-        response = notion.databases.query(
-            database_id=db_id,
-            filter={
-                "and": [
-                    {
-                        "property": "Telegram Date",
-                        "date": {"on_or_after": month_start},
-                    },
-                    {
-                        "property": "Telegram Date",
-                        "date": {"before": month_end},
-                    },
-                ]
-            },
-            page_size=100,
-        )
-        uid_marker = f"uid:{mine_user.id}" if mine_user else None
-        user_name = (mine_user.full_name or "").strip().lower() if mine_user else ""
-        username = (mine_user.username or "").strip().lower() if mine_user else ""
-        rows = []
-        for page in response.get("results", []):
-            props = page.get("properties", {})
-            if mine_user:
-                notes = _get_plain_text(props.get("Notes")).lower()
-                posted_by = _get_plain_text(props.get("Posted By")).strip().lower()
-                is_mine = uid_marker and uid_marker in notes
-                if not is_mine and user_name and posted_by == user_name:
-                    is_mine = True
-                if not is_mine and username and username in posted_by:
-                    is_mine = True
-                if not is_mine:
-                    continue
-            date_prop = (props.get("Telegram Date") or {}).get("date") or {}
-            date_str = date_prop.get("start", "—")
-            ticker = (
-                _get_plain_text(props.get("Ticker")) or ""
-            ).lstrip("#").upper() or "—"
-            rows.append(
-                {
-                    "page_id": page["id"],
-                    "date": date_str,
-                    "ticker": ticker,
-                    "summary": _get_plain_text(props.get("Summary")) or "—",
-                    "catalyst": _get_plain_text(props.get("Next Catalyst")) or "—",
-                    "target": _get_plain_text(props.get("Target Price")) or "—",
-                    "posted_by": _get_plain_text(props.get("Posted By")) or "—",
-                    "message": _get_plain_text(props.get("Message")) or "",
-                }
-            )
-        return rows
-    except Exception as e:
-        logger.error("_fetch_stockpicks_month failed: %s", e)
-        return []
-
-
-def _month_label(year: int, month: int) -> str:
-    names = [
-        "",
-        "Jan",
-        "Feb",
-        "Mar",
-        "Apr",
-        "May",
-        "Jun",
-        "Jul",
-        "Aug",
-        "Sept",
-        "Oct",
-        "Nov",
-        "Dec",
-    ]
-    return f"{names[month]} {year}"
-
-
-async def show_stockpick_hub(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    edit: bool = False,
-) -> None:
-    """
-    My Stockpick home – two content parts + 3 expandable inline sections:
-      1) League table (month nav)
-      2) My pick this month (edit actions)
-      3) History (month nav)
-    """
-    user = update.effective_user
-    if update.callback_query:
-        msg = update.callback_query.message
-    else:
-        msg = update.message
-    if not msg or not user:
-        return
-    if not await is_authorized(update, context):
-        text = "🔒 Not authorised. Send /request then /status."
-        if edit:
-            try:
-                await msg.edit_text(text)
-            except Exception:
-                await msg.reply_text(text)
         else:
-            await msg.reply_text(text)
-        return
-
-    st = _msp_state(user.id)
-    now = datetime.now(timezone.utc)
-    # Default cursors to current month
-    ly, lm = st.get("league_y") or now.year, st.get("league_m") or now.month
-    hy, hm = st.get("hist_y") or now.year, st.get("hist_m") or now.month
-
-    # --- Part 2 data: user's current month pick ---
-    my_rows = await _fetch_stockpicks_month(now.year, now.month, mine_user=user)
-    my_pick = my_rows[0] if my_rows else None
-    if my_pick:
-        _last_stockpick_page[user.id] = my_pick["page_id"]
-
-    # Who else picked the same ticker this month (followers / co-pickers)
-    co_pickers: list[str] = []
-    if my_pick and my_pick.get("ticker") and my_pick["ticker"] != "—":
-        all_month = await _fetch_stockpicks_month(now.year, now.month, mine_user=None)
-        for r in all_month:
-            if r["ticker"] == my_pick["ticker"]:
-                name = (r.get("posted_by") or "").strip()
-                if name and name != "—" and name.lower() != (user.full_name or "").lower():
-                    if name not in co_pickers:
-                        co_pickers.append(name)
-
-    lines = [
-        "📌 *My Stockpick*",
-        "",
-        "• View the *Hive Stockpicker League* for the month",
-        "• Enter or edit *your* stockpick this month",
-        "• Open *history* by month",
-        "",
-    ]
-    if my_pick:
-        lines.append(
-            f"*Your pick · {_month_label(now.year, now.month)}:* "
-            f"*#{my_pick['ticker']}*"
-        )
-        lines.append(f"Summary: {my_pick['summary'][:120]}")
-        lines.append(f"Catalyst: {my_pick['catalyst'][:80]}")
-        lines.append(f"Target: {my_pick['target']}")
-        if co_pickers:
-            lines.append(
-                "Also picked by: " + ", ".join(co_pickers[:8])
+            await msg.reply_text(
+                f"I don’t have *#{t}* in the current UK AIM Micro-Cap snapshot.",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
             )
-    else:
-        lines.append(
-            f"_No stockpick yet for {_month_label(now.year, now.month)}. "
-            "Post `#stockpick #TICKER` in the group._"
-        )
-    lines.append("")
-
-    keyboard: list[list] = []
-
-    # --- Section 1: League ---
-    if st.get("league_open"):
-        league_rows = await _fetch_stockpicks_month(ly, lm, mine_user=None)
-        # Aggregate by ticker
-        counts: dict[str, list[str]] = {}
-        for r in league_rows:
-            t = r["ticker"]
-            if not t or t == "—":
-                continue
-            counts.setdefault(t, [])
-            name = (r.get("posted_by") or "?").strip()
-            if name and name not in counts[t]:
-                counts[t].append(name)
-        ranked = sorted(counts.items(), key=lambda x: len(x[1]), reverse=True)
-        lines.append(f"🏆 *League · {_month_label(ly, lm)}*")
-        if not ranked:
-            lines.append("_No stockpicks logged this month._")
-        else:
-            for i, (t, names) in enumerate(ranked[:10], 1):
-                lines.append(f"{i}. *#{t}* · {len(names)} pick(s)")
-                lines.append(f"   {', '.join(names[:6])}")
-        lines.append("")
-        keyboard.append(
-            [
-                InlineKeyboardButton("‹", callback_data="msp:league_prev"),
-                InlineKeyboardButton(
-                    _month_label(ly, lm), callback_data="msp:league_noop"
-                ),
-                InlineKeyboardButton("›", callback_data="msp:league_next"),
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("▴ Hide league", callback_data="msp:ui_league")]
-        )
-    else:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "🏆 League table ▾", callback_data="msp:ui_league"
-                )
-            ]
-        )
-
-    # --- Section 2: My pick this month ---
-    if st.get("mine_open"):
-        keyboard.append(
-            [
-                InlineKeyboardButton("Summary", callback_data="sp:Summary"),
-                InlineKeyboardButton("Catalyst", callback_data="sp:Next Catalyst"),
-            ]
-        )
-        keyboard.append(
-            [
-                InlineKeyboardButton("Target", callback_data="sp:Target Price"),
-                InlineKeyboardButton("Edit pick", callback_data="sp:Change"),
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("▴ Hide my pick", callback_data="msp:ui_mine")]
-        )
-    else:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "✏️ My pick this month ▾", callback_data="msp:ui_mine"
-                )
-            ]
-        )
-
-    # --- Section 3: History ---
-    if st.get("hist_open"):
-        hist_rows = await _fetch_stockpicks_month(hy, hm, mine_user=user)
-        lines.append(f"📚 *History · {_month_label(hy, hm)}*")
-        if not hist_rows:
-            lines.append("_No picks in this month._")
-        else:
-            for r in hist_rows[:8]:
-                lines.append(
-                    f"• *#{r['ticker']}* · {r['date'][:10]}\n"
-                    f"  {r['summary'][:80]}"
-                )
-        lines.append("")
-        keyboard.append(
-            [
-                InlineKeyboardButton("‹", callback_data="msp:hist_prev"),
-                InlineKeyboardButton(
-                    _month_label(hy, hm), callback_data="msp:hist_noop"
-                ),
-                InlineKeyboardButton("›", callback_data="msp:hist_next"),
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("▴ Hide history", callback_data="msp:ui_hist")]
-        )
-    else:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "📚 History ▾", callback_data="msp:ui_hist"
-                )
-            ]
-        )
-
-    keyboard.append(
-        [InlineKeyboardButton("« Hub", callback_data="hub:home")]
-    )
-
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "\n…"
-    markup = InlineKeyboardMarkup(keyboard)
-
-    if edit:
-        try:
-            await msg.edit_text(
-                text, parse_mode="Markdown", reply_markup=markup
-            )
-            await remember_nav_panel(user.id, msg)
-            return
-        except Exception:
-            pass
-    sent = await msg.reply_text(
-        text, parse_mode="Markdown", reply_markup=markup
-    )
-    await remember_nav_panel(user.id, sent)
-    await ensure_home_keyboard(context.bot, msg.chat_id)
-
 
 async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
+
     if not await require_authorized(update, context):
         return
-    await cleanup_trigger_message(update, context)
-    await clear_nav_panel(context.bot, user.id)
-    await show_stockpick_hub(update, context, edit=False)
+
+    await update.message.reply_text(
+        "📌 *My Stockpick hub*\n\n"
+        "• Edit **this month’s** pick with the buttons below\n"
+        "• Open **My Stockpicks** for your full history\n"
+        "• Open **My Watchlist** to manage tickers\n\n"
+        "_Past months’ stockpicks are locked (admin can still change them)._",
+        parse_mode="Markdown",
+        reply_markup=_hub_keyboard(),
+    )
 
 async def show_my_stockpicks(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False
@@ -4057,76 +3048,16 @@ async def show_watchlist(
         )
         rns_hits = len(rns_map)
 
-        # Day % change – always load for display (and for sort-by-pct)
-        # Priority: live Yahoo (session %) → Micro-Cap → Watchlist cache
-        # Live is preferred: Micro-Cap day-% is often empty/stale.
+        # Day % change from UK AIM Micro-Cap (when property exists)
         pct_map: dict[str, float | None] = {}
         sort_mode = _watchlist_sort.get(user.id, "rns")
-        for t in tickers_for_rns:
-            pct_map[t] = None
-            live = _fetch_pct_on_day_live(t)
-            if live is not None:
-                pct_map[t] = live
-            else:
+        if sort_mode == "pct":
+            for t in tickers_for_rns:
                 try:
                     data = await get_ticker_from_notion(t)
-                    if data and data.get("day_change_pct") is not None:
-                        pct_map[t] = data.get("day_change_pct")
+                    pct_map[t] = (data or {}).get("day_change_pct")
                 except Exception:
-                    pass
-            await asyncio.sleep(0.12)
-        # User's this-month stockpick tickers (for 📌 badge)
-        try:
-            my_pick_tickers = await _user_stockpick_tickers_this_month(user)
-        except Exception:
-            my_pick_tickers = set()
-        picks_label = _month_picks_label()
-        # 3) Watchlist row cache if still missing
-        for page in pages:
-            props = page.get("properties", {})
-            ln = _get_plain_text(props.get("List Name")).strip() or "Default"
-            if ln != active:
-                continue
-            t = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper()
-            if not t or pct_map.get(t) is not None:
-                continue
-            pct_prop = props.get("% On Day") or {}
-            if isinstance(pct_prop, dict) and pct_prop.get("number") is not None:
-                try:
-                    pct_map[t] = float(pct_prop["number"])
-                except (TypeError, ValueError):
-                    pass
-        # On Refresh: persist latest % into Hive Bot Watchlist "% On Day"
-        if force_rns and (notion or NOTION_TOKEN):
-            for page in pages:
-                props = page.get("properties", {})
-                ln = _get_plain_text(props.get("List Name")).strip() or "Default"
-                if ln != active:
-                    continue
-                t = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper()
-                pct = pct_map.get(t)
-                if pct is None or not page.get("id"):
-                    continue
-                try:
-                    if notion:
-                        notion.pages.update(
-                            page_id=page["id"],
-                            properties={"% On Day": {"number": float(pct)}},
-                        )
-                    else:
-                        _notion_http(
-                            "PATCH",
-                            f"pages/{page['id']}",
-                            {"properties": {"% On Day": {"number": float(pct)}}},
-                        )
-                    logger.info("Wrote %% On Day=%.2f for %s", pct, t)
-                except Exception as we:
-                    logger.warning(
-                        "Watchlist %% On Day write failed for %s "
-                        "(add Number column '%% On Day' on Hive Bot Watchlist): %s",
-                        t,
-                        we,
-                    )
+                    pct_map[t] = None
 
         # Enrich + sort
         for r in rows:
@@ -4186,36 +3117,16 @@ async def show_watchlist(
         if not rows:
             lines.append("Empty — use Edit list to add tickers.")
         else:
-            lines.append("Tap a #ticker button to open the company snapshot.")
-            lines.append("")
             for r in page_rows:
                 ticker, name, url = r["ticker"], r["name"], r["url"]
-                # Prefer company name from UK AIM Micro-Cap when list Name is thin
-                company = name
-                try:
-                    meta = await get_ticker_from_notion(ticker)
-                    if meta and meta.get("company"):
-                        company = meta["company"]
-                except Exception:
-                    pass
-                r["display_name"] = company
                 pri = r.get("priority")
                 pri_bit = f" · ⭐{pri}" if pri is not None else ""
                 pct = r.get("pct")
+                pct_bit = ""
                 if pct is not None:
                     sign = "+" if pct >= 0 else ""
-                    arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
-                    pct_bit = f" · {arrow} {sign}{pct:.2f}%"
-                else:
-                    pct_bit = " · ⚪ —%"
-                # Badge if this ticker is the user's stockpick this month
-                pick_bit = ""
-                if ticker in my_pick_tickers:
-                    pick_bit = f" 📌 {picks_label}"
-                # e.g. #EPP Energy Pathways · 🟢 +13.70% 📌 Sept Picks
-                lines.append(
-                    f"*#{ticker}* {company}{pri_bit}{pct_bit}{pick_bit}"
-                )
+                    pct_bit = f" · {sign}{pct:.2f}%"
+                lines.append(f"*{ticker}* · {name}{pri_bit}{pct_bit}")
                 if url and url != "-":
                     lines.append(f"  🔗 {url}")
                 rns = r.get("rns") or {}
@@ -4224,163 +3135,74 @@ async def show_watchlist(
                     lines.append(f"  📰 *Latest RNS*{date_bit}")
                     lines.append(f"  {rns.get('title') or '—'}")
                     if rns.get("summary"):
-                        lines.append(f"  {rns['summary']}")
+                        lines.append(f"  _{rns['summary']}_")
                     if rns.get("link"):
                         lines.append(f"  {rns['link']}")
                 else:
                     lines.append("  📰 No RNS in News Log yet")
                 lines.append("")
 
-        # ----- Inline keyboard in 3 sections (expand / contract) -----
-        # 1) Company snapshot list
-        # 2) Navigation (page / sort / refresh) — sort expands
-        # 3) Manage menu — collapsed by default
-        ui = _wl_ui(user.id)
-        sort_open = bool(ui.get("sort_open"))
-        manage_open = bool(ui.get("manage_open"))
-        lists_open = bool(ui.get("lists_open"))
-
         keyboard = []
-
-        # --- Section 1: company snapshot list ---
-        for r in page_rows:
-            t = r["ticker"]
-            n = (r.get("display_name") or r.get("name") or t)[:28]
-            if t and t != "-":
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            f"#{t}  {n}",
-                            callback_data=f"wl:snap:{t[:20]}",
-                        )
-                    ]
+        # Tabs
+        keyboard.extend(_tab_keyboard(list_names, active))
+        # Pagination
+        if total_pages > 1 or total > 0:
+            nav = []
+            if page_idx > 0:
+                nav.append(
+                    InlineKeyboardButton("◀️ Prev", callback_data="wl:page_prev")
                 )
-
-        # --- Section 2: navigation ---
-        # List switcher (collapsed to one button when >1 lists)
-        if len(list_names) > 1:
-            if lists_open:
-                keyboard.extend(_tab_keyboard(list_names, active))
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            "▴ Hide lists", callback_data="wl:ui_lists"
-                        )
-                    ]
+            nav.append(
+                InlineKeyboardButton(
+                    f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
                 )
-            else:
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            f"📂 {active} ▾",
-                            callback_data="wl:ui_lists",
-                        )
-                    ]
-                )
-        elif list_names:
-            # Single list – compact label only (no extra chrome)
-            pass
-
-        # Page + Refresh on one row
-        nav = []
-        if page_idx > 0:
-            nav.append(InlineKeyboardButton("‹", callback_data="wl:page_prev"))
-        nav.append(
-            InlineKeyboardButton(
-                f"{page_idx + 1}/{total_pages}", callback_data="wl:page_noop"
             )
+            if page_idx < total_pages - 1:
+                nav.append(
+                    InlineKeyboardButton("Next ▶️", callback_data="wl:page_next")
+                )
+            keyboard.append(nav)
+        # Sort
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
+                    callback_data="wl:sort_rns",
+                ),
+                InlineKeyboardButton(
+                    "% Day" + (" ✓" if sort_mode == "pct" else ""),
+                    callback_data="wl:sort_pct",
+                ),
+                InlineKeyboardButton(
+                    "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
+                    callback_data="wl:sort_priority",
+                ),
+            ]
         )
-        if page_idx < total_pages - 1:
-            nav.append(InlineKeyboardButton("›", callback_data="wl:page_next"))
-        nav.append(InlineKeyboardButton("🔄", callback_data="wl:refresh_rns"))
-        keyboard.append(nav)
-
-        # Sort – collapsed dropdown style
-        sort_labels = {
-            "rns": "📰 RNS",
-            "pct": "% Day",
-            "priority": "⭐ Pri",
-            "name": "Name",
-        }
-        cur_sort = sort_labels.get(sort_mode, "Sort")
-        if sort_open:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        "📰 RNS" + (" ✓" if sort_mode == "rns" else ""),
-                        callback_data="wl:sort_rns",
-                    ),
-                    InlineKeyboardButton(
-                        "% Day" + (" ✓" if sort_mode == "pct" else ""),
-                        callback_data="wl:sort_pct",
-                    ),
-                    InlineKeyboardButton(
-                        "⭐ Pri" + (" ✓" if sort_mode == "priority" else ""),
-                        callback_data="wl:sort_priority",
-                    ),
-                ]
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        "▴ Hide sort", callback_data="wl:ui_sort"
-                    )
-                ]
-            )
-        else:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        f"Sort: {cur_sort} ▾",
-                        callback_data="wl:ui_sort",
-                    )
-                ]
-            )
-
-        # --- Section 3: manage menu (collapsed by default) ---
-        if manage_open:
-            keyboard.append(
-                [
-                    InlineKeyboardButton("➕ Add", callback_data="wl:add"),
-                    InlineKeyboardButton(
-                        "✏️ Edit", callback_data="wl:edit_menu"
-                    ),
-                ]
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        "⭐ Priority", callback_data="wl:set_priority"
-                    ),
-                    InlineKeyboardButton(
-                        "🆕 New list", callback_data="wl:create"
-                    ),
-                ]
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton("Rename", callback_data="wl:rename"),
-                    InlineKeyboardButton(
-                        "🗑 Delete", callback_data="wl:delete_list"
-                    ),
-                ]
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        "▴ Hide menu", callback_data="wl:ui_manage"
-                    )
-                ]
-            )
-        else:
-            keyboard.append(
-                [
-                    InlineKeyboardButton(
-                        "☰ Manage ▾", callback_data="wl:ui_manage"
-                    ),
-                    InlineKeyboardButton("« Hub", callback_data="hub:home"),
-                ]
-            )
+        keyboard.append(
+            [
+                InlineKeyboardButton("⭐ Set priority", callback_data="wl:set_priority"),
+                InlineKeyboardButton("🔄 Refresh RNS", callback_data="wl:refresh_rns"),
+            ]
+        )
+        # Manage
+        keyboard.append(
+            [
+                InlineKeyboardButton("Create New", callback_data="wl:create"),
+                InlineKeyboardButton("Edit list", callback_data="wl:edit_menu"),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton("Rename", callback_data="wl:rename"),
+                InlineKeyboardButton("Delete list", callback_data="wl:delete_list"),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ]
+        )
 
         text = "\n".join(lines).strip()
         # Telegram message limit safety
@@ -4441,253 +3263,25 @@ async def show_watchlist(
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
-async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """My Stockpick hub expand/collapse + month navigation."""
-    query = update.callback_query
-    user = query.from_user if query else None
-    if not query or not user:
-        return
-    await query.answer()
-    action = (query.data or "").replace("msp:", "", 1)
-    st = _msp_state(user.id)
-    now = datetime.now(timezone.utc)
-
-    def _shift(y: int, m: int, delta: int) -> tuple[int, int]:
-        m = m + delta
-        while m < 1:
-            m += 12
-            y -= 1
-        while m > 12:
-            m -= 12
-            y += 1
-        # Don't go past current month
-        if y > now.year or (y == now.year and m > now.month):
-            return now.year, now.month
-        return y, m
-
-    if action == "ui_league":
-        st["league_open"] = not st.get("league_open")
-        if st["league_open"]:
-            st["mine_open"] = False
-            st["hist_open"] = False
-    elif action == "ui_mine":
-        st["mine_open"] = not st.get("mine_open")
-        if st["mine_open"]:
-            st["league_open"] = False
-            st["hist_open"] = False
-    elif action == "ui_hist":
-        st["hist_open"] = not st.get("hist_open")
-        if st["hist_open"]:
-            st["league_open"] = False
-            st["mine_open"] = False
-    elif action == "league_prev":
-        st["league_y"], st["league_m"] = _shift(
-            st.get("league_y") or now.year,
-            st.get("league_m") or now.month,
-            -1,
-        )
-        st["league_open"] = True
-    elif action == "league_next":
-        st["league_y"], st["league_m"] = _shift(
-            st.get("league_y") or now.year,
-            st.get("league_m") or now.month,
-            1,
-        )
-        st["league_open"] = True
-    elif action == "hist_prev":
-        st["hist_y"], st["hist_m"] = _shift(
-            st.get("hist_y") or now.year,
-            st.get("hist_m") or now.month,
-            -1,
-        )
-        st["hist_open"] = True
-    elif action == "hist_next":
-        st["hist_y"], st["hist_m"] = _shift(
-            st.get("hist_y") or now.year,
-            st.get("hist_m") or now.month,
-            1,
-        )
-        st["hist_open"] = True
-    elif action in ("league_noop", "hist_noop"):
-        return
-
-    await show_stockpick_hub(update, context, edit=True)
-
-
-async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stock of the Day → open snapshot in place with Save + Hub."""
-    query = update.callback_query
-    user = query.from_user if query else None
-    if not query or not user:
-        return
-    await query.answer()
-    data = query.data or ""
-    if not data.startswith("sotd:snap:"):
-        return
-    ticker = data.replace("sotd:snap:", "", 1).strip().upper()
-    if not ticker:
-        return
-    # Reuse snapshot delivery into this chat; keep Home keyboard
-    try:
-        meta = await get_ticker_from_notion(ticker)
-        if not meta:
-            await query.edit_message_text(
-                f"No snapshot for #{ticker} in UK AIM Micro-Cap.",
-                reply_markup=hub_back_keyboard(),
-            )
-            await remember_nav_panel(user.id, query.message)
-            return
-        try:
-            stockpickers = await get_stockpickers_for_ticker(ticker)
-        except Exception:
-            stockpickers = []
-        body = format_reply(ticker, meta, stockpickers)
-        pct = meta.get("day_change_pct")
-        if pct is None:
-            pct = _fetch_pct_on_day_live(ticker)
-        if pct is not None:
-            sign = "+" if pct >= 0 else ""
-            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
-        try:
-            await query.edit_message_text(
-                body,
-                parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            await query.edit_message_text(
-                body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker),
-                disable_web_page_preview=True,
-            )
-        await remember_nav_panel(user.id, query.message)
-        await ensure_home_keyboard(
-            context.bot, query.message.chat_id if query.message else None
-        )
-    except Exception as e:
-        logger.error("sotd:snap failed for %s: %s", ticker, e)
-        try:
-            await query.edit_message_text(
-                f"Snapshot failed: {e}", reply_markup=hub_back_keyboard()
-            )
-        except Exception:
-            pass
-
-
-async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle snap:save:TICKER from Stock Snapshot inline actions."""
-    query = update.callback_query
-    user = query.from_user if query else None
-    if not query or not user:
-        return
-    await query.answer()
-    data = query.data or ""
-    if not data.startswith("snap:save:"):
-        return
-    ticker = data.replace("snap:save:", "", 1).strip().upper()
-    if not ticker:
-        await query.message.reply_text("Missing ticker.")
-        return
-    if not await is_authorized(update, context):
-        await query.message.reply_text(
-            "🔒 Only authorised members can use My Watchlist.\n"
-            "Send /request to ask for access.",
-            reply_markup=main_reply_keyboard(),
-        )
-        return
-    list_name = _active_watchlist_name.get(user.id, "Default")
-    company = ""
-    try:
-        meta = await get_ticker_from_notion(ticker)
-        if meta:
-            company = meta.get("company") or ""
-    except Exception:
-        pass
-    try:
-        status, info = await _watchlist_upsert_ticker(
-            user,
-            ticker=ticker,
-            name=company,
-            link="",
-            list_name=list_name,
-        )
-        if status in ("added", "updated"):
-            verb = "Added to" if status == "added" else "Updated on"
-            msg = (
-                f"✅ *#{ticker}* {verb} My Watchlist "
-                f"(*{list_name}*)."
-            )
-        else:
-            msg = f"⚠️ Could not save *#{ticker}*: {info}"
-        await query.message.reply_text(
-            msg,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "👀 Open My Watchlist",
-                            callback_data="hub:watchlist",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "« Hub", callback_data="hub:home"
-                        )
-                    ],
-                ]
-            ),
-        )
-        await ensure_home_keyboard(
-            context.bot,
-            query.message.chat_id if query.message else None,
-        )
-    except Exception as e:
-        logger.error("snap:save failed for %s: %s", ticker, e)
-        await query.message.reply_text(
-            f"Could not save #{ticker} to watchlist.\n`{e}`",
-            parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
-        )
-
-
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data or ""
-    user = update.effective_user
 
     if data == "hub:watchlist":
         # Cancel any pending watchlist input and return to clean panel
+        user = update.effective_user
         if user:
             _awaiting_watchlist.pop(user.id, None)
-            _awaiting_snapshot.pop(user.id, None)
         await show_watchlist(update, context, edit=True, force_rns=False)
     elif data == "hub:mypicks":
-        await show_stockpick_hub(update, context, edit=True)
+        await show_my_stockpicks(update, context, edit=True)
     elif data == "hub:home":
-        # Wipe previous panel, then land on Home with keyboard that STAYS
-        if user:
-            _awaiting_snapshot.pop(user.id, None)
-            _awaiting_watchlist.pop(user.id, None)
-            _awaiting_link.pop(user.id, None)
-            _awaiting_field.pop(user.id, None)
-            await clear_nav_panel(context.bot, user.id)
-        chat_id = query.message.chat_id if query.message else None
-        # Remove the inline panel (snapshot / sotd / stockpick / etc.)
-        try:
-            await query.message.delete()
-        except Exception:
-            try:
-                await query.edit_message_text("…")
-            except Exception:
-                pass
-        # Must send a non-deleted message with ReplyKeyboardMarkup
-        # or Telegram clients drop the Home menu entirely
-        await send_home_menu(context.bot, chat_id)
-        return
-
+        await query.edit_message_text(
+            "📌 *My Stockpick hub*\n\nChoose an option:",
+            parse_mode="Markdown",
+            reply_markup=_hub_keyboard(),
+        )
 
 async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -4698,126 +3292,10 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = query.data or ""
     action = data.replace("wl:", "")
 
-    # Force re-query RNS News Log + refresh % On Day into Notion
+    # Force re-query RNS News Log for active list tickers
     if action == "refresh_rns":
-        await query.answer("Syncing RNS + % on day…")
-        # Clear ticker cache so day_change_pct is re-read from Notion
-        try:
-            _ticker_cache.clear()
-        except Exception:
-            pass
+        await query.answer("Syncing RNS from Notion…")
         await show_watchlist(update, context, edit=True, force_rns=True)
-        return
-
-    # Expand / contract keyboard sections
-    if action == "ui_sort":
-        st = _wl_ui(user.id)
-        st["sort_open"] = not st.get("sort_open")
-        # keep manage closed when opening sort (less clutter)
-        if st["sort_open"]:
-            st["manage_open"] = False
-        await query.answer()
-        await show_watchlist(update, context, edit=True, force_rns=False)
-        return
-    if action == "ui_manage":
-        st = _wl_ui(user.id)
-        st["manage_open"] = not st.get("manage_open")
-        if st["manage_open"]:
-            st["sort_open"] = False
-            st["lists_open"] = False
-        await query.answer()
-        await show_watchlist(update, context, edit=True, force_rns=False)
-        return
-    if action == "ui_lists":
-        st = _wl_ui(user.id)
-        st["lists_open"] = not st.get("lists_open")
-        if st["lists_open"]:
-            st["manage_open"] = False
-        await query.answer()
-        await show_watchlist(update, context, edit=True, force_rns=False)
-        return
-
-    # « Back to Watchlist from snapshot – restore same panel in place
-    if action == "back":
-        await query.answer()
-        await show_watchlist(update, context, edit=True, force_rns=False)
-        return
-
-    # Ticker "hyperlink" → company snapshot in the SAME message (edit in place)
-    if action.startswith("snap:"):
-        await query.answer()
-        ticker = action[5:].strip().upper()
-        back_kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "« Back to Watchlist", callback_data="wl:back"
-                    )
-                ]
-            ]
-        )
-        if not ticker:
-            try:
-                await query.edit_message_text(
-                    "Missing ticker.", reply_markup=back_kb
-                )
-            except Exception:
-                await query.message.reply_text(
-                    "Missing ticker.", reply_markup=back_kb
-                )
-            return
-        try:
-            meta = await get_ticker_from_notion(ticker)
-            if not meta:
-                body = f"No snapshot for #{ticker} in UK AIM Micro-Cap."
-                try:
-                    await query.edit_message_text(body, reply_markup=back_kb)
-                except Exception:
-                    await query.message.reply_text(body, reply_markup=back_kb)
-                return
-            try:
-                stockpickers = await get_stockpickers_for_ticker(ticker)
-            except Exception:
-                stockpickers = []
-            body = format_reply(ticker, meta, stockpickers)
-            pct = meta.get("day_change_pct")
-            if pct is None:
-                pct = _fetch_pct_on_day_live(ticker)
-            if pct is not None:
-                sign = "+" if pct >= 0 else ""
-                body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
-            # Stay in the same view: replace watchlist message with snapshot
-            try:
-                await query.edit_message_text(
-                    body,
-                    parse_mode="Markdown",
-                    reply_markup=back_kb,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                try:
-                    await query.edit_message_text(
-                        body.replace("*", "").replace("_", ""),
-                        reply_markup=back_kb,
-                        disable_web_page_preview=True,
-                    )
-                except Exception as e2:
-                    logger.warning("wl:snap edit failed, fallback reply: %s", e2)
-                    await query.message.reply_text(
-                        body.replace("*", "").replace("_", ""),
-                        reply_markup=back_kb,
-                        disable_web_page_preview=True,
-                    )
-        except Exception as e:
-            logger.error("wl:snap failed for %s: %s", ticker, e)
-            try:
-                await query.edit_message_text(
-                    f"Snapshot failed: {e}", reply_markup=back_kb
-                )
-            except Exception:
-                await query.message.reply_text(
-                    f"Snapshot failed: {e}", reply_markup=back_kb
-                )
         return
 
     # Pagination
@@ -4842,11 +3320,6 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             mode = "rns"
         _watchlist_sort[user.id] = mode
         _watchlist_page[user.id] = 0  # reset to first page
-        # Collapse sort dropdown after choice
-        try:
-            _wl_ui(user.id)["sort_open"] = False
-        except Exception:
-            pass
         labels = {
             "rns": "Latest RNS",
             "pct": "% day change",
@@ -6128,59 +4601,21 @@ async def append_request_history(
             "Request history row created user=%s type=%s", user.id, notion_type
         )
     except Exception as e:
-        logger.error(
-            "append_request_history failed for %s type=%s ds=%s db=%s: %s",
-            user.id,
-            notion_type,
-            ds_id,
-            db_id,
-            e,
-        )
-        # Last resort: classic pages.create via database_id only
-        try:
-            if db_id and notion:
-                notion.pages.create(
-                    parent={"database_id": db_id},
-                    properties=props,
-                )
-                logger.info(
-                    "Request history row created via fallback user=%s type=%s",
-                    user.id,
-                    notion_type,
-                )
-        except Exception as e2:
-            logger.error("append_request_history fallback failed: %s", e2)
+        logger.error("append_request_history failed for %s: %s", user.id, e)
 
 
 async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
-    1) Always write a standalone Request History row (source of truth).
-    2) Best-effort update of the member's Auth row (count / last request).
-
-    History must never depend on finding an Auth row — that was blocking
-    live sync after 2026-09-12.
+    Update Hive Bot Authorised Users with last request date/type and increment count.
+    Uses data-source API so multi-source Auth DB updates reliably.
     """
     if not user:
         return
     if not notion and not NOTION_TOKEN:
         return
 
-    # --- 1. Request History (always) ---
-    try:
-        await append_request_history(
-            user, request_type, details=notes, status="Logged"
-        )
-    except Exception as he:
-        logger.error(
-            "append_request_history failed for %s type=%s: %s",
-            user.id,
-            request_type,
-            he,
-        )
-
-    # --- 2. Auth row activity counters (best-effort) ---
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
     )
@@ -6189,31 +4624,18 @@ async def log_member_activity(
         return
 
     try:
-        results = []
-        # Telegram User ID may be title or rich_text depending on schema version
-        for filt in (
-            {"property": "Telegram User ID", "title": {"equals": str(user.id)}},
-            {"property": "Telegram User ID", "rich_text": {"equals": str(user.id)}},
-        ):
-            try:
-                response = notion_query_data_source(
-                    data_source_id=ds_id,
-                    database_id=db_id,
-                    filter=filt,
-                    page_size=1,
-                )
-                results = response.get("results", [])
-                if results:
-                    break
-            except Exception as fe:
-                logger.warning("log_member_activity filter %s failed: %s", filt, fe)
-
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
         if not results:
-            logger.info(
-                "log_member_activity: no auth row for user %s "
-                "(history already written)",
-                user.id,
-            )
+            logger.info("log_member_activity: no auth row for user %s", user.id)
             return
 
         page = results[0]
@@ -6230,24 +4652,13 @@ async def log_member_activity(
         elif isinstance(count_prop, (int, float)):
             count = int(count_prop)
 
-        # Last Request Type select must match Auth DB options; fall back safely
-        type_for_auth = request_type
-        if request_type not in (
-            "Stockpick",
-            "Security snapshot",
-            "Telegram link",
-            "Access request",
-            "Other",
-        ):
-            type_for_auth = "Other"
-
         update_props: dict = {
             "Last Request Date": {
                 "date": {
                     "start": datetime.now(timezone.utc).date().isoformat()
                 }
             },
-            "Last Request Type": {"select": {"name": type_for_auth}},
+            "Last Request Type": {"select": {"name": request_type}},
             "Request Count": {"number": count + 1},
         }
         if notes:
@@ -6255,35 +4666,24 @@ async def log_member_activity(
                 "rich_text": [{"text": {"content": notes[:1800]}}]
             }
 
-        try:
-            if notion:
-                notion.pages.update(page_id=page_id, properties=update_props)
-            else:
-                _notion_http(
-                    "PATCH", f"pages/{page_id}", {"properties": update_props}
-                )
-            logger.info(
-                "Logged activity user=%s type=%s count=%s",
-                user.id,
-                request_type,
-                count + 1,
-            )
-        except Exception as ue:
-            # Retry without Last Request Type if select option rejected
-            logger.warning(
-                "Auth update with type failed user=%s: %s – retrying without type",
-                user.id,
-                ue,
-            )
-            update_props.pop("Last Request Type", None)
-            if notion:
-                notion.pages.update(page_id=page_id, properties=update_props)
-            else:
-                _notion_http(
-                    "PATCH", f"pages/{page_id}", {"properties": update_props}
-                )
+        # pages.update still works by page_id regardless of multi-source
+        if notion:
+            notion.pages.update(page_id=page_id, properties=update_props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+
+        logger.info(
+            "Logged activity user=%s type=%s count=%s",
+            user.id,
+            request_type,
+            count + 1,
+        )
+        # Standalone history row (one row per request)
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
+        )
     except Exception as e:
-        logger.error("log_member_activity auth update failed for %s: %s", user.id, e)
+        logger.error("log_member_activity failed for %s: %s", user.id, e)
 
         
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6352,9 +4752,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(hub_button, pattern=r"^hub:"))
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
-    app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
-    app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
-    app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
