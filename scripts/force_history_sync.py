@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Re-apply Notion auto-sync on top of the LATEST bot.py from hive-bot main.
+Re-apply Notion Request History auto-sync on top of latest bot.py.
 
-1) log_member_activity always writes Request History first
-2) append_request_history has pages.create fallback
-3) Watchlist add/remove logs to Request History
-4) REQUEST_TYPE_WATCHLIST constant
-
-Idempotent: safe to run multiple times.
+- Replace append_request_history with hardened multi-attempt writer
+- Replace log_member_activity (History first, then Auth)
+- Add /logtest admin command to surface live Notion errors
+- Watchlist add/remove history logging
 """
 from pathlib import Path
 import re
@@ -15,20 +13,162 @@ import re
 path = Path("bot.py")
 text = path.read_text()
 
-# ------------------------------------------------------------------
-# 1. Replace log_member_activity entirely
-# ------------------------------------------------------------------
-start = text.find("async def log_member_activity(")
+# ---------------------------------------------------------------------------
+# 1) Replace append_request_history entirely
+# ---------------------------------------------------------------------------
+start = text.find("async def append_request_history(")
 if start < 0:
-    raise SystemExit("log_member_activity not found")
-
+    raise SystemExit("append_request_history not found")
 rest = text[start + 10 :]
 m = re.search(r"\nasync def ", rest)
 if not m:
-    raise SystemExit("could not find end of log_member_activity")
+    raise SystemExit("end of append_request_history not found")
 end = start + 10 + m.start()
 
-new_fn = '''async def log_member_activity(
+new_append = r'''async def append_request_history(
+    user,
+    request_type: str,
+    *,
+    details: str | None = None,
+    status: str = "Logged",
+) -> bool:
+    """
+    Create a standalone row in Hive Bot Request History.
+    Returns True on success. Tries data_source then database parent,
+    then a minimal property payload. Always logs the full error body.
+    """
+    if not user:
+        return False
+    if not NOTION_TOKEN and not notion:
+        logger.error("append_request_history: no NOTION_TOKEN")
+        return False
+
+    ds_id = (NOTION_HISTORY_DATA_SOURCE_ID or "").strip() or None
+    db_id = (NOTION_HISTORY_DB_ID or "").strip() or None
+    if db_id:
+        raw = db_id.replace("-", "")
+        if len(raw) == 32:
+            db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+    if not ds_id and not db_id:
+        logger.error("append_request_history: HISTORY db/ds ids missing")
+        return False
+
+    type_map = {
+        "Stockpick": "Stockpick",
+        "Security snapshot": "Security snapshot",
+        "Telegram link": "Telegram link",
+        "Access request": "Access request",
+        "Other": "Other",
+        REQUEST_TYPE_STOCKPICK: "Stockpick",
+        REQUEST_TYPE_SNAPSHOT: "Security snapshot",
+        REQUEST_TYPE_TG_LINK: "Telegram link",
+    }
+    if "REQUEST_TYPE_WATCHLIST" in dir() or True:
+        try:
+            type_map[REQUEST_TYPE_WATCHLIST] = "Other"
+        except Exception:
+            pass
+    notion_type = type_map.get(request_type, "Other")
+    if notion_type not in (
+        "Stockpick",
+        "Security snapshot",
+        "Telegram link",
+        "Access request",
+        "Other",
+    ):
+        notion_type = "Other"
+
+    st = status if status in ("Logged", "Pending", "Completed", "Denied") else "Logged"
+    now = datetime.now(timezone.utc)
+    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
+
+    def _props(minimal: bool = False) -> dict:
+        p = {
+            "Request": {"title": [{"text": {"content": title[:100]}}]},
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+            "Request Type": {"select": {"name": notion_type}},
+            "Status": {"select": {"name": st}},
+            "Requested At": {"date": {"start": now.date().isoformat()}},
+        }
+        if not minimal:
+            p["Full Name"] = {
+                "rich_text": [
+                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
+                ]
+            }
+            if user.username:
+                p["Username"] = {
+                    "rich_text": [{"text": {"content": user.username[:100]}}]
+                }
+            if details:
+                p["Details"] = {
+                    "rich_text": [{"text": {"content": details[:1800]}}]
+                }
+        return p
+
+    attempts = []
+    if ds_id:
+        attempts.append(
+            ("data_source", {"parent": {"type": "data_source_id", "data_source_id": ds_id}})
+        )
+    if db_id:
+        attempts.append(("database", {"parent": {"database_id": db_id}}))
+
+    last_err = None
+    for minimal in (False, True):
+        props = _props(minimal=minimal)
+        for label, parent in attempts:
+            body = {**parent, "properties": props}
+            try:
+                _notion_http("POST", "pages", body)
+                logger.info(
+                    "Request history row created user=%s type=%s via=%s minimal=%s",
+                    user.id,
+                    notion_type,
+                    label,
+                    minimal,
+                )
+                return True
+            except Exception as e:
+                last_err = e
+                logger.error(
+                    "append_request_history attempt failed user=%s via=%s minimal=%s: %s",
+                    user.id,
+                    label,
+                    minimal,
+                    e,
+                )
+
+    logger.error(
+        "append_request_history ALL attempts failed user=%s type=%s ds=%s db=%s last=%s",
+        user.id,
+        notion_type,
+        ds_id,
+        db_id,
+        last_err,
+    )
+    return False
+
+
+'''
+
+text = text[:start] + new_append + text[end:]
+
+# ---------------------------------------------------------------------------
+# 2) Replace log_member_activity
+# ---------------------------------------------------------------------------
+start = text.find("async def log_member_activity(")
+if start < 0:
+    raise SystemExit("log_member_activity not found")
+rest = text[start + 10 :]
+m = re.search(r"\nasync def ", rest)
+if not m:
+    raise SystemExit("end of log_member_activity not found")
+end = start + 10 + m.start()
+
+new_log = r'''async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
@@ -43,18 +183,24 @@ new_fn = '''async def log_member_activity(
     if not notion and not NOTION_TOKEN:
         return
 
-    # --- 1. Request History (always) ---
     try:
-        await append_request_history(
+        ok = await append_request_history(
             user, request_type, details=notes, status="Logged"
         )
+        if not ok:
+            logger.error(
+                "log_member_activity: History write returned False user=%s type=%s",
+                user.id,
+                request_type,
+            )
     except Exception as he:
         logger.error(
             "append_request_history failed for %s type=%s: %s",
-            user.id, request_type, he,
+            user.id,
+            request_type,
+            he,
         )
 
-    # --- 2. Auth row activity counters (best-effort) ---
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
     )
@@ -83,7 +229,7 @@ new_fn = '''async def log_member_activity(
 
         if not results:
             logger.info(
-                "log_member_activity: no auth row for user %s (history already written)",
+                "log_member_activity: no auth row for user %s (history already attempted)",
                 user.id,
             )
             return
@@ -125,12 +271,15 @@ new_fn = '''async def log_member_activity(
                 _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
             logger.info(
                 "Logged activity user=%s type=%s count=%s",
-                user.id, request_type, count + 1,
+                user.id,
+                request_type,
+                count + 1,
             )
         except Exception as ue:
             logger.warning(
                 "Auth update with type failed user=%s: %s – retrying without type",
-                user.id, ue,
+                user.id,
+                ue,
             )
             update_props.pop("Last Request Type", None)
             if notion:
@@ -143,37 +292,11 @@ new_fn = '''async def log_member_activity(
 
 '''
 
-text = text[:start] + new_fn + text[end:]
+text = text[:start] + new_log + text[end:]
 
-# ------------------------------------------------------------------
-# 2. Harden append_request_history error path
-# ------------------------------------------------------------------
-old_err = (
-    '    except Exception as e:\n'
-    '        logger.error("append_request_history failed for %s: %s", user.id, e)'
-)
-new_err = (
-    '    except Exception as e:\n'
-    '        logger.error(\n'
-    '            "append_request_history failed for %s type=%s ds=%s db=%s: %s",\n'
-    '            user.id, notion_type, ds_id, db_id, e,\n'
-    '        )\n'
-    '        try:\n'
-    '            if db_id and notion:\n'
-    '                notion.pages.create(parent={"database_id": db_id}, properties=props)\n'
-    '                logger.info(\n'
-    '                    "Request history row created via fallback user=%s type=%s",\n'
-    '                    user.id, notion_type,\n'
-    '                )\n'
-    '        except Exception as e2:\n'
-    '            logger.error("append_request_history fallback failed: %s", e2)'
-)
-if old_err in text:
-    text = text.replace(old_err, new_err, 1)
-
-# ------------------------------------------------------------------
-# 3. REQUEST_TYPE_WATCHLIST constant
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 3) REQUEST_TYPE_WATCHLIST
+# ---------------------------------------------------------------------------
 if "REQUEST_TYPE_WATCHLIST" not in text:
     text = text.replace(
         'REQUEST_TYPE_TG_LINK = "Telegram link"',
@@ -181,20 +304,17 @@ if "REQUEST_TYPE_WATCHLIST" not in text:
         1,
     )
 
-# ------------------------------------------------------------------
-# 4. Watchlist add → history log
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4) Watchlist logging (best-effort patterns)
+# ---------------------------------------------------------------------------
 if "Watchlist add:" not in text:
-    # Prefer lines.append style; fall back to bits.append
-    patterns = [
-        (
-            '''            if added:
+    old = '''            if added:
                 lines.append(
                     f"✅ Added ({len(added)}): "
                     + ", ".join(f"#{x}" for x in added)
                 )
-            if updated:''',
-            '''            if added:
+            if updated:'''
+    new = '''            if added:
                 lines.append(
                     f"✅ Added ({len(added)}): "
                     + ", ".join(f"#{x}" for x in added)
@@ -207,17 +327,10 @@ if "Watchlist add:" not in text:
                     )
                 except Exception as le:
                     logger.warning("watchlist add history log failed: %s", le)
-            if updated:''',
-        ),
-    ]
-    for old, new in patterns:
-        if old in text:
-            text = text.replace(old, new, 1)
-            break
+            if updated:'''
+    if old in text:
+        text = text.replace(old, new, 1)
 
-# ------------------------------------------------------------------
-# 5. Watchlist remove → history log
-# ------------------------------------------------------------------
 if "Watchlist remove:" not in text:
     old_rm = '''            if removed:
                 bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
@@ -236,10 +349,66 @@ if "Watchlist remove:" not in text:
     if old_rm in text:
         text = text.replace(old_rm, new_rm, 1)
 
+# ---------------------------------------------------------------------------
+# 5) Admin /logtest command
+# ---------------------------------------------------------------------------
+if "async def logtest_cmd" not in text:
+    logtest_fn = r'''
+async def logtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: force one Request History write and report success/error."""
+    user = update.effective_user
+    if not is_admin(user):
+        await update.message.reply_text("Admin only.")
+        return
+    ds = (NOTION_HISTORY_DATA_SOURCE_ID or "").strip()
+    db = (NOTION_HISTORY_DB_ID or "").strip()
+    tok = "yes" if NOTION_TOKEN else "NO"
+    await update.message.reply_text(
+        f"History diagnostic…\n"
+        f"NOTION_TOKEN set: {tok}\n"
+        f"HISTORY_DS: {ds or 'MISSING'}\n"
+        f"HISTORY_DB: {db or 'MISSING'}"
+    )
+    try:
+        ok = await append_request_history(
+            user,
+            "Other",
+            details="/logtest forced write from Railway",
+            status="Logged",
+        )
+        if ok:
+            await update.message.reply_text(
+                "✅ History row created. Check Hive Bot Request History."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ History write failed. Check Railway logs for "
+                "append_request_history attempt failed…"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Exception:\n`{e}`", parse_mode="Markdown")
+
+
+'''
+    # Insert before def main
+    idx = text.find("\ndef main()")
+    if idx < 0:
+        idx = text.find("\nasync def main")
+    if idx > 0:
+        text = text[:idx] + "\n" + logtest_fn + text[idx:]
+
+if 'CommandHandler("logtest"' not in text and "CommandHandler('logtest'" not in text:
+    text = text.replace(
+        'app.add_handler(CommandHandler("debug", with_command_cleanup(debug_cmd)))',
+        'app.add_handler(CommandHandler("debug", with_command_cleanup(debug_cmd)))\n'
+        '    app.add_handler(CommandHandler("logtest", with_command_cleanup(logtest_cmd)))',
+        1,
+    )
+
 path.write_text(text)
 assert "History must never depend" in text
-print("OK rewritten on latest bot.py", path.stat().st_size)
-print("  history-first:", "History must never depend" in text)
-print("  watchlist add:", "Watchlist add:" in text)
-print("  watchlist remove:", "Watchlist remove:" in text)
-print("  WATCHLIST const:", "REQUEST_TYPE_WATCHLIST" in text)
+assert "async def logtest_cmd" in text
+print("OK", path.stat().st_size)
+print(" history-first", "History must never depend" in text)
+print(" logtest", "logtest_cmd" in text)
+print(" multi-attempt", "ALL attempts failed" in text)
