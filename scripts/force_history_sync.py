@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Rewrite log_member_activity so Request History is always written first."""
+"""
+Re-apply Notion auto-sync on top of the LATEST bot.py from hive-bot main.
+
+1) log_member_activity always writes Request History first
+2) append_request_history has pages.create fallback
+3) Watchlist add/remove logs to Request History
+4) REQUEST_TYPE_WATCHLIST constant
+
+Idempotent: safe to run multiple times.
+"""
 from pathlib import Path
 import re
 
 path = Path("bot.py")
 text = path.read_text()
 
+# ------------------------------------------------------------------
+# 1. Replace log_member_activity entirely
+# ------------------------------------------------------------------
 start = text.find("async def log_member_activity(")
 if start < 0:
     raise SystemExit("log_member_activity not found")
@@ -133,6 +145,9 @@ new_fn = '''async def log_member_activity(
 
 text = text[:start] + new_fn + text[end:]
 
+# ------------------------------------------------------------------
+# 2. Harden append_request_history error path
+# ------------------------------------------------------------------
 old_err = (
     '    except Exception as e:\n'
     '        logger.error("append_request_history failed for %s: %s", user.id, e)'
@@ -156,6 +171,75 @@ new_err = (
 if old_err in text:
     text = text.replace(old_err, new_err, 1)
 
+# ------------------------------------------------------------------
+# 3. REQUEST_TYPE_WATCHLIST constant
+# ------------------------------------------------------------------
+if "REQUEST_TYPE_WATCHLIST" not in text:
+    text = text.replace(
+        'REQUEST_TYPE_TG_LINK = "Telegram link"',
+        'REQUEST_TYPE_TG_LINK = "Telegram link"\nREQUEST_TYPE_WATCHLIST = "Other"',
+        1,
+    )
+
+# ------------------------------------------------------------------
+# 4. Watchlist add → history log
+# ------------------------------------------------------------------
+if "Watchlist add:" not in text:
+    # Prefer lines.append style; fall back to bits.append
+    patterns = [
+        (
+            '''            if added:
+                lines.append(
+                    f"✅ Added ({len(added)}): "
+                    + ", ".join(f"#{x}" for x in added)
+                )
+            if updated:''',
+            '''            if added:
+                lines.append(
+                    f"✅ Added ({len(added)}): "
+                    + ", ".join(f"#{x}" for x in added)
+                )
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist add: {', '.join('#'+x for x in added)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist add history log failed: %s", le)
+            if updated:''',
+        ),
+    ]
+    for old, new in patterns:
+        if old in text:
+            text = text.replace(old, new, 1)
+            break
+
+# ------------------------------------------------------------------
+# 5. Watchlist remove → history log
+# ------------------------------------------------------------------
+if "Watchlist remove:" not in text:
+    old_rm = '''            if removed:
+                bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+            if missing:'''
+    new_rm = '''            if removed:
+                bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist remove: {', '.join('#'+x for x in removed)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist remove history log failed: %s", le)
+            if missing:'''
+    if old_rm in text:
+        text = text.replace(old_rm, new_rm, 1)
+
 path.write_text(text)
 assert "History must never depend" in text
-print("OK rewritten", path.stat().st_size)
+print("OK rewritten on latest bot.py", path.stat().st_size)
+print("  history-first:", "History must never depend" in text)
+print("  watchlist add:", "Watchlist add:" in text)
+print("  watchlist remove:", "Watchlist remove:" in text)
+print("  WATCHLIST const:", "REQUEST_TYPE_WATCHLIST" in text)
