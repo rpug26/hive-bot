@@ -1740,13 +1740,14 @@ async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
 
     Never delete the message that carries ReplyKeyboardMarkup — many Telegram
     clients drop the keyboard when that message is removed.
+    Uses a minimal 🏠 anchor to keep the chat clean.
     """
     if not bot or chat_id is None:
         return
     try:
         await bot.send_message(
             chat_id,
-            "🏠 Home",
+            "🏠",
             reply_markup=main_reply_keyboard(),
         )
     except Exception as e:
@@ -4667,25 +4668,59 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "hub:mypicks":
         await show_stockpick_hub(update, context, edit=True)
     elif data == "hub:home":
-        # Wipe previous panel, then land on Home with keyboard that STAYS
+        # Clean overlay: clear state + collapse prior panel in-place + Home keyboard
         if user:
             _awaiting_snapshot.pop(user.id, None)
             _awaiting_watchlist.pop(user.id, None)
             _awaiting_link.pop(user.id, None)
             _awaiting_field.pop(user.id, None)
             await clear_nav_panel(context.bot, user.id)
-        chat_id = query.message.chat_id if query.message else None
-        # Remove the inline panel (snapshot / sotd / stockpick / etc.)
-        try:
-            await query.message.delete()
-        except Exception:
+            # Drop watchlist panel tracking so Hub does not leave a second message
             try:
-                await query.edit_message_text("…")
+                _watchlist_ui.pop(user.id, None)
             except Exception:
                 pass
-        # Must send a non-deleted message with ReplyKeyboardMarkup
-        # or Telegram clients drop the Home menu entirely
-        await send_home_menu(context.bot, chat_id)
+        chat_id = query.message.chat_id if query.message else None
+        home_text = (
+            "🏠 *Home*\n\n"
+            "• 👀 My Watchlist\n"
+            "• 📌 My Stockpick\n"
+            "• 📊 Stock Snapshot\n"
+            "• 🔗 Group Links\n"
+            "• 📋 Menu\n"
+            "• 🏆 Stock of the Day\n"
+            "• 🙈 Hide"
+        )
+        # Prefer EDIT of the current inline panel → no stacked leftover body
+        edited = False
+        try:
+            await query.edit_message_text(
+                home_text,
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
+            edited = True
+            if user and query.message:
+                await remember_nav_panel(user.id, query.message)
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        # Attach full 7-button reply keyboard (Telegram requires a real message)
+        if chat_id and context.bot:
+            try:
+                if edited:
+                    # Minimal anchor so keyboard sticks without a second long menu
+                    await context.bot.send_message(
+                        chat_id,
+                        "🏠",
+                        reply_markup=main_reply_keyboard(),
+                    )
+                else:
+                    await send_home_menu(context.bot, chat_id)
+            except Exception:
+                await ensure_home_keyboard(context.bot, chat_id)
         return
 
 
@@ -5300,14 +5335,6 @@ async def handle_watchlist_text(
             bits = []
             if removed:
                 bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
-                try:
-                    await log_member_activity(
-                        user,
-                        REQUEST_TYPE_WATCHLIST,
-                        notes=f"Watchlist remove: {', '.join('#'+x for x in removed)}",
-                    )
-                except Exception as le:
-                    logger.warning("watchlist remove history log failed: %s", le)
             if missing:
                 bits.append("Not found: " + ", ".join(f"#{x}" for x in missing))
             await _watchlist_finish_action(
@@ -5349,14 +5376,6 @@ async def handle_watchlist_text(
                     f"✅ Added ({len(added)}): "
                     + ", ".join(f"#{x}" for x in added)
                 )
-                try:
-                    await log_member_activity(
-                        user,
-                        REQUEST_TYPE_WATCHLIST,
-                        notes=f"Watchlist add: {', '.join('#'+x for x in added)}",
-                    )
-                except Exception as le:
-                    logger.warning("watchlist add history log failed: %s", le)
             if updated:
                 lines.append(
                     f"♻️ Updated ({len(updated)}): "
@@ -6070,7 +6089,6 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
 REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
-REQUEST_TYPE_WATCHLIST = "Other"
 
 
 async def append_request_history(
@@ -6079,160 +6097,86 @@ async def append_request_history(
     *,
     details: str | None = None,
     status: str = "Logged",
-) -> bool:
+) -> None:
     """
-    Create a standalone row in Hive Bot Request History.
-    Returns True on success. Tries data_source then database parent,
-    then a minimal property payload. Always logs the full error body.
+    Create a standalone row in Hive Bot Request History (one row per request).
     """
     if not user:
-        return False
+        return
     if not NOTION_TOKEN and not notion:
-        logger.error("append_request_history: no NOTION_TOKEN")
-        return False
-
-    ds_id = (NOTION_HISTORY_DATA_SOURCE_ID or "").strip() or None
-    db_id = (NOTION_HISTORY_DB_ID or "").strip() or None
-    if db_id:
-        raw = db_id.replace("-", "")
-        if len(raw) == 32:
-            db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+        return
+    ds_id = NOTION_HISTORY_DATA_SOURCE_ID
+    db_id = NOTION_HISTORY_DB_ID
     if not ds_id and not db_id:
-        logger.error("append_request_history: HISTORY db/ds ids missing")
-        return False
+        return
 
+    # Map bot types → Notion select options
     type_map = {
         "Stockpick": "Stockpick",
         "Security snapshot": "Security snapshot",
         "Telegram link": "Telegram link",
         "Access request": "Access request",
-        "Other": "Other",
         REQUEST_TYPE_STOCKPICK: "Stockpick",
         REQUEST_TYPE_SNAPSHOT: "Security snapshot",
         REQUEST_TYPE_TG_LINK: "Telegram link",
     }
-    if "REQUEST_TYPE_WATCHLIST" in dir() or True:
-        try:
-            type_map[REQUEST_TYPE_WATCHLIST] = "Other"
-        except Exception:
-            pass
-    notion_type = type_map.get(request_type, "Other")
-    if notion_type not in (
-        "Stockpick",
-        "Security snapshot",
-        "Telegram link",
-        "Access request",
-        "Other",
-    ):
-        notion_type = "Other"
+    notion_type = type_map.get(request_type, request_type if request_type in {
+        "Stockpick", "Security snapshot", "Telegram link", "Access request", "Other"
+    } else "Other")
 
-    st = status if status in ("Logged", "Pending", "Completed", "Denied") else "Logged"
     now = datetime.now(timezone.utc)
     title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
-
-    def _props(minimal: bool = False) -> dict:
-        p = {
-            "Request": {"title": [{"text": {"content": title[:100]}}]},
-            "Telegram User ID": {
-                "rich_text": [{"text": {"content": str(user.id)}}]
-            },
-            "Request Type": {"select": {"name": notion_type}},
-            "Status": {"select": {"name": st}},
-            "Requested At": {"date": {"start": now.date().isoformat()}},
-        }
-        if not minimal:
-            p["Full Name"] = {
-                "rich_text": [
-                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
-                ]
+    props = {
+        "Request": {"title": [{"text": {"content": title[:100]}}]},
+        "Telegram User ID": {
+            "rich_text": [{"text": {"content": str(user.id)}}]
+        },
+        "Full Name": {
+            "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+        },
+        "Request Type": {"select": {"name": notion_type}},
+        "Requested At": {
+            "date": {
+                "start": now.isoformat().replace("+00:00", "Z"),
             }
-            if user.username:
-                p["Username"] = {
-                    "rich_text": [{"text": {"content": user.username[:100]}}]
-                }
-            if details:
-                p["Details"] = {
-                    "rich_text": [{"text": {"content": details[:1800]}}]
-                }
-        return p
+        },
+        "Status": {"select": {"name": status if status in {
+            "Logged", "Pending", "Completed", "Denied"
+        } else "Logged"}},
+    }
+    if user.username:
+        props["Username"] = {
+            "rich_text": [{"text": {"content": user.username[:100]}}]
+        }
+    if details:
+        props["Details"] = {
+            "rich_text": [{"text": {"content": details[:1800]}}]
+        }
 
-    attempts = []
-    if ds_id:
-        attempts.append(
-            ("data_source", {"parent": {"type": "data_source_id", "data_source_id": ds_id}})
+    try:
+        notion_create_page_in_data_source(
+            properties=props,
+            data_source_id=ds_id,
+            database_id=db_id,
         )
-    if db_id:
-        attempts.append(("database", {"parent": {"database_id": db_id}}))
-
-    last_err = None
-    for minimal in (False, True):
-        props = _props(minimal=minimal)
-        for label, parent in attempts:
-            body = {**parent, "properties": props}
-            try:
-                _notion_http("POST", "pages", body)
-                logger.info(
-                    "Request history row created user=%s type=%s via=%s minimal=%s",
-                    user.id,
-                    notion_type,
-                    label,
-                    minimal,
-                )
-                return True
-            except Exception as e:
-                last_err = e
-                logger.error(
-                    "append_request_history attempt failed user=%s via=%s minimal=%s: %s",
-                    user.id,
-                    label,
-                    minimal,
-                    e,
-                )
-
-    logger.error(
-        "append_request_history ALL attempts failed user=%s type=%s ds=%s db=%s last=%s",
-        user.id,
-        notion_type,
-        ds_id,
-        db_id,
-        last_err,
-    )
-    return False
-
+        logger.info(
+            "Request history row created user=%s type=%s", user.id, notion_type
+        )
+    except Exception as e:
+        logger.error("append_request_history failed for %s: %s", user.id, e)
 
 
 async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
-    Consistent Notion auto-sync on every request:
-      1) Always write Hive Bot Request History (source of truth)
-      2) Best-effort update Hive Bot Authorised Users (count / last request)
-
-    History must never depend on finding an Auth row.
+    Update Hive Bot Authorised Users with last request date/type and increment count.
+    Uses data-source API so multi-source Auth DB updates reliably.
     """
     if not user:
         return
     if not notion and not NOTION_TOKEN:
         return
-
-    try:
-        ok = await append_request_history(
-            user, request_type, details=notes, status="Logged"
-        )
-        if not ok:
-            logger.error(
-                "log_member_activity: History write returned False user=%s type=%s",
-                user.id,
-                request_type,
-            )
-    except Exception as he:
-        logger.error(
-            "append_request_history failed for %s type=%s: %s",
-            user.id,
-            request_type,
-            he,
-        )
 
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
@@ -6242,29 +6186,18 @@ async def log_member_activity(
         return
 
     try:
-        results = []
-        for filt in (
-            {"property": "Telegram User ID", "title": {"equals": str(user.id)}},
-            {"property": "Telegram User ID", "rich_text": {"equals": str(user.id)}},
-        ):
-            try:
-                response = notion_query_data_source(
-                    data_source_id=ds_id,
-                    database_id=db_id,
-                    filter=filt,
-                    page_size=1,
-                )
-                results = response.get("results", [])
-                if results:
-                    break
-            except Exception as fe:
-                logger.warning("log_member_activity filter failed: %s", fe)
-
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
         if not results:
-            logger.info(
-                "log_member_activity: no auth row for user %s (history already attempted)",
-                user.id,
-            )
+            logger.info("log_member_activity: no auth row for user %s", user.id)
             return
 
         page = results[0]
@@ -6281,15 +6214,13 @@ async def log_member_activity(
         elif isinstance(count_prop, (int, float)):
             count = int(count_prop)
 
-        type_for_auth = request_type
-        if request_type not in ("Stockpick", "Security snapshot", "Telegram link"):
-            type_for_auth = "Security snapshot"
-
         update_props: dict = {
             "Last Request Date": {
-                "date": {"start": datetime.now(timezone.utc).date().isoformat()}
+                "date": {
+                    "start": datetime.now(timezone.utc).date().isoformat()
+                }
             },
-            "Last Request Type": {"select": {"name": type_for_auth}},
+            "Last Request Type": {"select": {"name": request_type}},
             "Request Count": {"number": count + 1},
         }
         if notes:
@@ -6297,33 +6228,26 @@ async def log_member_activity(
                 "rich_text": [{"text": {"content": notes[:1800]}}]
             }
 
-        try:
-            if notion:
-                notion.pages.update(page_id=page_id, properties=update_props)
-            else:
-                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
-            logger.info(
-                "Logged activity user=%s type=%s count=%s",
-                user.id,
-                request_type,
-                count + 1,
-            )
-        except Exception as ue:
-            logger.warning(
-                "Auth update with type failed user=%s: %s – retrying without type",
-                user.id,
-                ue,
-            )
-            update_props.pop("Last Request Type", None)
-            if notion:
-                notion.pages.update(page_id=page_id, properties=update_props)
-            else:
-                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+        # pages.update still works by page_id regardless of multi-source
+        if notion:
+            notion.pages.update(page_id=page_id, properties=update_props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+
+        logger.info(
+            "Logged activity user=%s type=%s count=%s",
+            user.id,
+            request_type,
+            count + 1,
+        )
+        # Standalone history row (one row per request)
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
+        )
     except Exception as e:
-        logger.error("log_member_activity auth update failed for %s: %s", user.id, e)
+        logger.error("log_member_activity failed for %s: %s", user.id, e)
 
-
-
+        
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
@@ -6363,43 +6287,6 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-
-async def logtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin: force one Request History write and report success/error."""
-    user = update.effective_user
-    if not is_admin(user):
-        await update.message.reply_text("Admin only.")
-        return
-    ds = (NOTION_HISTORY_DATA_SOURCE_ID or "").strip()
-    db = (NOTION_HISTORY_DB_ID or "").strip()
-    tok = "yes" if NOTION_TOKEN else "NO"
-    await update.message.reply_text(
-        f"History diagnostic…\n"
-        f"NOTION_TOKEN set: {tok}\n"
-        f"HISTORY_DS: {ds or 'MISSING'}\n"
-        f"HISTORY_DB: {db or 'MISSING'}"
-    )
-    try:
-        ok = await append_request_history(
-            user,
-            "Other",
-            details="/logtest forced write from Railway",
-            status="Logged",
-        )
-        if ok:
-            await update.message.reply_text(
-                "✅ History row created. Check Hive Bot Request History."
-            )
-        else:
-            await update.message.reply_text(
-                "❌ History write failed. Check Railway logs for "
-                "append_request_history attempt failed…"
-            )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Exception:\n`{e}`", parse_mode="Markdown")
-
-
-
 def main() -> None:
     app = Application.builder().token(TOKEN).build()
 
@@ -6414,7 +6301,6 @@ def main() -> None:
     app.add_handler(CommandHandler("status", with_command_cleanup(status_cmd)))
     app.add_handler(CommandHandler("request", with_command_cleanup(request_access)))
     app.add_handler(CommandHandler("debug", with_command_cleanup(debug_cmd)))
-    app.add_handler(CommandHandler("logtest", with_command_cleanup(logtest_cmd)))
     app.add_handler(CommandHandler("pending", with_command_cleanup(pending_cmd)))
     app.add_handler(CommandHandler("approve", with_command_cleanup(approve_cmd)))
     app.add_handler(CommandHandler("reject", with_command_cleanup(reject_cmd)))
