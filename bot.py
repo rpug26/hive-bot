@@ -4618,21 +4618,48 @@ async def append_request_history(
             "Request history row created user=%s type=%s", user.id, notion_type
         )
     except Exception as e:
-        logger.error("append_request_history failed for %s: %s", user.id, e)
+        logger.error(
+            "append_request_history failed for %s type=%s ds=%s db=%s: %s",
+            user.id, notion_type, ds_id, db_id, e,
+        )
+        try:
+            if db_id and notion:
+                notion.pages.create(parent={"database_id": db_id}, properties=props)
+                logger.info(
+                    "Request history row created via fallback user=%s type=%s",
+                    user.id, notion_type,
+                )
+        except Exception as e2:
+            logger.error("append_request_history fallback failed: %s", e2)
 
 
 async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
-    Update Hive Bot Authorised Users with last request date/type and increment count.
-    Uses data-source API so multi-source Auth DB updates reliably.
+    Consistent Notion auto-sync on every request:
+      1) Always write Hive Bot Request History (source of truth)
+      2) Best-effort update Hive Bot Authorised Users (count / last request)
+
+    History must never depend on finding an Auth row.
     """
     if not user:
         return
     if not notion and not NOTION_TOKEN:
         return
 
+    # --- 1. Request History (always) ---
+    try:
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
+        )
+    except Exception as he:
+        logger.error(
+            "append_request_history failed for %s type=%s: %s",
+            user.id, request_type, he,
+        )
+
+    # --- 2. Auth row activity counters (best-effort) ---
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
     )
@@ -4641,18 +4668,29 @@ async def log_member_activity(
         return
 
     try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
+        results = []
+        for filt in (
+            {"property": "Telegram User ID", "title": {"equals": str(user.id)}},
+            {"property": "Telegram User ID", "rich_text": {"equals": str(user.id)}},
+        ):
+            try:
+                response = notion_query_data_source(
+                    data_source_id=ds_id,
+                    database_id=db_id,
+                    filter=filt,
+                    page_size=1,
+                )
+                results = response.get("results", [])
+                if results:
+                    break
+            except Exception as fe:
+                logger.warning("log_member_activity filter failed: %s", fe)
+
         if not results:
-            logger.info("log_member_activity: no auth row for user %s", user.id)
+            logger.info(
+                "log_member_activity: no auth row for user %s (history already written)",
+                user.id,
+            )
             return
 
         page = results[0]
@@ -4669,13 +4707,15 @@ async def log_member_activity(
         elif isinstance(count_prop, (int, float)):
             count = int(count_prop)
 
+        type_for_auth = request_type
+        if request_type not in ("Stockpick", "Security snapshot", "Telegram link"):
+            type_for_auth = "Security snapshot"
+
         update_props: dict = {
             "Last Request Date": {
-                "date": {
-                    "start": datetime.now(timezone.utc).date().isoformat()
-                }
+                "date": {"start": datetime.now(timezone.utc).date().isoformat()}
             },
-            "Last Request Type": {"select": {"name": request_type}},
+            "Last Request Type": {"select": {"name": type_for_auth}},
             "Request Count": {"number": count + 1},
         }
         if notes:
@@ -4683,26 +4723,30 @@ async def log_member_activity(
                 "rich_text": [{"text": {"content": notes[:1800]}}]
             }
 
-        # pages.update still works by page_id regardless of multi-source
-        if notion:
-            notion.pages.update(page_id=page_id, properties=update_props)
-        else:
-            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
-
-        logger.info(
-            "Logged activity user=%s type=%s count=%s",
-            user.id,
-            request_type,
-            count + 1,
-        )
-        # Standalone history row (one row per request)
-        await append_request_history(
-            user, request_type, details=notes, status="Logged"
-        )
+        try:
+            if notion:
+                notion.pages.update(page_id=page_id, properties=update_props)
+            else:
+                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+            logger.info(
+                "Logged activity user=%s type=%s count=%s",
+                user.id, request_type, count + 1,
+            )
+        except Exception as ue:
+            logger.warning(
+                "Auth update with type failed user=%s: %s – retrying without type",
+                user.id, ue,
+            )
+            update_props.pop("Last Request Type", None)
+            if notion:
+                notion.pages.update(page_id=page_id, properties=update_props)
+            else:
+                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
     except Exception as e:
-        logger.error("log_member_activity failed for %s: %s", user.id, e)
+        logger.error("log_member_activity auth update failed for %s: %s", user.id, e)
 
-        
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
