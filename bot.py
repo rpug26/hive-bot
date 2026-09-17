@@ -981,14 +981,69 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                     pass
             return None
 
+        def find_date(*names):
+            """Read a Notion date property start (YYYY-MM-DD)."""
+            for name in names:
+                prop = props.get(name)
+                if not prop or not isinstance(prop, dict):
+                    continue
+                if prop.get("type") == "date" and prop.get("date"):
+                    start = (prop["date"] or {}).get("start") or ""
+                    if start:
+                        return start[:10]
+                # Fallback: plain text that looks like a date
+                raw = _get_plain_text(prop).strip()
+                if re.match(r"\d{4}-\d{2}-\d{2}", raw):
+                    return raw[:10]
+            return ""
+
+        summary_raw = find_prop(
+            "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
+        )
+        # Stale "Last RNS: YYYY-MM-DD" is often embedded in the summary text
+        # and lags the real Last RNS Date property — strip it for display.
+        summary_clean = re.sub(
+            r"(?i)(?:\s*[|｜]\s*)?Last RNS\s*:\s*\d{4}-\d{2}-\d{2}",
+            "",
+            summary_raw or "",
+        ).strip()
+        summary_clean = re.sub(r"\s+\n", "\n", summary_clean)
+        summary_clean = re.sub(r"[ \t]{2,}", " ", summary_clean)
+
+        last_rns_date = find_date("Last RNS Date", "Last RNS", "Latest RNS Date")
+        last_3_rns = find_prop("Last 3 RNS", "Last 3 RNS ", "Recent RNS")
+        # Normalize HTML breaks from Notion rich text
+        if last_3_rns:
+            last_3_rns = (
+                last_3_rns.replace("<br>", "\n")
+                .replace("<br/>", "\n")
+                .replace("<br />", "\n")
+            )
+            last_3_rns = re.sub(r"<[^>]+>", "", last_3_rns)
+            last_3_rns = re.sub(r"\n{3,}", "\n\n", last_3_rns).strip()
+
+        mcap = find_number("Market Cap GBPm", "Market Cap", "Mkt Cap", "Mcap")
+        mcap_display = ""
+        if mcap is not None:
+            mcap_display = f"£{mcap:.2f}m" if mcap < 1000 else f"£{mcap:,.0f}m"
+        # Prefer explicit Market Cap text line in summary if number missing
+        if not mcap_display and summary_raw:
+            m = re.search(
+                r"(?i)Market Cap\s*:\s*£?\s*([\d.]+)\s*m", summary_raw
+            )
+            if m:
+                mcap_display = f"£{m.group(1)}m"
+
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
-            "summary": find_prop(
-                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
-            ),
+            "summary": summary_clean or summary_raw,
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
+            "last_rns_date": last_rns_date,
+            "last_3_rns": last_3_rns,
+            "mcap": mcap_display,
+            "mcap_num": mcap,
             "day_change_pct": find_number(
                 "Day Change %",
                 "% Change",
@@ -1004,7 +1059,12 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "data": data,
             "expires": time.time() + CACHE_TTL_SECONDS,
         }
-        logger.info("Found ticker %s – company=%s", ticker, data.get("company"))
+        logger.info(
+            "Found ticker %s – company=%s last_rns=%s",
+            ticker,
+            data.get("company"),
+            data.get("last_rns_date") or "n/a",
+        )
         return data
         # --- END ---
 
@@ -1525,6 +1585,80 @@ def _strip_html(text: str) -> str:
     return cleaned
 
 
+def _parse_rns_log_page(page: dict, ticker: str) -> dict:
+    """Normalize one Hive RNS News Log page into a flat dict."""
+    props = page.get("properties", {})
+    title = _get_plain_text(props.get("Title")) or "RNS"
+    summary = _strip_html(_get_plain_text(props.get("AI Summary")))
+    company = _get_plain_text(props.get("Company")) or ""
+    link = ""
+    link_prop = props.get("Link") or {}
+    if isinstance(link_prop, dict):
+        link = (link_prop.get("url") or "").strip()
+    date_str = ""
+    date_prop = props.get("RNS Date") or {}
+    if isinstance(date_prop, dict):
+        d = date_prop.get("date") or {}
+        if isinstance(d, dict):
+            date_str = (d.get("start") or "")[:10]
+    source = ""
+    src = props.get("Source") or {}
+    if isinstance(src, dict) and src.get("select"):
+        source = (src["select"] or {}).get("name") or ""
+    return {
+        "ticker": ticker,
+        "title": title[:120],
+        "summary": summary[:280],
+        "company": company[:80],
+        "link": link,
+        "date": date_str,
+        "source": source,
+    }
+
+
+async def get_recent_rns_for_ticker(
+    ticker: str, *, limit: int = 3, force: bool = False
+) -> list[dict]:
+    """
+    Up to `limit` recent RNS rows for a ticker from Hive RNS News Log,
+    newest first. Used by Stock Snapshot for a complete picture.
+    """
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t:
+        return []
+    if not (notion or NOTION_TOKEN):
+        return []
+    ds_id = NOTION_RNS_DATA_SOURCE_ID
+    db_id = NOTION_RNS_DB_ID
+    if not ds_id and not db_id:
+        return []
+
+    try:
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Ticker",
+                "rich_text": {"equals": t},
+            },
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=max(3, min(limit, 10)),
+        )
+        out: list[dict] = []
+        for page in response.get("results", []):
+            props = page.get("properties", {})
+            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
+            if row_t != t:
+                continue
+            out.append(_parse_rns_log_page(page, t))
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        logger.warning("get_recent_rns_for_ticker(%s) failed: %s", t, e)
+        return []
+
+
 async def get_latest_rns_for_ticker(
     ticker: str, *, force: bool = False
 ) -> dict | None:
@@ -1549,52 +1683,8 @@ async def get_latest_rns_for_ticker(
             return cached
 
     try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Ticker",
-                "rich_text": {"equals": t},
-            },
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=3,
-        )
-        results = response.get("results", [])
-        # Prefer exact ticker match (case-insensitive)
-        best = None
-        for page in results:
-            props = page.get("properties", {})
-            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
-            if row_t != t:
-                continue
-            title = _get_plain_text(props.get("Title")) or "RNS"
-            summary = _strip_html(_get_plain_text(props.get("AI Summary")))
-            company = _get_plain_text(props.get("Company")) or ""
-            link = ""
-            link_prop = props.get("Link") or {}
-            if isinstance(link_prop, dict):
-                link = (link_prop.get("url") or "").strip()
-            date_str = ""
-            date_prop = props.get("RNS Date") or {}
-            if isinstance(date_prop, dict):
-                d = date_prop.get("date") or {}
-                if isinstance(d, dict):
-                    date_str = (d.get("start") or "")[:10]
-            source = ""
-            src = props.get("Source") or {}
-            if isinstance(src, dict) and src.get("select"):
-                source = (src["select"] or {}).get("name") or ""
-            best = {
-                "ticker": t,
-                "title": title[:120],
-                "summary": summary[:280],
-                "company": company[:80],
-                "link": link,
-                "date": date_str,
-                "source": source,
-            }
-            break
-
+        recent = await get_recent_rns_for_ticker(t, limit=1, force=force)
+        best = recent[0] if recent else None
         _rns_cache[t] = (now, best)
         return best
     except Exception as e:
@@ -1674,12 +1764,83 @@ def has_intent_keyword(text: str) -> bool:
     lower = text.lower()
     return any(kw in lower for kw in INTENT_KEYWORDS)
 
-def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None) -> str:
-    text = (
-        f"🔖📑 *#{ticker}* – {data.get('company') or 'N/A'}\n\n"
-        f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
+def format_reply(
+    ticker: str,
+    data: dict,
+    stockpickers: list[str] | None = None,
+    *,
+    rns_latest: dict | None = None,
+    rns_recent: list | None = None,
+) -> str:
+    """
+    Full stock snapshot from UK AIM Micro-Cap + optional live RNS News Log.
+    Prefer structured Last RNS Date / Last 3 RNS over any stale date
+    embedded inside Summary & Next Catalyst text.
+    """
+    company = data.get("company") or "N/A"
+    status = data.get("status") or ""
+    mcap = data.get("mcap") or ""
+    header_bits = [f"🔖📑 *#{ticker}* – {company}"]
+    meta_line = []
+    if status:
+        meta_line.append(f"Status: {status}")
+    if mcap:
+        meta_line.append(f"Mkt Cap: {mcap}")
+    # Authoritative Last RNS Date (Notion date property)
+    last_rns = (data.get("last_rns_date") or "").strip()
+    if rns_latest and rns_latest.get("date"):
+        # Prefer the fresher of Micro-Cap date vs RNS News Log
+        log_date = (rns_latest.get("date") or "")[:10]
+        if not last_rns or log_date >= last_rns:
+            last_rns = log_date
+    if last_rns:
+        meta_line.append(f"Last RNS: {last_rns}")
+
+    text = header_bits[0] + "\n"
+    if meta_line:
+        text += " · ".join(meta_line) + "\n"
+    text += "\n"
+
+    overview = (data.get("company_overview") or "").strip()
+    if overview:
+        text += f"*Company Overview:*\n{overview[:500]}\n\n"
+
+    text += (
+        f"*Snapshot Summary:*\n"
+        f"{data.get('summary') or 'No summary available.'}\n\n"
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
     )
+
+    # --- RNS section (systematic) ---
+    # 1) Live latest from Hive RNS News Log (if any)
+    # 2) Last 3 RNS from Micro-Cap property
+    rns_block_parts: list[str] = []
+    if rns_latest and (rns_latest.get("title") or rns_latest.get("summary")):
+        line = "📌 *Latest RNS*"
+        if rns_latest.get("date"):
+            line += f" · {rns_latest['date']}"
+        line += f"\n{rns_latest.get('title') or 'RNS'}"
+        if rns_latest.get("summary"):
+            line += f"\n_{rns_latest['summary'][:220]}_"
+        if rns_latest.get("link"):
+            line += f"\n[Read full RNS]({rns_latest['link']})"
+        rns_block_parts.append(line)
+
+    last_3 = (data.get("last_3_rns") or "").strip()
+    if last_3:
+        # Keep readable length for Telegram
+        clipped = last_3 if len(last_3) <= 900 else last_3[:897] + "…"
+        rns_block_parts.append(f"*Last 3 RNS (Micro-Cap):*\n{clipped}")
+    elif rns_recent:
+        lines = ["*Recent RNS:*"]
+        for r in rns_recent[:3]:
+            d = r.get("date") or "—"
+            tit = r.get("title") or "RNS"
+            lines.append(f"• {d} — {tit}")
+        rns_block_parts.append("\n".join(lines))
+
+    if rns_block_parts:
+        text += "\n" + "\n\n".join(rns_block_parts) + "\n"
 
     if stockpickers:
         quoted = ", ".join(f'"{n}"' for n in stockpickers)
@@ -3002,6 +3163,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         for t in tickers:
             try:
+                try:
+                    _ticker_cache.pop(t, None)
+                except Exception:
+                    pass
                 data = await get_ticker_from_notion(t)
                 if data:
                     await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
@@ -3010,7 +3175,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     except Exception as e:
                         logger.error("stockpickers failed for %s: %s", t, e)
                         stockpickers = []
-                    body = format_reply(t, data, stockpickers)
+                    rns_latest = None
+                    rns_recent: list = []
+                    try:
+                        rns_recent = await get_recent_rns_for_ticker(
+                            t, limit=3, force=True
+                        )
+                        rns_latest = rns_recent[0] if rns_recent else None
+                    except Exception:
+                        pass
+                    body = format_reply(
+                        t,
+                        data,
+                        stockpickers,
+                        rns_latest=rns_latest,
+                        rns_recent=rns_recent,
+                    )
                     try:
                         await update.message.reply_text(body, parse_mode="Markdown")
                     except Exception:
@@ -3432,6 +3612,11 @@ async def deliver_stock_snapshot(
         )
         return
     try:
+        # Bust ticker cache so Last RNS Date / Last 3 RNS are fresh
+        try:
+            _ticker_cache.pop(ticker, None)
+        except Exception:
+            pass
         meta = await get_ticker_from_notion(ticker)
         if not meta:
             sent = await context.bot.send_message(
@@ -3447,7 +3632,21 @@ async def deliver_stock_snapshot(
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
-        body = format_reply(ticker, meta, stockpickers)
+        # Live RNS from Hive RNS News Log (may be newer than Micro-Cap summary text)
+        rns_latest = None
+        rns_recent: list = []
+        try:
+            rns_recent = await get_recent_rns_for_ticker(ticker, limit=3, force=True)
+            rns_latest = rns_recent[0] if rns_recent else None
+        except Exception as rexc:
+            logger.warning("snapshot RNS enrich failed for %s: %s", ticker, rexc)
+        body = format_reply(
+            ticker,
+            meta,
+            stockpickers,
+            rns_latest=rns_latest,
+            rns_recent=rns_recent,
+        )
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
@@ -4530,6 +4729,10 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     # Reuse snapshot delivery into this chat; keep Home keyboard
     try:
+        try:
+            _ticker_cache.pop(ticker, None)
+        except Exception:
+            pass
         meta = await get_ticker_from_notion(ticker)
         if not meta:
             await query.edit_message_text(
@@ -4542,7 +4745,20 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
-        body = format_reply(ticker, meta, stockpickers)
+        rns_latest = None
+        rns_recent: list = []
+        try:
+            rns_recent = await get_recent_rns_for_ticker(ticker, limit=3, force=True)
+            rns_latest = rns_recent[0] if rns_recent else None
+        except Exception:
+            pass
+        body = format_reply(
+            ticker,
+            meta,
+            stockpickers,
+            rns_latest=rns_latest,
+            rns_recent=rns_recent,
+        )
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
@@ -4802,6 +5018,10 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             return
         try:
+            try:
+                _ticker_cache.pop(ticker, None)
+            except Exception:
+                pass
             meta = await get_ticker_from_notion(ticker)
             if not meta:
                 body = f"No snapshot for #{ticker} in UK AIM Micro-Cap."
@@ -4814,7 +5034,22 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 stockpickers = await get_stockpickers_for_ticker(ticker)
             except Exception:
                 stockpickers = []
-            body = format_reply(ticker, meta, stockpickers)
+            rns_latest = None
+            rns_recent: list = []
+            try:
+                rns_recent = await get_recent_rns_for_ticker(
+                    ticker, limit=3, force=True
+                )
+                rns_latest = rns_recent[0] if rns_recent else None
+            except Exception:
+                pass
+            body = format_reply(
+                ticker,
+                meta,
+                stockpickers,
+                rns_latest=rns_latest,
+                rns_recent=rns_recent,
+            )
             pct = meta.get("day_change_pct")
             if pct is None:
                 pct = _fetch_pct_on_day_live(ticker)
