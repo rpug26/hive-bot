@@ -1811,33 +1811,44 @@ def format_reply(
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
     )
 
-    # --- RNS section (systematic) ---
-    # 1) Live latest from Hive RNS News Log (if any)
-    # 2) Last 3 RNS from Micro-Cap property
+    # --- RNS section (no duplicate Latest vs Last 3) ---
+    # Order: Last 3 RNS first, then Latest only if not already covered
     rns_block_parts: list[str] = []
-    if rns_latest and (rns_latest.get("title") or rns_latest.get("summary")):
-        line = "📌 *Latest RNS*"
-        if rns_latest.get("date"):
-            line += f" · {rns_latest['date']}"
-        line += f"\n{rns_latest.get('title') or 'RNS'}"
-        if rns_latest.get("summary"):
-            line += f"\n_{rns_latest['summary'][:220]}_"
-        if rns_latest.get("link"):
-            line += f"\n[Read full RNS]({rns_latest['link']})"
-        rns_block_parts.append(line)
-
     last_3 = (data.get("last_3_rns") or "").strip()
+    last_3_norm = re.sub(r"\s+", " ", last_3).lower() if last_3 else ""
+
     if last_3:
-        # Keep readable length for Telegram
         clipped = last_3 if len(last_3) <= 900 else last_3[:897] + "…"
-        rns_block_parts.append(f"*Last 3 RNS (Micro-Cap):*\n{clipped}")
+        rns_block_parts.append(f"*Last 3 RNS:*\n{clipped}")
     elif rns_recent:
-        lines = ["*Recent RNS:*"]
+        lines = ["*Last 3 RNS:*"]
         for r in rns_recent[:3]:
             d = r.get("date") or "—"
             tit = r.get("title") or "RNS"
             lines.append(f"• {d} — {tit}")
         rns_block_parts.append("\n".join(lines))
+
+    # Latest from News Log only when it adds something new
+    if rns_latest and (rns_latest.get("title") or rns_latest.get("summary")):
+        lat_date = (rns_latest.get("date") or "")[:10]
+        lat_title = (rns_latest.get("title") or "").strip()
+        already_in_last3 = False
+        if last_3_norm:
+            # Same date or same title already present in Last 3 block
+            if lat_date and lat_date in last_3_norm:
+                already_in_last3 = True
+            elif lat_title and lat_title.lower()[:40] in last_3_norm:
+                already_in_last3 = True
+        if not already_in_last3:
+            line = "📌 *Latest RNS (News Log)*"
+            if lat_date:
+                line += f" · {lat_date}"
+            line += f"\n{lat_title or 'RNS'}"
+            if rns_latest.get("summary"):
+                line += f"\n_{rns_latest['summary'][:220]}_"
+            if rns_latest.get("link"):
+                line += f"\n[Read full RNS]({rns_latest['link']})"
+            rns_block_parts.append(line)
 
     if rns_block_parts:
         text += "\n" + "\n\n".join(rns_block_parts) + "\n"
