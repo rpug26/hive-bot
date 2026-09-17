@@ -2436,15 +2436,28 @@ def _msp_state(user_id: int) -> dict:
         now = datetime.now(timezone.utc)
         st = {
             "league_open": False,
-            "mine_open": False,
-            "hist_open": False,
+            "follow_open": False,
+            "submit_open": False,
+            "picks_open": False,  # My Stockpicks (this month + history)
             "league_y": now.year,
             "league_m": now.month,
             "hist_y": now.year,
             "hist_m": now.month,
         }
         _msp_ui[user_id] = st
+    else:
+        # Back-compat if older keys missing
+        st.setdefault("follow_open", False)
+        st.setdefault("submit_open", False)
+        st.setdefault("picks_open", False)
+        st.setdefault("league_open", False)
     return st
+
+
+def _msp_close_all(st: dict, except_key: str | None = None) -> None:
+    for k in ("league_open", "follow_open", "submit_open", "picks_open"):
+        if k != except_key:
+            st[k] = False
 
 
 async def send_clean(
@@ -2589,6 +2602,14 @@ async def _watchlist_finish_action(
     user = update.effective_user
     if user:
         await _delete_watchlist_prompt(context, user.id)
+        try:
+            await log_member_activity(
+                user,
+                REQUEST_TYPE_WATCHLIST,
+                notes=(summary or "Watchlist change")[:500],
+            )
+        except Exception as e:
+            logger.debug("watchlist activity log: %s", e)
     await cleanup_trigger_message(update, context)
 
     chat = update.effective_chat
@@ -3719,6 +3740,12 @@ async def stock_of_the_day_cmd(
         reply_markup=main_reply_keyboard(),
     )
     await remember_nav_panel(user.id if user else None, status)
+    try:
+        await log_member_activity(
+            user, REQUEST_TYPE_SOTD, notes="Stock of the Day"
+        )
+    except Exception:
+        pass
 
     try:
         pairs = await _load_microcap_tickers(limit=60)
@@ -4154,10 +4181,12 @@ async def show_stockpick_hub(
     edit: bool = False,
 ) -> None:
     """
-    My Stockpick home – two content parts + 3 expandable inline sections:
-      1) League table (month nav)
-      2) My pick this month (edit actions)
-      3) History (month nav)
+    My Stockpick home – 5 fixed components:
+      1) The Hive League Table
+      2) Follow Top Stockpickers
+      3) Submit Your Stockpick
+      4) My Stockpicks (this month + history)
+      5) Hub
     """
     user = update.effective_user
     if update.callback_query:
@@ -4179,63 +4208,50 @@ async def show_stockpick_hub(
 
     st = _msp_state(user.id)
     now = datetime.now(timezone.utc)
-    # Default cursors to current month
     ly, lm = st.get("league_y") or now.year, st.get("league_m") or now.month
     hy, hm = st.get("hist_y") or now.year, st.get("hist_m") or now.month
 
-    # --- Part 2 data: user's current month pick ---
     my_rows = await _fetch_stockpicks_month(now.year, now.month, mine_user=user)
     my_pick = my_rows[0] if my_rows else None
     if my_pick:
         _last_stockpick_page[user.id] = my_pick["page_id"]
 
-    # Who else picked the same ticker this month (followers / co-pickers)
-    co_pickers: list[str] = []
-    if my_pick and my_pick.get("ticker") and my_pick["ticker"] != "—":
-        all_month = await _fetch_stockpicks_month(now.year, now.month, mine_user=None)
-        for r in all_month:
-            if r["ticker"] == my_pick["ticker"]:
-                name = (r.get("posted_by") or "").strip()
-                if name and name != "—" and name.lower() != (user.full_name or "").lower():
-                    if name not in co_pickers:
-                        co_pickers.append(name)
+    following = await get_user_following(user)
+    following_names = {(it.get("name") or "").lower() for it in following}
 
+    # Landing text (always clean + short) — 5-component menu
     lines = [
         "📌 *My Stockpick*",
+        f"_{_month_label(now.year, now.month)}_",
         "",
-        "• View the *Hive Stockpicker League* for the month",
-        "• Enter or edit *your* stockpick this month",
-        "• Open *history* by month",
+        "1. 🏆 Hive League Table",
+        "2. ⭐ Follow Top Stockpickers",
+        "3. ✏️ Submit Your Stockpick",
+        "4. 📚 My Stockpicks",
+        "5. « Hub",
         "",
     ]
     if my_pick:
-        lines.append(
-            f"*Your pick · {_month_label(now.year, now.month)}:* "
-            f"*#{my_pick['ticker']}*"
-        )
-        lines.append(f"Summary: {my_pick['summary'][:120]}")
-        lines.append(f"Catalyst: {my_pick['catalyst'][:80]}")
-        lines.append(f"Target: {my_pick['target']}")
-        if co_pickers:
-            lines.append(
-                "Also picked by: " + ", ".join(co_pickers[:8])
-            )
+        lines.append(f"Your pick: *#{my_pick['ticker']}*")
+        if my_pick.get("summary"):
+            lines.append(f"_{my_pick['summary'][:100]}_")
     else:
+        lines.append("_No pick this month yet — open *3. Submit Your Stockpick*._")
+    if following_names:
         lines.append(
-            f"_No stockpick yet for {_month_label(now.year, now.month)}. "
-            "Post `#stockpick #TICKER` in the group._"
+            "Following: "
+            + ", ".join((it.get("name") or "") for it in following[:6] if it.get("name"))
         )
     lines.append("")
 
     keyboard: list[list] = []
 
-    # --- Section 1: League ---
+    # ========== 1) Hive League Table ==========
     if st.get("league_open"):
         league_rows = await _fetch_stockpicks_month(ly, lm, mine_user=None)
-        # Aggregate by ticker
         counts: dict[str, list[str]] = {}
         for r in league_rows:
-            t = r["ticker"]
+            t = r.get("ticker") or ""
             if not t or t == "—":
                 continue
             counts.setdefault(t, [])
@@ -4243,7 +4259,7 @@ async def show_stockpick_hub(
             if name and name not in counts[t]:
                 counts[t].append(name)
         ranked = sorted(counts.items(), key=lambda x: len(x[1]), reverse=True)
-        lines.append(f"🏆 *League · {_month_label(ly, lm)}*")
+        lines.append(f"🏆 *Hive League · {_month_label(ly, lm)}*")
         if not ranked:
             lines.append("_No stockpicks logged this month._")
         else:
@@ -4261,54 +4277,124 @@ async def show_stockpick_hub(
             ]
         )
         keyboard.append(
-            [InlineKeyboardButton("▴ Hide league", callback_data="msp:ui_league")]
+            [InlineKeyboardButton("▴ Hide League", callback_data="msp:ui_league")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "🏆 League table ▾", callback_data="msp:ui_league"
+                    "🏆 1. Hive League Table", callback_data="msp:ui_league"
                 )
             ]
         )
 
-    # --- Section 2: My pick this month ---
-    if st.get("mine_open"):
+    # ========== 2) Follow Top Stockpickers ==========
+    if st.get("follow_open"):
+        all_month = await _fetch_stockpicks_month(now.year, now.month, mine_user=None)
+        by_picker: dict[str, set[str]] = {}
+        for r in all_month:
+            name = (r.get("posted_by") or "").strip()
+            t = (r.get("ticker") or "").strip()
+            if not name or name == "—" or name.lower() == (user.full_name or "").lower():
+                continue
+            by_picker.setdefault(name, set())
+            if t and t != "—":
+                by_picker[name].add(t)
+        top = sorted(by_picker.items(), key=lambda x: len(x[1]), reverse=True)[:8]
+        lines.append("⭐ *Follow Top Stockpickers*")
+        lines.append("_Tap Follow — get a DM when they post a monthly pick._")
+        if not top:
+            lines.append("_No stockpickers yet this month._")
+        else:
+            for name, tickers in top:
+                tags = ", ".join(f"#{x}" for x in list(tickers)[:4])
+                mark = " ✓" if name.lower() in following_names else ""
+                lines.append(f"• *{name}*{mark} · {tags or '—'}")
+        lines.append("")
+        # Follow buttons (max 6)
+        for name, _tickers in top[:6]:
+            key = _follow_key(name)
+            _follow_name_cache[key] = name
+            label = name if len(name) <= 16 else name[:14] + "…"
+            already = name.lower() in following_names
+            btn = (
+                InlineKeyboardButton(
+                    f"✓ {label}", callback_data=f"fol:add:{key}"
+                )
+                if already
+                else InlineKeyboardButton(
+                    f"➕ Follow {label}", callback_data=f"fol:add:{key}"
+                )
+            )
+            keyboard.append([btn])
         keyboard.append(
-            [
-                InlineKeyboardButton("Summary", callback_data="sp:Summary"),
-                InlineKeyboardButton("Catalyst", callback_data="sp:Next Catalyst"),
-            ]
-        )
-        keyboard.append(
-            [
-                InlineKeyboardButton("Target", callback_data="sp:Target Price"),
-                InlineKeyboardButton("Edit pick", callback_data="sp:Change"),
-            ]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("▴ Hide my pick", callback_data="msp:ui_mine")]
+            [InlineKeyboardButton("▴ Hide Follow", callback_data="msp:ui_follow")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "✏️ My pick this month ▾", callback_data="msp:ui_mine"
+                    "⭐ 2. Follow Top Stockpickers",
+                    callback_data="msp:ui_follow",
                 )
             ]
         )
 
-    # --- Section 3: History ---
-    if st.get("hist_open"):
+    # ========== 3) Submit Your Stockpick ==========
+    if st.get("submit_open"):
+        lines.append("✏️ *Submit Your Stockpick*")
+        if my_pick:
+            lines.append(
+                f"Already submitted *#{my_pick['ticker']}* this month.\n"
+                "Add details or change below."
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton("Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton(
+                        "Catalyst", callback_data="sp:Next Catalyst"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton("Target", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change pick", callback_data="sp:Change"),
+                ]
+            )
+        else:
+            lines.append(
+                "Send in this chat:\n"
+                "`#stockpick #TICKER`\n"
+                "Optional: short note, `#September` or `#2026`"
+            )
+        lines.append("")
+        keyboard.append(
+            [InlineKeyboardButton("▴ Hide Submit", callback_data="msp:ui_submit")]
+        )
+    else:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "✏️ 3. Submit Your Stockpick",
+                    callback_data="msp:ui_submit",
+                )
+            ]
+        )
+
+    # ========== 4) My Stockpicks (this month + history) ==========
+    if st.get("picks_open"):
+        lines.append(f"📚 *My Stockpicks · {_month_label(hy, hm)}*")
         hist_rows = await _fetch_stockpicks_month(hy, hm, mine_user=user)
-        lines.append(f"📚 *History · {_month_label(hy, hm)}*")
         if not hist_rows:
             lines.append("_No picks in this month._")
         else:
             for r in hist_rows[:8]:
                 lines.append(
-                    f"• *#{r['ticker']}* · {r['date'][:10]}\n"
-                    f"  {r['summary'][:80]}"
+                    f"• *#{r['ticker']}* · {str(r.get('date') or '')[:10]}\n"
+                    f"  Summary: {(r.get('summary') or '—')[:80]}\n"
+                    f"  Catalyst: {(r.get('catalyst') or '—')[:60]}\n"
+                    f"  Target: {r.get('target') or '—'}"
                 )
         lines.append("")
         keyboard.append(
@@ -4320,20 +4406,37 @@ async def show_stockpick_hub(
                 InlineKeyboardButton("›", callback_data="msp:hist_next"),
             ]
         )
+        # Edit tools when viewing current month and user has a pick
+        if hy == now.year and hm == now.month and my_pick:
+            keyboard.append(
+                [
+                    InlineKeyboardButton("Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton(
+                        "Catalyst", callback_data="sp:Next Catalyst"
+                    ),
+                ]
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton("Target", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change", callback_data="sp:Change"),
+                ]
+            )
         keyboard.append(
-            [InlineKeyboardButton("▴ Hide history", callback_data="msp:ui_hist")]
+            [InlineKeyboardButton("▴ Hide My Stockpicks", callback_data="msp:ui_picks")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "📚 History ▾", callback_data="msp:ui_hist"
+                    "📚 4. My Stockpicks", callback_data="msp:ui_picks"
                 )
             ]
         )
 
+    # ========== 5) Hub ==========
     keyboard.append(
-        [InlineKeyboardButton("« Hub", callback_data="hub:home")]
+        [InlineKeyboardButton("« 5. Hub", callback_data="hub:home")]
     )
 
     text = "\n".join(lines)
@@ -4365,6 +4468,12 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     await cleanup_trigger_message(update, context)
     await clear_nav_panel(context.bot, user.id)
+    try:
+        await log_member_activity(
+            user, REQUEST_TYPE_STOCKPICK, notes="Opened My Stockpick"
+        )
+    except Exception:
+        pass
     await show_stockpick_hub(update, context, edit=False)
 
 async def show_my_stockpicks(
@@ -4974,7 +5083,7 @@ async def show_watchlist(
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
 async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """My Stockpick hub expand/collapse + month navigation."""
+    """My Stockpick hub – 5-section expand/collapse + month navigation."""
     query = update.callback_query
     user = query.from_user if query else None
     if not query or not user:
@@ -4992,32 +5101,42 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         while m > 12:
             m -= 12
             y += 1
-        # Don't go past current month
         if y > now.year or (y == now.year and m > now.month):
             return now.year, now.month
         return y, m
 
     if action == "ui_league":
-        st["league_open"] = not st.get("league_open")
-        if st["league_open"]:
-            st["mine_open"] = False
-            st["hist_open"] = False
+        open_now = not st.get("league_open")
+        _msp_close_all(st)
+        st["league_open"] = open_now
+    elif action == "ui_follow":
+        open_now = not st.get("follow_open")
+        _msp_close_all(st)
+        st["follow_open"] = open_now
+    elif action == "ui_submit":
+        open_now = not st.get("submit_open")
+        _msp_close_all(st)
+        st["submit_open"] = open_now
+    elif action == "ui_picks":
+        open_now = not st.get("picks_open")
+        _msp_close_all(st)
+        st["picks_open"] = open_now
+    # Legacy aliases from old keyboards
     elif action == "ui_mine":
-        st["mine_open"] = not st.get("mine_open")
-        if st["mine_open"]:
-            st["league_open"] = False
-            st["hist_open"] = False
+        open_now = not st.get("submit_open")
+        _msp_close_all(st)
+        st["submit_open"] = open_now
     elif action == "ui_hist":
-        st["hist_open"] = not st.get("hist_open")
-        if st["hist_open"]:
-            st["league_open"] = False
-            st["mine_open"] = False
+        open_now = not st.get("picks_open")
+        _msp_close_all(st)
+        st["picks_open"] = open_now
     elif action == "league_prev":
         st["league_y"], st["league_m"] = _shift(
             st.get("league_y") or now.year,
             st.get("league_m") or now.month,
             -1,
         )
+        _msp_close_all(st)
         st["league_open"] = True
     elif action == "league_next":
         st["league_y"], st["league_m"] = _shift(
@@ -5025,6 +5144,7 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             st.get("league_m") or now.month,
             1,
         )
+        _msp_close_all(st)
         st["league_open"] = True
     elif action == "hist_prev":
         st["hist_y"], st["hist_m"] = _shift(
@@ -5032,14 +5152,16 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             st.get("hist_m") or now.month,
             -1,
         )
-        st["hist_open"] = True
+        _msp_close_all(st)
+        st["picks_open"] = True
     elif action == "hist_next":
         st["hist_y"], st["hist_m"] = _shift(
             st.get("hist_y") or now.year,
             st.get("hist_m") or now.month,
             1,
         )
-        st["hist_open"] = True
+        _msp_close_all(st)
+        st["picks_open"] = True
     elif action in ("league_noop", "hist_noop"):
         return
 
@@ -5256,6 +5378,15 @@ async def follow_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     ok, msg = await add_following(user, name=name, target_uid=target_uid)
     await query.answer("Followed" if ok else "Could not follow", show_alert=not ok)
+    if ok:
+        try:
+            await log_member_activity(
+                user,
+                REQUEST_TYPE_FOLLOW,
+                notes=f"Follow {name}" + (f" uid:{target_uid}" if target_uid else ""),
+            )
+        except Exception:
+            pass
     try:
         await query.message.reply_text(msg, parse_mode="Markdown")
     except Exception:
@@ -6720,6 +6851,28 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
 REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
+REQUEST_TYPE_WATCHLIST = "My Watchlist"
+REQUEST_TYPE_SOTD = "Stock of the Day"
+REQUEST_TYPE_ACCESS = "Access request"
+REQUEST_TYPE_FOLLOW = "Follow stockpicker"
+
+# Preferred Notion "Request Type" select labels (add these on History DB)
+_HISTORY_TYPE_PREFERRED = {
+    REQUEST_TYPE_STOCKPICK: "Stockpick",
+    REQUEST_TYPE_SNAPSHOT: "Security snapshot",
+    REQUEST_TYPE_TG_LINK: "Telegram link",
+    REQUEST_TYPE_ACCESS: "Access request",
+    REQUEST_TYPE_WATCHLIST: "My Watchlist",
+    REQUEST_TYPE_SOTD: "Stock of the Day",
+    REQUEST_TYPE_FOLLOW: "Follow stockpicker",
+    "Stockpick": "Stockpick",
+    "Security snapshot": "Security snapshot",
+    "Telegram link": "Telegram link",
+    "Access request": "Access request",
+    "My Watchlist": "My Watchlist",
+    "Stock of the Day": "Stock of the Day",
+    "Follow stockpicker": "Follow stockpicker",
+}
 
 
 async def append_request_history(
@@ -6731,6 +6884,8 @@ async def append_request_history(
 ) -> None:
     """
     Create a standalone row in Hive Bot Request History (one row per request).
+    If Notion select option is missing, falls back to \"Other\" and puts the
+    real type in Details so nothing is silently dropped.
     """
     if not user:
         return
@@ -6741,60 +6896,88 @@ async def append_request_history(
     if not ds_id and not db_id:
         return
 
-    # Map bot types → Notion select options
-    type_map = {
-        "Stockpick": "Stockpick",
-        "Security snapshot": "Security snapshot",
-        "Telegram link": "Telegram link",
-        "Access request": "Access request",
-        REQUEST_TYPE_STOCKPICK: "Stockpick",
-        REQUEST_TYPE_SNAPSHOT: "Security snapshot",
-        REQUEST_TYPE_TG_LINK: "Telegram link",
-    }
-    notion_type = type_map.get(request_type, request_type if request_type in {
-        "Stockpick", "Security snapshot", "Telegram link", "Access request", "Other"
-    } else "Other")
+    notion_type = _HISTORY_TYPE_PREFERRED.get(
+        request_type, request_type if request_type else "Other"
+    )
+    detail_text = details or ""
+    # Always keep original label in details for audit
+    if request_type and request_type != notion_type:
+        detail_text = f"[{request_type}] {detail_text}".strip()
+    elif request_type:
+        detail_text = detail_text or request_type
 
     now = datetime.now(timezone.utc)
-    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
-    props = {
-        "Request": {"title": [{"text": {"content": title[:100]}}]},
-        "Telegram User ID": {
-            "rich_text": [{"text": {"content": str(user.id)}}]
-        },
-        "Full Name": {
-            "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
-        },
-        "Request Type": {"select": {"name": notion_type}},
-        "Requested At": {
-            "date": {
-                "start": now.isoformat().replace("+00:00", "Z"),
-            }
-        },
-        "Status": {"select": {"name": status if status in {
-            "Logged", "Pending", "Completed", "Denied"
-        } else "Logged"}},
-    }
-    if user.username:
-        props["Username"] = {
-            "rich_text": [{"text": {"content": user.username[:100]}}]
-        }
-    if details:
-        props["Details"] = {
-            "rich_text": [{"text": {"content": details[:1800]}}]
-        }
 
-    try:
-        notion_create_page_in_data_source(
-            properties=props,
-            data_source_id=ds_id,
-            database_id=db_id,
+    def _props(type_label: str, detail: str) -> dict:
+        title = (
+            f"{type_label} · {user.full_name or user.id} · "
+            f"{now.strftime('%Y-%m-%d %H:%M')}"
         )
-        logger.info(
-            "Request history row created user=%s type=%s", user.id, notion_type
-        )
-    except Exception as e:
-        logger.error("append_request_history failed for %s: %s", user.id, e)
+        p = {
+            "Request": {"title": [{"text": {"content": title[:100]}}]},
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+            "Full Name": {
+                "rich_text": [
+                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
+                ]
+            },
+            "Request Type": {"select": {"name": type_label}},
+            "Requested At": {
+                "date": {
+                    "start": now.isoformat().replace("+00:00", "Z"),
+                }
+            },
+            "Status": {
+                "select": {
+                    "name": status
+                    if status
+                    in {"Logged", "Pending", "Completed", "Denied"}
+                    else "Logged"
+                }
+            },
+        }
+        if user.username:
+            p["Username"] = {
+                "rich_text": [{"text": {"content": user.username[:100]}}]
+            }
+        if detail:
+            p["Details"] = {
+                "rich_text": [{"text": {"content": detail[:1800]}}]
+            }
+        return p
+
+    # Try preferred type, then Other (covers incomplete Notion select options)
+    for attempt_type, attempt_detail in (
+        (notion_type, detail_text),
+        (
+            "Other",
+            f"[{request_type}] {detail_text}".strip()
+            if request_type
+            else detail_text,
+        ),
+    ):
+        try:
+            notion_create_page_in_data_source(
+                properties=_props(attempt_type, attempt_detail),
+                data_source_id=ds_id,
+                database_id=db_id,
+            )
+            logger.info(
+                "Request history row created user=%s type=%s",
+                user.id,
+                attempt_type,
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "append_request_history try type=%s failed for %s: %s",
+                attempt_type,
+                user.id,
+                e,
+            )
+    logger.error("append_request_history exhausted retries for %s", user.id)
 
 
 async def log_member_activity(
@@ -6845,32 +7028,107 @@ async def log_member_activity(
         elif isinstance(count_prop, (int, float)):
             count = int(count_prop)
 
-        update_props: dict = {
-            "Last Request Date": {
-                "date": {
-                    "start": datetime.now(timezone.utc).date().isoformat()
-                }
-            },
-            "Last Request Type": {"select": {"name": request_type}},
-            "Request Count": {"number": count + 1},
-        }
-        if notes:
-            update_props["Notes"] = {
-                "rich_text": [{"text": {"content": notes[:1800]}}]
-            }
-
-        # pages.update still works by page_id regardless of multi-source
-        if notion:
-            notion.pages.update(page_id=page_id, properties=update_props)
-        else:
-            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
-
-        logger.info(
-            "Logged activity user=%s type=%s count=%s",
-            user.id,
+        # Prefer exact type on Auth "Last Request Type" select; fall back
+        type_candidates = [
+            _HISTORY_TYPE_PREFERRED.get(request_type, request_type),
             request_type,
-            count + 1,
-        )
+            "Other",
+        ]
+        # de-dupe preserve order
+        seen_t: set[str] = set()
+        type_candidates = [
+            t for t in type_candidates if t and not (t in seen_t or seen_t.add(t))
+        ]
+
+        updated = False
+        last_err = None
+        for type_label in type_candidates:
+            update_props: dict = {
+                "Last Request Date": {
+                    "date": {
+                        "start": datetime.now(timezone.utc).date().isoformat()
+                    }
+                },
+                "Last Request Type": {"select": {"name": type_label}},
+                "Request Count": {"number": count + 1},
+            }
+            if notes:
+                update_props["Notes"] = {
+                    "rich_text": [{"text": {"content": notes[:1800]}}]
+                }
+            try:
+                if notion:
+                    notion.pages.update(
+                        page_id=page_id, properties=update_props
+                    )
+                else:
+                    _notion_http(
+                        "PATCH",
+                        f"pages/{page_id}",
+                        {"properties": update_props},
+                    )
+                updated = True
+                logger.info(
+                    "Logged activity user=%s type=%s (stored=%s) count=%s",
+                    user.id,
+                    request_type,
+                    type_label,
+                    count + 1,
+                )
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "log_member_activity type=%s failed for %s: %s",
+                    type_label,
+                    user.id,
+                    e,
+                )
+
+        if not updated:
+            # Still bump date/count without select if select options incomplete
+            try:
+                bare = {
+                    "Last Request Date": {
+                        "date": {
+                            "start": datetime.now(timezone.utc)
+                            .date()
+                            .isoformat()
+                        }
+                    },
+                    "Request Count": {"number": count + 1},
+                }
+                if notes:
+                    bare["Notes"] = {
+                        "rich_text": [
+                            {
+                                "text": {
+                                    "content": (
+                                        f"[{request_type}] {notes}"
+                                    )[:1800]
+                                }
+                            }
+                        ]
+                    }
+                if notion:
+                    notion.pages.update(page_id=page_id, properties=bare)
+                else:
+                    _notion_http(
+                        "PATCH", f"pages/{page_id}", {"properties": bare}
+                    )
+                logger.info(
+                    "Logged activity (no type select) user=%s type=%s",
+                    user.id,
+                    request_type,
+                )
+            except Exception as e2:
+                logger.error(
+                    "log_member_activity bare update failed for %s: %s / %s",
+                    user.id,
+                    last_err,
+                    e2,
+                )
+
         # Standalone history row (one row per request)
         await append_request_history(
             user, request_type, details=notes, status="Logged"
