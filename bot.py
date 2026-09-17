@@ -1075,11 +1075,20 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
 async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
     """
     Return unique Posted By names from Hive Stock Picks for this ticker.
+    (Names only — used in snapshot text / Follow buttons.)
+    """
+    detailed = await get_stockpickers_detailed_for_ticker(ticker)
+    return [d["name"] for d in detailed if d.get("name")]
+
+
+async def get_stockpickers_detailed_for_ticker(ticker: str) -> list[dict]:
+    """
+    Unique stockpickers for ticker this cycle from Hive Stock Picks.
+    Each item: {name, user_id} where user_id may be None if not in Notes.
     """
     if not notion or not ticker:
         return []
 
-    # Prefer dedicated stockpicks DB only
     db_id = (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip()
     if not db_id:
         db_id = "9095ded4-ad6a-4b25-9887-19a77baba12f"
@@ -1092,7 +1101,7 @@ async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
         db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
 
     ticker = ticker.upper().strip()
-    names: list[str] = []
+    out: list[dict] = []
     seen: set[str] = set()
 
     filters_to_try = [
@@ -1124,7 +1133,6 @@ async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
             props = page.get("properties", {})
             posted_by = _get_plain_text(props.get("Posted By")).strip()
             if not posted_by:
-                # fallback: title
                 posted_by = _get_plain_text(props.get("Stockpick & Month")).strip()
             if not posted_by:
                 continue
@@ -1132,16 +1140,277 @@ async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
             if key in seen:
                 continue
             seen.add(key)
-            names.append(posted_by)
+            notes = _get_plain_text(props.get("Notes")) or ""
+            uid = None
+            m = re.search(r"uid:(\d+)", notes)
+            if m:
+                uid = m.group(1)
+            out.append({"name": posted_by, "user_id": uid})
 
-        if not names:
+        if not out:
             logger.info(
                 "No stockpickers found for %s in db %s", ticker, db_id
             )
     except Exception as e:
         logger.error("Stockpickers lookup failed for %s db=%s: %s", ticker, db_id, e)
 
-    return names
+    return out
+
+
+def _parse_following_blob(raw: str) -> list[dict]:
+    """
+    Parse Following rich_text from Auth DB.
+    Format entries: Name or Name|uid:123 — separated by ; or newlines.
+    """
+    items: list[dict] = []
+    seen: set[str] = set()
+    if not raw:
+        return items
+    for part in re.split(r"[;\n]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        uid = None
+        name = part
+        m = re.match(r"^(.*?)\|uid:(\d+)$", part.strip())
+        if m:
+            name = m.group(1).strip()
+            uid = m.group(2)
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        items.append({"name": name, "user_id": uid})
+    return items
+
+
+def _serialize_following(items: list[dict]) -> str:
+    parts = []
+    for it in items:
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+        uid = it.get("user_id")
+        if uid:
+            parts.append(f"{name}|uid:{uid}")
+        else:
+            parts.append(name)
+    return "; ".join(parts)[:1800]
+
+
+async def get_user_following(user) -> list[dict]:
+    """Load Following list for a Telegram user from Auth DB."""
+    if not user:
+        return []
+    if not notion and not NOTION_TOKEN:
+        return []
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
+        return []
+    try:
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            return []
+        props = results[0].get("properties", {})
+        raw = (
+            _get_plain_text(props.get("Following"))
+            or _get_plain_text(props.get("Following Stockpickers"))
+            or ""
+        )
+        return _parse_following_blob(raw)
+    except Exception as e:
+        logger.warning("get_user_following failed for %s: %s", user.id, e)
+        return []
+
+
+async def add_following(user, *, name: str, target_uid: str | None = None) -> tuple[bool, str]:
+    """
+    Add a stockpicker to this user's Following list on Auth DB.
+    Requires rich_text property \"Following\" (or \"Following Stockpickers\").
+    Returns (ok, message).
+    """
+    if not user or not name:
+        return False, "Missing user or name."
+    if not notion and not NOTION_TOKEN:
+        return False, "Notion not configured."
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
+        return False, "Auth DB not configured."
+
+    try:
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            page_size=1,
+        )
+        results = response.get("results", [])
+        if not results:
+            return False, "Your access profile was not found. Send /request first."
+
+        page = results[0]
+        page_id = page["id"]
+        props = page.get("properties", {})
+        prop_name = "Following" if "Following" in props else (
+            "Following Stockpickers" if "Following Stockpickers" in props else "Following"
+        )
+        raw = _get_plain_text(props.get(prop_name)) or ""
+        items = _parse_following_blob(raw)
+        key = name.strip().lower()
+        for it in items:
+            if (it.get("name") or "").lower() == key:
+                return True, f"You already follow *{name}*."
+            if target_uid and it.get("user_id") == str(target_uid):
+                return True, f"You already follow *{name}*."
+
+        items.append({"name": name.strip(), "user_id": str(target_uid) if target_uid else None})
+        blob = _serialize_following(items)
+        update_props = {
+            prop_name: {"rich_text": [{"text": {"content": blob}}]}
+        }
+        if notion:
+            notion.pages.update(page_id=page_id, properties=update_props)
+        else:
+            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+        return True, f"✅ You now follow *{name}*.\nYou’ll get a DM when they post a monthly stockpick."
+    except Exception as e:
+        err = str(e)
+        logger.error("add_following failed for %s: %s", user.id, e)
+        if "is not a property" in err or "property" in err.lower():
+            return (
+                False,
+                "Could not save follow — add a **Rich text** property named "
+                "`Following` on *Hive Bot Authorised Users*, then try again.",
+            )
+        return False, f"Could not save follow: {e}"
+
+
+async def notify_followers_of_stockpick(
+    *,
+    picker_name: str,
+    picker_uid: int | None,
+    ticker: str | None,
+    message: str,
+    bot,
+) -> int:
+    """
+    DM every authorised user who follows this stockpicker.
+    Match by name or uid stored in their Following field.
+    Returns number of DMs sent.
+    """
+    if not bot or not (picker_name or picker_uid):
+        return 0
+    if not notion and not NOTION_TOKEN:
+        return 0
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
+        return 0
+
+    needle_name = (picker_name or "").strip()
+    needle_uid = str(picker_uid) if picker_uid else ""
+    sent = 0
+    try:
+        # Pull authorised users in pages; filter Following client-side
+        # (Notion rich_text contains is case-sensitive / partial)
+        cursor = None
+        candidates: list[dict] = []
+        while True:
+            kwargs: dict = {
+                "page_size": 100,
+                "filter": {
+                    "property": "Status",
+                    "select": {"equals": "Authorised"},
+                },
+            }
+            if cursor:
+                kwargs["start_cursor"] = cursor
+            response = notion_query_data_source(
+                data_source_id=ds_id,
+                database_id=db_id,
+                **kwargs,
+            )
+            for page in response.get("results", []):
+                props = page.get("properties", {})
+                raw = (
+                    _get_plain_text(props.get("Following"))
+                    or _get_plain_text(props.get("Following Stockpickers"))
+                    or ""
+                )
+                if not raw:
+                    continue
+                items = _parse_following_blob(raw)
+                match = False
+                for it in items:
+                    if needle_uid and it.get("user_id") == needle_uid:
+                        match = True
+                        break
+                    if needle_name and (it.get("name") or "").lower() == needle_name.lower():
+                        match = True
+                        break
+                if not match:
+                    # soft contains fallback
+                    low = raw.lower()
+                    if needle_name and needle_name.lower() in low:
+                        match = True
+                    elif needle_uid and f"uid:{needle_uid}" in low:
+                        match = True
+                if not match:
+                    continue
+                uid = (
+                    _get_plain_text(props.get("Telegram User ID"))
+                    or _get_plain_text(props.get("Telegram ID"))
+                    or ""
+                ).strip()
+                if uid.isdigit() and (not needle_uid or uid != needle_uid):
+                    candidates.append({"uid": int(uid)})
+            if not response.get("has_more"):
+                break
+            cursor = response.get("next_cursor")
+            if not cursor:
+                break
+
+        t_label = f"#{ticker}" if ticker else "a new pick"
+        body = (
+            f"🔔 *Stockpicker you follow*\n\n"
+            f"*{picker_name or 'Member'}* just posted {t_label}:\n\n"
+            f"{(message or '')[:500]}\n\n"
+            f"_Open Stock Snapshot or My Stockpick to review._"
+        )
+        for c in candidates:
+            try:
+                await bot.send_message(
+                    chat_id=c["uid"],
+                    text=body,
+                    parse_mode="Markdown",
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning("follow notify DM failed %s: %s", c["uid"], e)
+            await asyncio.sleep(0.35)
+    except Exception as e:
+        logger.error("notify_followers_of_stockpick failed: %s", e)
+    return sent
     
 async def save_stockpick_to_notion(
     text: str,
@@ -1988,22 +2257,57 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
-    """Inline actions under a company snapshot."""
+# Short key → display name for Follow callbacks (callback_data max 64 chars)
+_follow_name_cache: dict[str, str] = {}
+
+
+def _follow_key(name: str) -> str:
+    import hashlib
+
+    return hashlib.md5((name or "").strip().lower().encode("utf-8")).hexdigest()[:10]
+
+
+def snapshot_action_keyboard(
+    ticker: str,
+    stockpickers: list | None = None,
+) -> InlineKeyboardMarkup:
+    """
+    Inline actions under a company snapshot.
+    Includes Follow buttons when this-month stockpickers are known.
+    """
     t = (ticker or "").upper()[:20]
-    return InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = [
         [
+            InlineKeyboardButton(
+                "➕ Save to My Watchlist",
+                callback_data=f"snap:save:{t}",
+            )
+        ],
+    ]
+    # Up to 3 Follow buttons (Telegram callback_data limit 64 bytes)
+    names: list[str] = []
+    if stockpickers:
+        for sp in stockpickers:
+            if isinstance(sp, dict):
+                n = (sp.get("name") or "").strip()
+            else:
+                n = str(sp or "").strip()
+            if n and n not in names:
+                names.append(n)
+    for name in names[:3]:
+        key = _follow_key(name)
+        _follow_name_cache[key] = name
+        label = name if len(name) <= 18 else name[:16] + "…"
+        rows.append(
             [
                 InlineKeyboardButton(
-                    "➕ Save to My Watchlist",
-                    callback_data=f"snap:save:{t}",
+                    f"➕ Follow {label}",
+                    callback_data=f"fol:add:{key}",
                 )
-            ],
-            [
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ],
-        ]
-    )
+            ]
+        )
+    rows.append([InlineKeyboardButton("« Hub", callback_data="hub:home")])
+    return InlineKeyboardMarkup(rows)
 
 
 def hub_home_keyboard() -> InlineKeyboardMarkup:
@@ -3128,6 +3432,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if page_id:
             _last_stockpick_page[user.id] = page_id
             await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
+            # Notify members who Follow this stockpicker
+            try:
+                n = await notify_followers_of_stockpick(
+                    picker_name=user_name,
+                    picker_uid=user.id if user else None,
+                    ticker=ticker,
+                    message=clean_text,
+                    bot=context.bot,
+                )
+                if n:
+                    logger.info(
+                        "Notified %s follower(s) of stockpick by %s",
+                        n,
+                        user_name,
+                    )
+            except Exception as ne:
+                logger.warning("follower notify failed: %s", ne)
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
@@ -3669,14 +3990,14 @@ async def deliver_stock_snapshot(
                 msg.chat_id,
                 body,
                 parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
                 disable_web_page_preview=True,
             )
         except Exception:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
                 disable_web_page_preview=True,
             )
         if user:
@@ -4780,13 +5101,13 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text(
                 body,
                 parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
                 disable_web_page_preview=True,
             )
         except Exception:
             await query.edit_message_text(
                 body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
                 disable_web_page_preview=True,
             )
         await remember_nav_panel(user.id, query.message)
@@ -4878,6 +5199,70 @@ async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
             reply_markup=main_reply_keyboard(),
         )
+
+
+async def follow_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Follow stockpicker from snapshot: fol:add:<key>."""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data or ""
+    if not user:
+        await query.answer()
+        return
+
+    if not data.startswith("fol:add:"):
+        await query.answer()
+        return
+
+    key = data.replace("fol:add:", "", 1).strip()
+    name = _follow_name_cache.get(key)
+    if not name:
+        await query.answer(
+            "That Follow button expired — open the snapshot again.",
+            show_alert=True,
+        )
+        return
+
+    if not await is_authorized(update, context):
+        await query.answer("Authorised members only.", show_alert=True)
+        return
+
+    # Resolve optional Telegram uid from Hive Stock Picks Notes (uid:123)
+    target_uid = None
+    try:
+        db_id = (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip() or (
+            "9095ded4-ad6a-4b25-9887-19a77baba12f"
+        )
+        raw = db_id.replace("-", "")
+        if len(raw) == 32:
+            db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
+        if notion:
+            resp = notion.databases.query(
+                database_id=db_id,
+                filter={
+                    "property": "Posted By",
+                    "rich_text": {"equals": name},
+                },
+                page_size=5,
+            )
+            for page in resp.get("results", []):
+                notes = _get_plain_text(page.get("properties", {}).get("Notes")) or ""
+                m = re.search(r"uid:(\d+)", notes)
+                if m:
+                    target_uid = m.group(1)
+                    break
+    except Exception as e:
+        logger.debug("follow uid resolve: %s", e)
+
+    ok, msg = await add_following(user, name=name, target_uid=target_uid)
+    await query.answer("Followed" if ok else "Could not follow", show_alert=not ok)
+    try:
+        await query.message.reply_text(msg, parse_mode="Markdown")
+    except Exception:
+        try:
+            await query.message.reply_text(msg.replace("*", ""))
+        except Exception:
+            pass
 
 
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6561,6 +6946,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
+    app.add_handler(CallbackQueryHandler(follow_button, pattern=r"^fol:"))
     app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
     app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
