@@ -3804,8 +3804,20 @@ async def daily_brief_cmd(
         )
         return
 
-    # Immediate ack — user must see this within 1s of passing auth
     day = datetime.now(timezone.utc).date().isoformat()
+
+    # IMPORTANT: clear old panels BEFORE posting the loading message.
+    # Previous bug: remember(status) then clear_nav_panel() deleted status,
+    # so users saw nothing / endless "loading".
+    try:
+        await clear_nav_panel(context.bot, user.id if user else None)
+    except Exception:
+        pass
+    try:
+        await cleanup_trigger_message(update, context)
+    except Exception:
+        pass
+
     try:
         status = await msg.reply_text(
             "📰 *Daily Brief*\n\nLoading today’s RNS…",
@@ -3817,14 +3829,6 @@ async def daily_brief_cmd(
         return
     await remember_nav_panel(user.id if user else None, status)
 
-    # Cleanup after ack (never before)
-    try:
-        await cleanup_trigger_message(update, context)
-        await clear_nav_panel(context.bot, user.id if user else None)
-        await remember_nav_panel(user.id if user else None, status)
-    except Exception:
-        pass
-
     try:
         rns = await _ensure_daily_brief_rns(day)
         if not rns:
@@ -3833,7 +3837,7 @@ async def daily_brief_cmd(
                 f"_Hive RNS News Log · {day}_\n\n"
                 "_No RNS rows for today yet "
                 "(or Notion timed out under 15s)._\n\n"
-                "Tap **Performers** for session %, or try again shortly."
+                "Tap Performers for session %, or try again shortly."
             )
             markup = InlineKeyboardMarkup(
                 [
@@ -3863,7 +3867,20 @@ async def daily_brief_cmd(
                     disable_web_page_preview=True,
                 )
             except Exception as e2:
-                logger.error("daily_brief_cmd edit failed: %s", e2)
+                logger.error(
+                    "daily_brief_cmd edit failed: %s — sending new message",
+                    e2,
+                )
+                try:
+                    sent = await context.bot.send_message(
+                        status.chat_id,
+                        text.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                    await remember_nav_panel(user.id if user else None, sent)
+                except Exception as e3:
+                    logger.error("daily_brief_cmd send fallback failed: %s", e3)
         try:
             asyncio.create_task(
                 log_member_activity(
@@ -3877,7 +3894,12 @@ async def daily_brief_cmd(
         try:
             await status.edit_text(f"Daily Brief failed: {e}")
         except Exception:
-            pass
+            try:
+                await context.bot.send_message(
+                    status.chat_id, f"Daily Brief failed: {e}"
+                )
+            except Exception:
+                pass
 
 
 async def daily_brief_button(
