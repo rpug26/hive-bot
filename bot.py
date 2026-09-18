@@ -3240,8 +3240,7 @@ async def stock_of_the_day_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Rank UK AIM Micro-Cap names by live day % and show top movers
-    with Save to Watchlist + Hub actions.
+    Entry: let user choose % Today movers vs today's top RNS news.
     """
     user = update.effective_user
     msg = update.effective_message
@@ -3257,64 +3256,90 @@ async def stock_of_the_day_cmd(
 
     await cleanup_trigger_message(update, context)
     await clear_nav_panel(context.bot, user.id if user else None)
-    status = await msg.reply_text(
-        "🏆 Scanning…",
-        reply_markup=main_reply_keyboard(),
+
+    body = (
+        "🏆 *Stock of the Day*\n\n"
+        "Choose a board:\n\n"
+        "• *% Today* — top session movers across UK AIM Micro-Cap\n"
+        "• *RNS News* — most significant RNS from *today’s* News Log"
     )
-    await remember_nav_panel(user.id if user else None, status)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📈 % Today", callback_data="sotd:mode:pct"
+                ),
+                InlineKeyboardButton(
+                    "📰 RNS News", callback_data="sotd:mode:rns"
+                ),
+            ],
+            [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+        ]
+    )
+    sent = await msg.reply_text(
+        body,
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    await remember_nav_panel(user.id if user else None, sent)
+    await ensure_home_keyboard(context.bot, msg.chat_id)
 
-    try:
-        # Full universe from Notion UK AIM Micro-Cap
-        pairs = await _load_microcap_tickers(limit=None)
-        if not pairs:
-            try:
-                await status.edit_text(
-                    "🏆 *Stock of the Day*\n\n"
-                    "Could not load the UK AIM Micro-Cap list from Notion.",
-                    parse_mode="Markdown",
-                    reply_markup=hub_back_keyboard(),
-                )
-            except Exception:
-                await msg.reply_text(
-                    "Could not load Stock of the Day right now.",
-                    reply_markup=main_reply_keyboard(),
-                )
-            return
 
+async def stock_of_the_day_pct(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit_msg=None
+) -> None:
+    """Top movers by live Yahoo session % across full Micro-Cap universe."""
+    user = update.effective_user
+    msg = edit_msg or update.effective_message
+    if not msg:
+        return
+
+    async def _set(text: str, markup=None):
         try:
-            await status.edit_text(
-                f"🏆 Scanning *{len(pairs)}* AIM names for live session %…",
+            await msg.edit_text(
+                text,
                 parse_mode="Markdown",
-                reply_markup=main_reply_keyboard(),
+                reply_markup=markup or hub_back_keyboard(),
+                disable_web_page_preview=True,
             )
         except Exception:
-            pass
+            try:
+                await msg.edit_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup or hub_back_keyboard(),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
 
+    await _set("🏆 Scanning full AIM list for live session %…")
+
+    try:
+        pairs = await _load_microcap_tickers(limit=None)
+        if not pairs:
+            await _set(
+                "🏆 *Stock of the Day — % Today*\n\n"
+                "Could not load the UK AIM Micro-Cap list from Notion."
+            )
+            return
+
+        await _set(f"🏆 Scanning *{len(pairs)}* AIM names for live session %…")
         ranked = await _rank_tickers_by_live_pct(pairs, concurrency=12)
         top = ranked[:5]
         quoted = len(ranked)
 
         if not top:
-            try:
-                await status.edit_text(
-                    "🏆 *Stock of the Day*\n\n"
-                    f"Loaded *{len(pairs)}* names from Notion but no live "
-                    "Yahoo quotes returned. Try again shortly.",
-                    parse_mode="Markdown",
-                    reply_markup=hub_back_keyboard(),
-                )
-            except Exception:
-                await msg.reply_text(
-                    "Could not load Stock of the Day right now.",
-                    reply_markup=main_reply_keyboard(),
-                )
+            await _set(
+                "🏆 *Stock of the Day — % Today*\n\n"
+                f"Loaded *{len(pairs)}* names but no live Yahoo quotes. "
+                "Try again shortly."
+            )
             return
 
-        # Header board
         lines = [
-            "🏆 *Stock of the Day*",
-            "_Top movers by session % change (full UK AIM Micro-Cap)_",
-            f"_Scanned {len(pairs)} names · {quoted} with live Yahoo quotes_",
+            "🏆 *Stock of the Day — % Today*",
+            "_Top movers by session % (full UK AIM Micro-Cap)_",
+            f"_Scanned {len(pairs)} · {quoted} with live Yahoo quotes_",
             "",
         ]
         for i, (t, company, pct) in enumerate(top, 1):
@@ -3323,8 +3348,8 @@ async def stock_of_the_day_cmd(
             lines.append(f"{i}. *#{t}* {company}")
             lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
         lines.append("")
-        lines.append("_Tap a ticker below for the full snapshot._")
-        lines.append("_Prices: Yahoo Finance (LSE). Not financial advice. DYOR._")
+        lines.append("_Tap a ticker for the full snapshot._")
+        lines.append("_Prices: Yahoo Finance (LSE). Not FA. DYOR._")
 
         kb_rows = []
         for t, company, pct in top:
@@ -3338,39 +3363,319 @@ async def stock_of_the_day_cmd(
                 ]
             )
         kb_rows.append(
-            [InlineKeyboardButton("« Hub", callback_data="hub:home")]
+            [
+                InlineKeyboardButton("« Boards", callback_data="sotd:menu"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ]
         )
-        body = "\n".join(lines)
-        try:
-            await status.edit_text(
-                body,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb_rows),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            await msg.reply_text(
-                body.replace("*", ""),
-                reply_markup=InlineKeyboardMarkup(kb_rows),
-                disable_web_page_preview=True,
-            )
-        await ensure_home_keyboard(context.bot, msg.chat_id)
+        await _set("\n".join(lines), InlineKeyboardMarkup(kb_rows))
+        chat_id = getattr(msg, "chat_id", None) or (
+            update.effective_chat.id if update.effective_chat else None
+        )
+        if chat_id:
+            await ensure_home_keyboard(context.bot, chat_id)
     except Exception as e:
-        logger.error("stock_of_the_day_cmd failed: %s", e)
+        logger.error("stock_of_the_day_pct failed: %s", e)
+        await _set(f"Stock of the Day (% Today) failed: {e}")
+
+
+# Significance weights for RNS titles/summaries (no readership field in Notion)
+_RNS_SCORE_HIGH = (
+    "acquisition",
+    "takeover",
+    "recommended offer",
+    "firm offer",
+    "fundraising",
+    "placing",
+    "subscription",
+    "retail offer",
+    "open offer",
+    "interim results",
+    "final results",
+    "full year results",
+    "half-year",
+    "half year",
+    "profit warning",
+    "trading update",
+    "administration",
+    "administrators",
+    "suspension",
+    "restore",
+    "contract win",
+    "major contract",
+    "offtake",
+    "resource",
+    "drill",
+    "feasibility",
+    "permitting",
+    "licence",
+    "license",
+    "fda",
+    "clinical",
+    "partnership",
+    "joint venture",
+    "disposal",
+    "divestment",
+    "strategic review",
+)
+_RNS_SCORE_MED = (
+    "appointment",
+    "board change",
+    "director",
+    "holding(s)",
+    "holdings in company",
+    "agm",
+    "egm",
+    "general meeting",
+    "loan note",
+    "convertible",
+    "warrant",
+    "exercise of options",
+)
+_RNS_SCORE_LOW = (
+    "total voting rights",
+    "tvr",
+    "block listing",
+    "pdmr",
+    "form 8",
+    "rule 8",
+    "second price monitoring",
+    "price monitoring extension",
+)
+
+
+def _score_rns_significance(title: str, summary: str) -> tuple[float, str]:
+    """
+    Heuristic significance score (0–100) + short reason tag.
+    Proxy for readership/virality/context until explicit metrics exist in Notion.
+    """
+    blob = f"{title or ''} {summary or ''}".lower()
+    score = 10.0
+    tags: list[str] = []
+
+    for kw in _RNS_SCORE_HIGH:
+        if kw in blob:
+            score += 18
+            tags.append(kw)
+    for kw in _RNS_SCORE_MED:
+        if kw in blob:
+            score += 8
+            if len(tags) < 3:
+                tags.append(kw)
+    for kw in _RNS_SCORE_LOW:
+        if kw in blob:
+            score -= 6
+
+    # Substance: longer AI summary → more context
+    s_len = len((summary or "").strip())
+    if s_len > 400:
+        score += 12
+    elif s_len > 180:
+        score += 7
+    elif s_len > 60:
+        score += 3
+    elif s_len == 0:
+        score -= 5
+
+    # Title punchiness
+    t_len = len((title or "").strip())
+    if 12 <= t_len <= 80:
+        score += 3
+
+    score = max(0.0, min(100.0, score))
+    reason = ", ".join(dict.fromkeys(tags[:3])) if tags else "general update"
+    return score, reason
+
+
+async def _load_rns_for_day(day_iso: str | None = None) -> list[dict]:
+    """
+    All RNS News Log rows for a calendar day (RNS Date preferred).
+    day_iso: YYYY-MM-DD (default today UTC).
+    """
+    if not day_iso:
+        day_iso = datetime.now(timezone.utc).date().isoformat()
+    ds_id = NOTION_RNS_DATA_SOURCE_ID
+    db_id = NOTION_RNS_DB_ID
+    if not (notion or NOTION_TOKEN) or (not ds_id and not db_id):
+        return []
+
+    rows: list[dict] = []
+    try:
+        # On-or-after start of day; filter client-side for exact day
+        resp = notion_query_data_source(
+            data_source_id=ds_id or None,
+            database_id=db_id or None,
+            filter={
+                "property": "RNS Date",
+                "date": {"equals": day_iso},
+            },
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=100,
+        )
+        pages = resp.get("results", [])
+        # Fallback: Created time window if RNS Date filter empty
+        if not pages:
+            resp = notion_query_data_source(
+                data_source_id=ds_id or None,
+                database_id=db_id or None,
+                sorts=[{"timestamp": "created_time", "direction": "descending"}],
+                page_size=100,
+            )
+            pages = resp.get("results", [])
+
+        for page in pages:
+            props = page.get("properties") or {}
+            title = _get_plain_text(props.get("Title")) or "RNS"
+            ticker = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper().strip()
+            company = _get_plain_text(props.get("Company")) or ""
+            summary = _strip_html(_get_plain_text(props.get("AI Summary")) or "")
+            link = ""
+            lp = props.get("Link") or {}
+            if isinstance(lp, dict):
+                link = (lp.get("url") or "").strip()
+            date_str = ""
+            dp = props.get("RNS Date") or {}
+            if isinstance(dp, dict) and dp.get("date"):
+                date_str = (dp["date"].get("start") or "")[:10]
+            created = page.get("created_time") or ""
+            # Keep only target day when using created fallback
+            if date_str and date_str != day_iso:
+                continue
+            if not date_str and created and not created.startswith(day_iso):
+                continue
+            score, reason = _score_rns_significance(title, summary)
+            rows.append(
+                {
+                    "title": title[:140],
+                    "ticker": ticker,
+                    "company": company[:80],
+                    "summary": summary[:320],
+                    "link": link,
+                    "date": date_str or day_iso,
+                    "score": score,
+                    "reason": reason,
+                    "page_id": page.get("id"),
+                }
+            )
+    except Exception as e:
+        logger.error("_load_rns_for_day failed: %s", e)
+    return rows
+
+
+async def stock_of_the_day_rns(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit_msg=None
+) -> None:
+    """Top 5 most significant RNS items from today's News Log."""
+    user = update.effective_user
+    msg = edit_msg or update.effective_message
+    if not msg:
+        return
+
+    async def _set(text: str, markup=None):
         try:
-            await status.edit_text(
-                f"Stock of the Day failed: {e}",
-                reply_markup=hub_back_keyboard(),
+            await msg.edit_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup or hub_back_keyboard(),
+                disable_web_page_preview=True,
             )
         except Exception:
-            await msg.reply_text(
-                f"Stock of the Day failed: {e}",
-                reply_markup=main_reply_keyboard(),
+            try:
+                await msg.edit_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup or hub_back_keyboard(),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+    day = datetime.now(timezone.utc).date().isoformat()
+    await _set(f"📰 Loading RNS News Log for *{day}*…")
+
+    try:
+        rows = await _load_rns_for_day(day)
+        if not rows:
+            await _set(
+                f"🏆 *Stock of the Day — RNS News*\n\n"
+                f"No RNS rows found for *{day}* in Hive RNS News Log.\n"
+                "Check the log has today’s date on **RNS Date**."
             )
+            return
+
+        # Rank by significance; light boost if same ticker appears often (cluster)
+        ticker_counts: dict[str, int] = {}
+        for r in rows:
+            if r.get("ticker"):
+                ticker_counts[r["ticker"]] = ticker_counts.get(r["ticker"], 0) + 1
+        for r in rows:
+            t = r.get("ticker") or ""
+            if ticker_counts.get(t, 0) >= 2:
+                r["score"] = min(100.0, r["score"] + 5)
+
+        rows.sort(key=lambda r: r["score"], reverse=True)
+        top = rows[:5]
+
+        lines = [
+            "🏆 *Stock of the Day — RNS News*",
+            f"_Most significant updates · {day}_",
+            f"_From {len(rows)} RNS item(s) in today’s News Log_",
+            "",
+        ]
+        for i, r in enumerate(top, 1):
+            t = r.get("ticker") or "—"
+            company = r.get("company") or ""
+            head = f"#{t}" if t != "—" else "RNS"
+            if company:
+                head = f"{head} {company}"
+            lines.append(f"{i}. *{head}*")
+            lines.append(f"   📰 {r.get('title') or '—'}")
+            if r.get("summary"):
+                lines.append(f"   _{r['summary']}_")
+            lines.append(
+                f"   Significance *{r['score']:.0f}*/100 · {r.get('reason') or '—'}"
+            )
+            if r.get("link"):
+                lines.append(f"   {r['link']}")
+            lines.append("")
+
+        lines.append(
+            "_Ranked by topic significance + summary depth "
+            "(proxy for attention until readership metrics exist)._"
+        )
+        lines.append("_Not financial advice. DYOR._")
+
+        kb_rows = []
+        for r in top:
+            t = (r.get("ticker") or "")[:20]
+            label = f"#{t}" if t else (r.get("title") or "RNS")[:28]
+            if t:
+                kb_rows.append(
+                    [
+                        InlineKeyboardButton(
+                            label,
+                            callback_data=f"sotd:snap:{t}",
+                        )
+                    ]
+                )
+        kb_rows.append(
+            [
+                InlineKeyboardButton("« Boards", callback_data="sotd:menu"),
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ]
+        )
+        await _set("\n".join(lines).strip(), InlineKeyboardMarkup(kb_rows))
+        chat_id = getattr(msg, "chat_id", None) or (
+            update.effective_chat.id if update.effective_chat else None
+        )
+        if chat_id:
+            await ensure_home_keyboard(context.bot, chat_id)
+    except Exception as e:
+        logger.error("stock_of_the_day_rns failed: %s", e)
+        await _set(f"Stock of the Day (RNS) failed: {e}")
 
 
 async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Back-compat alias → Stock of the Day."""
+    """Back-compat alias → Stock of the Day chooser."""
     await stock_of_the_day_cmd(update, context)
 
 
@@ -4592,13 +4897,63 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stock of the Day → open snapshot in place with Save + Hub."""
+    """Stock of the Day boards + snapshot."""
     query = update.callback_query
     user = query.from_user if query else None
     if not query or not user:
         return
-    await query.answer()
     data = query.data or ""
+
+    # Chooser again
+    if data == "sotd:menu":
+        await query.answer()
+        body = (
+            "🏆 *Stock of the Day*\n\n"
+            "Choose a board:\n\n"
+            "• *% Today* — top session movers across UK AIM Micro-Cap\n"
+            "• *RNS News* — most significant RNS from *today’s* News Log"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "📈 % Today", callback_data="sotd:mode:pct"
+                    ),
+                    InlineKeyboardButton(
+                        "📰 RNS News", callback_data="sotd:mode:rns"
+                    ),
+                ],
+                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+            ]
+        )
+        try:
+            await query.edit_message_text(
+                body, parse_mode="Markdown", reply_markup=kb
+            )
+        except Exception:
+            await query.edit_message_text(
+                body.replace("*", ""), reply_markup=kb
+            )
+        await remember_nav_panel(user.id, query.message)
+        return
+
+    if data == "sotd:mode:pct":
+        await query.answer("Loading % Today…")
+        await stock_of_the_day_pct(
+            update, context, edit_msg=query.message
+        )
+        await remember_nav_panel(user.id, query.message)
+        return
+
+    if data == "sotd:mode:rns":
+        await query.answer("Loading RNS News…")
+        await stock_of_the_day_rns(
+            update, context, edit_msg=query.message
+        )
+        await remember_nav_panel(user.id, query.message)
+        return
+
+    await query.answer()
     if not data.startswith("sotd:snap:"):
         return
     ticker = data.replace("sotd:snap:", "", 1).strip().upper()
