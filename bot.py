@@ -122,7 +122,8 @@ def _notion_http(method: str, path: str, body: dict | None = None) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # Keep interactive bot calls snappy (was 30s → multi-minute hangs)
+        with urllib.request.urlopen(req, timeout=12) as resp:
             return _json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -239,6 +240,9 @@ _glink_requests: dict[str, dict] = {}
 _sotd_rns_likes: dict[str, set[int]] = {}
 # Cache last top-5 RNS payload per day so Like can refresh the board
 _sotd_rns_top_cache: dict[str, list[dict]] = {}
+# Throttle Notion Group Member sync (user_id -> last unix ts)
+_group_member_sync_at: dict[int, float] = {}
+_GROUP_MEMBER_SYNC_TTL = 3600.0  # seconds — do not rewrite Notion every request
 # Daily Brief caches (per UTC day)
 _daily_brief_rns: dict[str, list[dict]] = {}  # day -> ranked RNS rows
 _daily_brief_pct: dict[str, list[tuple[str, str, float]]] = {}  # day -> ranked %
@@ -910,11 +914,11 @@ async def is_authorized(
     if not user:
         return False
 
-    # --- Admins: always allowed; still sync group flag when possible ---
+    # --- Admins: always allowed; membership sync in background only ---
     if is_admin(user):
         if context is not None:
             try:
-                await sync_group_member_to_notion(context, user)
+                asyncio.create_task(sync_group_member_to_notion(context, user))
             except Exception:
                 pass
         return True
@@ -927,17 +931,29 @@ async def is_authorized(
     group_detail = "unknown"
     if context is not None:
         in_group, group_detail = await is_group_member(context, user.id)
-        # Persist live result to Notion whenever Telegram answers clearly
+        # Persist to Notion only when status is clear — throttled (not every request)
         if group_detail.startswith("status="):
             status = group_detail.replace("status=", "", 1)
-            try:
-                await mark_group_member_in_notion(
-                    user, is_member=(status in _MEMBER_STATUSES)
-                )
-            except Exception as e:
-                logger.warning(
-                    "Auth sync Group Member failed user=%s: %s", user.id, e
-                )
+            now_ts = time.time()
+            last_sync = _group_member_sync_at.get(user.id, 0)
+            must_sync = status in _NON_MEMBER_STATUSES or (
+                now_ts - last_sync > _GROUP_MEMBER_SYNC_TTL
+            )
+            if must_sync:
+                try:
+                    # Background so auth is not blocked on Notion write
+                    asyncio.create_task(
+                        mark_group_member_in_notion(
+                            user, is_member=(status in _MEMBER_STATUSES)
+                        )
+                    )
+                    _group_member_sync_at[user.id] = now_ts
+                except Exception as e:
+                    logger.warning(
+                        "Auth sync Group Member schedule failed user=%s: %s",
+                        user.id,
+                        e,
+                    )
             if status in _NON_MEMBER_STATUSES:
                 logger.info(
                     "Auth DENY user=%s – not in Hive group (%s)",
@@ -3508,11 +3524,18 @@ async def _rank_tickers_by_live_pct(
 
 
 async def _ensure_daily_brief_rns(day: str) -> list[dict]:
-    """Load & cache today's ranked RNS only (fast — Notion only)."""
+    """Load & cache today's ranked RNS only (Notion) with a hard timeout."""
     rns = _daily_brief_rns.get(day)
     if rns is not None:
         return rns
-    rows = await _load_rns_for_day(day)
+    try:
+        rows = await asyncio.wait_for(_load_rns_for_day(day), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.error("_ensure_daily_brief_rns timed out day=%s", day)
+        rows = []
+    except Exception as e:
+        logger.error("_ensure_daily_brief_rns failed day=%s: %s", day, e)
+        rows = []
     ticker_counts: dict[str, int] = {}
     for r in rows:
         if r.get("ticker"):
@@ -3760,6 +3783,7 @@ async def daily_brief_cmd(
     await clear_nav_panel(context.bot, user.id if user else None)
 
     day = datetime.now(timezone.utc).date().isoformat()
+    # Reply immediately so the user sees progress even if Notion is slow
     status = await msg.reply_text(
         "📰 *Daily Brief*\n\nLoading today’s RNS News Log…",
         parse_mode="Markdown",
@@ -3768,9 +3792,29 @@ async def daily_brief_cmd(
     await remember_nav_panel(user.id if user else None, status)
 
     try:
-        # News only — do NOT rank Yahoo here (that was the 5+ min hang)
+        # News only — hard 15s cap; never block on Yahoo / Auth Notion writes
         rns = await _ensure_daily_brief_rns(day)
-        text, markup = _format_daily_brief_news(day, rns, page=0)
+        if not rns:
+            text = (
+                f"📰 *Daily Brief — Top News*\n"
+                f"_Hive RNS News Log · {day}_\n\n"
+                "_No RNS rows for today yet "
+                "(or Notion timed out)._\n\n"
+                "Try **Performers** for session %, or open again in a moment."
+            )
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📈📉 Performers",
+                            callback_data="brief:pct:both:0",
+                        )
+                    ],
+                    [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+                ]
+            )
+        else:
+            text, markup = _format_daily_brief_news(day, rns, page=0)
         try:
             await status.edit_text(
                 text,
@@ -3784,9 +3828,12 @@ async def daily_brief_cmd(
                 reply_markup=markup,
                 disable_web_page_preview=True,
             )
+        # Activity log in background — must not delay the UI
         try:
-            await log_member_activity(
-                user, "Stock of the Day", notes="Daily Brief opened"
+            asyncio.create_task(
+                log_member_activity(
+                    user, "Stock of the Day", notes="Daily Brief opened"
+                )
             )
         except Exception:
             pass
