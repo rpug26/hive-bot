@@ -758,71 +758,233 @@ async def get_authorized_usernames() -> set[str]:
     auth = await get_authorized_users()
     return auth.get("usernames", set())
 
+# Hardcoded Hive Telegram group (fallback if TELEGRAM_GROUP_ID env missing)
+# Chat ID confirmed in project: Hive support / AIM group
+HIVE_GROUP_CHAT_ID = -1001891936451
+_MEMBER_STATUSES = frozenset(
+    {"creator", "administrator", "member", "restricted"}
+)
+_NON_MEMBER_STATUSES = frozenset({"left", "kicked"})
+
+
+def get_hive_group_chat_id() -> int:
+    """Env TELEGRAM_GROUP_ID wins; otherwise hardcoded Hive group."""
+    raw = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Invalid TELEGRAM_GROUP_ID=%s – using hardcoded", raw)
+    return HIVE_GROUP_CHAT_ID
+
+
 async def is_group_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> tuple[bool, str]:
     """
+    Live Telegram membership check against the Hive group.
     Returns (is_member, detail).
-    detail is 'yes', 'no', or an error reason.
+    detail: status=<telegram_status> | error: ... | skipped
     """
-    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
-    if not group_id:
-        return True, "TELEGRAM_GROUP_ID not set (skipped)"
-
-    try:
-        chat_id = int(group_id)
-    except ValueError:
-        return False, f"Invalid TELEGRAM_GROUP_ID: {group_id}"
-
+    if not context or not context.bot:
+        return False, "error: no bot context"
+    chat_id = get_hive_group_chat_id()
     try:
         member = await context.bot.get_chat_member(
             chat_id=chat_id,
             user_id=user_id,
         )
-        status = member.status  # creator / administrator / member / restricted / left / kicked
-        if status in ("creator", "administrator", "member", "restricted"):
+        status = getattr(member, "status", None) or "unknown"
+        if status in _MEMBER_STATUSES:
             return True, f"status={status}"
         return False, f"status={status}"
     except Exception as e:
         logger.warning(
             "get_chat_member failed chat_id=%s user_id=%s err=%s",
-            group_id,
+            chat_id,
             user_id,
             e,
         )
-        # Prefix with error: so is_authorized does not treat this as left/kicked
         return False, f"error: {e}"
+
+
+async def _notion_group_member_flag(user) -> str | None:
+    """
+    Read Notion Group Member for this user: 'Yes' | 'No' | None (unknown).
+    """
+    if not user or (not notion and not NOTION_TOKEN):
+        return None
+    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
+        "NOTION_DATABASE_ID"
+    )
+    ds_id = NOTION_AUTH_DATA_SOURCE_ID
+    if not db_id and not ds_id:
+        return None
+    try:
+        results = []
+        for filt in (
+            {
+                "property": "Telegram User ID",
+                "title": {"equals": str(user.id)},
+            },
+            {
+                "property": "Telegram User ID",
+                "rich_text": {"equals": str(user.id)},
+            },
+        ):
+            try:
+                response = notion_query_data_source(
+                    data_source_id=ds_id,
+                    database_id=db_id,
+                    filter=filt,
+                    page_size=1,
+                )
+                results = response.get("results", [])
+                if results:
+                    break
+            except Exception:
+                continue
+        if not results:
+            return None
+        props = results[0].get("properties", {}) or {}
+        gm = props.get("Group Member") or {}
+        if isinstance(gm, dict):
+            if gm.get("type") == "select" and gm.get("select"):
+                return (gm["select"].get("name") or "").strip() or None
+            # plain text fallback
+            text = _get_plain_text(gm).strip()
+            return text or None
+        return None
+    except Exception as e:
+        logger.warning("_notion_group_member_flag failed for %s: %s", user.id, e)
+        return None
+
 
 async def is_authorized(
     update: Update, context: ContextTypes.DEFAULT_TYPE | None = None
 ) -> bool:
     """
-    Authorised if:
-      1) Admin, or
-      2) Notion Hive Bot Authorised Users has Status = Authorised
-         for this Telegram User ID (preferred) or Username.
+    Hard dual-gate on every request (auto-sync):
 
-    Group membership is checked only as a soft signal:
-      - Definite left/kicked → deny
-      - API error / TELEGRAM_GROUP_ID missing → do not deny (Notion wins)
+      1) Hive group membership (live Telegram getChatMember)
+         - left / kicked → DENY + sync Notion Group Member = No
+         - API error → fall back to Notion Group Member (Yes only)
+      2) Notion Hive Bot Authorised Users Status = Authorised
+         (Telegram User ID preferred, else Username)
+
+    Admins always pass (still best-effort membership sync).
     """
     user = update.effective_user
     if not user:
         return False
 
+    # --- Admins: always allowed; still sync group flag when possible ---
     if is_admin(user):
+        if context is not None:
+            try:
+                await sync_group_member_to_notion(context, user)
+            except Exception:
+                pass
         return True
 
-    auth = await get_authorized_users()
     uid = str(user.id).strip()
     uname = (user.username or "").strip().lstrip("@").lower()
 
+    # ========== 1) Hive group membership (mandatory) ==========
+    in_group = False
+    group_detail = "unknown"
+    if context is not None:
+        in_group, group_detail = await is_group_member(context, user.id)
+        # Persist live result to Notion whenever Telegram answers clearly
+        if group_detail.startswith("status="):
+            status = group_detail.replace("status=", "", 1)
+            try:
+                await mark_group_member_in_notion(
+                    user, is_member=(status in _MEMBER_STATUSES)
+                )
+            except Exception as e:
+                logger.warning(
+                    "Auth sync Group Member failed user=%s: %s", user.id, e
+                )
+            if status in _NON_MEMBER_STATUSES:
+                logger.info(
+                    "Auth DENY user=%s – not in Hive group (%s)",
+                    user.id,
+                    group_detail,
+                )
+                return False
+            if status not in _MEMBER_STATUSES:
+                logger.info(
+                    "Auth DENY user=%s – unexpected group status (%s)",
+                    user.id,
+                    group_detail,
+                )
+                return False
+        elif group_detail.startswith("error:"):
+            # Telegram API failed – fall back to last known Notion flag
+            notion_gm = await _notion_group_member_flag(user)
+            if notion_gm and notion_gm.lower() in ("no", "n", "false", "0"):
+                logger.info(
+                    "Auth DENY user=%s – TG API error and Notion Group Member=No "
+                    "(%s)",
+                    user.id,
+                    group_detail,
+                )
+                return False
+            if not notion_gm or notion_gm.lower() not in ("yes", "y", "true", "1"):
+                # Unknown membership after API error → deny (fail closed)
+                logger.info(
+                    "Auth DENY user=%s – TG API error and no Notion Group Member=Yes "
+                    "(%s / notion=%s)",
+                    user.id,
+                    group_detail,
+                    notion_gm,
+                )
+                return False
+            logger.warning(
+                "Auth group check API error user=%s – allowing via Notion "
+                "Group Member=Yes (%s)",
+                user.id,
+                group_detail,
+            )
+            in_group = True
+        else:
+            if not in_group:
+                logger.info(
+                    "Auth DENY user=%s – not in Hive group (%s)",
+                    user.id,
+                    group_detail,
+                )
+                return False
+    else:
+        # No context → cannot live-check Telegram; use Notion Group Member
+        notion_gm = await _notion_group_member_flag(user)
+        if not notion_gm or notion_gm.lower() not in ("yes", "y", "true", "1"):
+            logger.info(
+                "Auth DENY user=%s – no context and Notion Group Member not Yes "
+                "(notion=%s)",
+                user.id,
+                notion_gm,
+            )
+            return False
+        in_group = True
+
+    if not in_group:
+        logger.info(
+            "Auth DENY user=%s – group membership failed (%s)",
+            user.id,
+            group_detail,
+        )
+        return False
+
+    # ========== 2) Notion Authorised status ==========
+    auth = await get_authorized_users()
     in_notion = uid in auth.get("user_ids", set()) or (
         uname and uname in auth.get("usernames", set())
     )
     if not in_notion:
         logger.info(
-            "Auth denied for id=%s username=%s – not in Notion Authorised list "
+            "Auth DENY user=%s username=%s – in group but not Notion Authorised "
             "(ids=%d usernames=%d)",
             uid,
             uname or "N/A",
@@ -831,43 +993,87 @@ async def is_authorized(
         )
         return False
 
-    # Soft group check: only block on clear non-membership
-    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
-    if group_id and context is not None:
-        in_group, detail = await is_group_member(context, user.id)
-        if not in_group and detail.startswith("status="):
-            status = detail.replace("status=", "")
-            if status in ("left", "kicked"):
-                logger.info(
-                    "Auth denied for %s – left/kicked group (%s)", user.id, detail
-                )
-                return False
-        # API errors / skipped → still allow if Notion Authorised
-
+    logger.debug(
+        "Auth OK user=%s group=%s notion=Authorised",
+        user.id,
+        group_detail,
+    )
     return True
 
 
 async def require_authorized(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Return True if authorised; otherwise reply with standard denial and return False."""
+    """
+    Hard gate: Hive group member AND Notion Authorised.
+    Replies with a clear reason when denied.
+    """
     if await is_authorized(update, context):
         return True
     msg = update.effective_message
-    if msg:
+    if not msg:
+        return False
+
+    user = update.effective_user
+    reason_lines = [
+        "🔒 Access denied.\n",
+        "This bot only works if *both* are true:",
+        "1. You are a *member of the Hive Telegram group*",
+        "2. An admin has set your status to *Authorised* in Notion",
+        "",
+    ]
+    # Best-effort specific hint
+    if user and context:
+        try:
+            in_group, detail = await is_group_member(context, user.id)
+            if not in_group and detail.startswith("status="):
+                st = detail.replace("status=", "", 1)
+                if st in _NON_MEMBER_STATUSES:
+                    reason_lines.append(
+                        f"_Reason: you are not in the Hive group "
+                        f"(Telegram status: {st})._"
+                    )
+                else:
+                    reason_lines.append(
+                        f"_Reason: group check failed ({detail})._"
+                    )
+            elif not in_group:
+                reason_lines.append(
+                    f"_Reason: group membership could not be confirmed "
+                    f"({detail})._"
+                )
+            else:
+                reason_lines.append(
+                    "_Reason: you are in the group, but not Authorised in Notion yet._"
+                )
+                reason_lines.append("Send /request then wait for admin approval.")
+        except Exception:
+            reason_lines.append(
+                "Send /request for access, then /status to check."
+            )
+    else:
+        reason_lines.append("Send /request for access, then /status to check.")
+
+    reason_lines.append("\nUse /status anytime to see your current checks.")
+    try:
         await msg.reply_text(
-            "🔒 You are not authorised to use this bot service yet.\n\n"
-            "Send /request to ask for access, then /status to check.\n"
-            "An admin must set your Status to Authorised in Notion."
+            "\n".join(reason_lines),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await msg.reply_text(
+            "Access denied. You must be a Hive group member and Authorised in Notion. "
+            "Send /request and /status."
         )
     return False
+
 
 async def sync_group_member_to_notion(
     context: ContextTypes.DEFAULT_TYPE,
     user,
 ) -> bool | None:
     """
-    Check Telegram group membership and update Notion "Group Member".
+    Live Telegram membership → Notion Group Member (Yes/No).
     Returns True/False, or None if check not possible.
     """
     if not user:
@@ -875,25 +1081,13 @@ async def sync_group_member_to_notion(
     if not notion and not NOTION_TOKEN:
         return None
 
-    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not group_id or (not db_id and not ds_id):
-        return None
-
+    chat_id = get_hive_group_chat_id()
     try:
         member = await context.bot.get_chat_member(
-            chat_id=int(group_id),
+            chat_id=chat_id,
             user_id=user.id,
         )
-        is_member = member.status in (
-            "creator",
-            "administrator",
-            "member",
-            "restricted",
-        )
+        is_member = (getattr(member, "status", None) or "") in _MEMBER_STATUSES
     except Exception as e:
         logger.warning("get_chat_member failed for %s: %s", user.id, e)
         return None
@@ -6424,39 +6618,51 @@ def _extract_status_change(
 
 
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """When someone leaves/is kicked from the Hive group → mark Group Member = No."""
+    """
+    When someone leaves/is kicked from the Hive group → Group Member = No.
+    When they join → Group Member = Yes.
+    Uses hardcoded Hive group id if env is unset.
+    """
     result = update.chat_member or update.my_chat_member
     if not result:
         return
 
-    group_id = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
-    if not group_id:
-        return
-
+    hive_id = get_hive_group_chat_id()
     try:
-        if str(result.chat.id) != str(int(group_id)):
+        if int(result.chat.id) != int(hive_id):
             return
-    except ValueError:
+    except (TypeError, ValueError):
         return
 
     old_status, new_status = _extract_status_change(result)
-    left_statuses = {"left", "kicked"}
-    member_statuses = {"member", "administrator", "creator", "restricted"}
+    left_statuses = set(_NON_MEMBER_STATUSES)
+    member_statuses = set(_MEMBER_STATUSES)
 
     user = result.new_chat_member.user if result.new_chat_member else None
     if not user or user.is_bot:
         return
 
-    # Left or kicked
+    # Left or kicked → deny future bot use until they rejoin + stay Authorised
     if new_status in left_statuses and old_status in member_statuses | {None}:
         await mark_group_member_in_notion(user, is_member=False)
-        logger.info("User %s left group → Group Member = No", user.id)
+        try:
+            _authorized_cache["expires"] = 0  # force auth list refresh
+        except Exception:
+            pass
+        logger.info(
+            "User %s left/kicked Hive group → Group Member=No (bot access gated)",
+            user.id,
+        )
         return
 
     # Joined / re-joined
     if new_status in member_statuses and old_status in left_statuses | {None}:
         await mark_group_member_in_notion(user, is_member=True)
-        logger.info("User %s joined group → Group Member = Yes", user.id)
+        try:
+            _authorized_cache["expires"] = 0
+        except Exception:
+            pass
+        logger.info("User %s joined Hive group → Group Member=Yes", user.id)
 
 async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
     """Update Group Member (and optionally Status) in the auth database."""
