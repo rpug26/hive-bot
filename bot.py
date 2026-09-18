@@ -160,9 +160,9 @@ def notion_query_data_source(
 
     if not db_id:
         raise ValueError("Need data_source_id or database_id for Notion query")
-    if not notion:
-        raise RuntimeError("Notion client is not initialised")
-    return notion.databases.query(database_id=db_id, **kwargs)
+    # Always use HTTP helper (has timeout) — SDK can hang with no timeout
+    body = dict(kwargs)
+    return _notion_http("POST", f"databases/{db_id}/query", body)
 
 
 def notion_create_page_in_data_source(
@@ -243,6 +243,9 @@ _sotd_rns_top_cache: dict[str, list[dict]] = {}
 # Throttle Notion Group Member sync (user_id -> last unix ts)
 _group_member_sync_at: dict[int, float] = {}
 _GROUP_MEMBER_SYNC_TTL = 3600.0  # seconds — do not rewrite Notion every request
+# Live Telegram membership cache (user_id -> (expires_ts, is_member, detail)
+_group_member_cache: dict[int, tuple[float, bool, str]] = {}
+_GROUP_MEMBER_CACHE_TTL = 300.0  # 5 minutes — avoid hanging getChatMember every tap
 # Daily Brief caches (per UTC day)
 _daily_brief_rns: dict[str, list[dict]] = {}  # day -> ranked RNS rows
 _daily_brief_pct: dict[str, list[tuple[str, str, float]]] = {}  # day -> ranked %
@@ -819,21 +822,36 @@ async def is_group_member(
 ) -> tuple[bool, str]:
     """
     Live Telegram membership check against the Hive group.
+    Cached 5 minutes. Hard 3s timeout on getChatMember (was hanging indefinitely).
     Returns (is_member, detail).
-    detail: status=<telegram_status> | error: ... | skipped
     """
     if not context or not context.bot:
         return False, "error: no bot context"
+
+    now_ts = time.time()
+    cached = _group_member_cache.get(user_id)
+    if cached and cached[0] > now_ts:
+        return cached[1], cached[2] + " (cached)"
+
     chat_id = get_hive_group_chat_id()
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
+        member = await asyncio.wait_for(
+            context.bot.get_chat_member(chat_id=chat_id, user_id=user_id),
+            timeout=3.0,
         )
         status = getattr(member, "status", None) or "unknown"
         if status in _MEMBER_STATUSES:
-            return True, f"status={status}"
-        return False, f"status={status}"
+            detail = f"status={status}"
+            _group_member_cache[user_id] = (now_ts + _GROUP_MEMBER_CACHE_TTL, True, detail)
+            return True, detail
+        detail = f"status={status}"
+        _group_member_cache[user_id] = (now_ts + _GROUP_MEMBER_CACHE_TTL, False, detail)
+        return False, detail
+    except asyncio.TimeoutError:
+        logger.warning(
+            "get_chat_member TIMEOUT chat_id=%s user_id=%s", chat_id, user_id
+        )
+        return False, "error: get_chat_member timeout"
     except Exception as e:
         logger.warning(
             "get_chat_member failed chat_id=%s user_id=%s err=%s",
@@ -3764,14 +3782,21 @@ async def daily_brief_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Daily Brief opens on Top News only (fast Notion query).
-    Live % performers load only when user taps Performers.
+    Daily Brief opens on Top News only (fast path).
+    Auth + RNS each have hard timeouts so the UI never sits for minutes.
     """
     user = update.effective_user
     msg = update.effective_message
     if not msg:
         return
-    if not await is_authorized(update, context):
+
+    # Auth with overall 8s budget — never block Daily Brief for minutes
+    try:
+        ok = await asyncio.wait_for(is_authorized(update, context), timeout=8.0)
+    except asyncio.TimeoutError:
+        logger.error("daily_brief_cmd: is_authorized timed out")
+        ok = is_admin(user)
+    if not ok:
         await msg.reply_text(
             "🔒 Only authorised members can use Daily Brief.\n"
             "Send /request to ask for access.",
@@ -3779,28 +3804,36 @@ async def daily_brief_cmd(
         )
         return
 
-    await cleanup_trigger_message(update, context)
-    await clear_nav_panel(context.bot, user.id if user else None)
-
+    # Immediate ack — user must see this within 1s of passing auth
     day = datetime.now(timezone.utc).date().isoformat()
-    # Reply immediately so the user sees progress even if Notion is slow
-    status = await msg.reply_text(
-        "📰 *Daily Brief*\n\nLoading today’s RNS News Log…",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
+    try:
+        status = await msg.reply_text(
+            "📰 *Daily Brief*\n\nLoading today’s RNS…",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard(),
+        )
+    except Exception as e:
+        logger.error("daily_brief_cmd: could not send ack: %s", e)
+        return
     await remember_nav_panel(user.id if user else None, status)
 
+    # Cleanup after ack (never before)
     try:
-        # News only — hard 15s cap; never block on Yahoo / Auth Notion writes
+        await cleanup_trigger_message(update, context)
+        await clear_nav_panel(context.bot, user.id if user else None)
+        await remember_nav_panel(user.id if user else None, status)
+    except Exception:
+        pass
+
+    try:
         rns = await _ensure_daily_brief_rns(day)
         if not rns:
             text = (
                 f"📰 *Daily Brief — Top News*\n"
                 f"_Hive RNS News Log · {day}_\n\n"
                 "_No RNS rows for today yet "
-                "(or Notion timed out)._\n\n"
-                "Try **Performers** for session %, or open again in a moment."
+                "(or Notion timed out under 15s)._\n\n"
+                "Tap **Performers** for session %, or try again shortly."
             )
             markup = InlineKeyboardMarkup(
                 [
@@ -3823,12 +3856,14 @@ async def daily_brief_cmd(
                 disable_web_page_preview=True,
             )
         except Exception:
-            await status.edit_text(
-                text.replace("*", "").replace("_", ""),
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        # Activity log in background — must not delay the UI
+            try:
+                await status.edit_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e2:
+                logger.error("daily_brief_cmd edit failed: %s", e2)
         try:
             asyncio.create_task(
                 log_member_activity(
@@ -4238,77 +4273,88 @@ def _score_rns_significance(title: str, summary: str) -> tuple[float, str]:
 
 async def _load_rns_for_day(day_iso: str | None = None) -> list[dict]:
     """
-    All RNS News Log rows for a calendar day (RNS Date preferred).
-    day_iso: YYYY-MM-DD (default today UTC).
+    RNS News Log rows for a calendar day.
+    Uses HTTP helper only (12s timeout) — never the SDK without timeout.
+    Runs in a thread so the event loop stays responsive.
     """
     if not day_iso:
         day_iso = datetime.now(timezone.utc).date().isoformat()
-    ds_id = NOTION_RNS_DATA_SOURCE_ID
-    db_id = NOTION_RNS_DB_ID
-    if not (notion or NOTION_TOKEN) or (not ds_id and not db_id):
+    ds_id = (NOTION_RNS_DATA_SOURCE_ID or "").strip() or None
+    db_id = (NOTION_RNS_DB_ID or "").strip() or None
+    if not NOTION_TOKEN or (not ds_id and not db_id):
         return []
 
-    rows: list[dict] = []
-    try:
-        # On-or-after start of day; filter client-side for exact day
-        resp = notion_query_data_source(
-            data_source_id=ds_id or None,
-            database_id=db_id or None,
-            filter={
-                "property": "RNS Date",
-                "date": {"equals": day_iso},
-            },
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=100,
-        )
-        pages = resp.get("results", [])
-        # Fallback: Created time window if RNS Date filter empty
-        if not pages:
+    def _sync_load() -> list[dict]:
+        rows: list[dict] = []
+        try:
             resp = notion_query_data_source(
-                data_source_id=ds_id or None,
-                database_id=db_id or None,
-                sorts=[{"timestamp": "created_time", "direction": "descending"}],
-                page_size=100,
+                data_source_id=ds_id,
+                database_id=db_id,
+                filter={
+                    "property": "RNS Date",
+                    "date": {"equals": day_iso},
+                },
+                sorts=[{"property": "RNS Date", "direction": "descending"}],
+                page_size=50,
             )
             pages = resp.get("results", [])
+            if not pages:
+                # Lightweight fallback: newest 50 by created_time
+                resp = notion_query_data_source(
+                    data_source_id=ds_id,
+                    database_id=db_id,
+                    sorts=[
+                        {
+                            "timestamp": "created_time",
+                            "direction": "descending",
+                        }
+                    ],
+                    page_size=50,
+                )
+                pages = resp.get("results", [])
 
-        for page in pages:
-            props = page.get("properties") or {}
-            title = _get_plain_text(props.get("Title")) or "RNS"
-            ticker = (_get_plain_text(props.get("Ticker")) or "").lstrip("#").upper().strip()
-            company = _get_plain_text(props.get("Company")) or ""
-            summary = _strip_html(_get_plain_text(props.get("AI Summary")) or "")
-            link = ""
-            lp = props.get("Link") or {}
-            if isinstance(lp, dict):
-                link = (lp.get("url") or "").strip()
-            date_str = ""
-            dp = props.get("RNS Date") or {}
-            if isinstance(dp, dict) and dp.get("date"):
-                date_str = (dp["date"].get("start") or "")[:10]
-            created = page.get("created_time") or ""
-            # Keep only target day when using created fallback
-            if date_str and date_str != day_iso:
-                continue
-            if not date_str and created and not created.startswith(day_iso):
-                continue
-            score, reason = _score_rns_significance(title, summary)
-            rows.append(
-                {
-                    "title": title[:140],
-                    "ticker": ticker,
-                    "company": company[:80],
-                    "summary": summary[:320],
-                    "link": link,
-                    "date": date_str or day_iso,
-                    "score": score,
-                    "reason": reason,
-                    "page_id": page.get("id"),
-                }
-            )
-    except Exception as e:
-        logger.error("_load_rns_for_day failed: %s", e)
-    return rows
+            for page in pages:
+                props = page.get("properties") or {}
+                title = _get_plain_text(props.get("Title")) or "RNS"
+                ticker = (
+                    _get_plain_text(props.get("Ticker")) or ""
+                ).lstrip("#").upper().strip()
+                company = _get_plain_text(props.get("Company")) or ""
+                summary = _strip_html(
+                    _get_plain_text(props.get("AI Summary")) or ""
+                )
+                link = ""
+                lp = props.get("Link") or {}
+                if isinstance(lp, dict):
+                    link = (lp.get("url") or "").strip()
+                date_str = ""
+                dp = props.get("RNS Date") or {}
+                if isinstance(dp, dict) and dp.get("date"):
+                    date_str = (dp["date"].get("start") or "")[:10]
+                created = page.get("created_time") or ""
+                if date_str and date_str != day_iso:
+                    continue
+                if not date_str and created and not created.startswith(day_iso):
+                    continue
+                score, reason = _score_rns_significance(title, summary)
+                rows.append(
+                    {
+                        "title": title[:140],
+                        "ticker": ticker,
+                        "company": company[:80],
+                        "summary": summary[:320],
+                        "link": link,
+                        "date": date_str or day_iso,
+                        "score": score,
+                        "reason": reason,
+                        "page_id": page.get("id"),
+                    }
+                )
+        except Exception as e:
+            logger.error("_load_rns_for_day sync failed: %s", e)
+        return rows
+
+    return await asyncio.to_thread(_sync_load)
 
 
 async def stock_of_the_day_rns(
