@@ -1976,8 +1976,8 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("🔗 Group Links"),
             ],
             [
-                KeyboardButton("🏆 Stock of the Day"),
-                KeyboardButton("📰 Daily Brief"),
+                KeyboardButton("📈 Top 10"),
+                KeyboardButton("📰 RNS Brief"),
             ],
             [
                 KeyboardButton("📋 Menu"),
@@ -2965,36 +2965,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await stock_snapshot_prompt(update, context)
         return
 
-    # Stock of the Day (replaces What's new?)
+    # Top 10 — session % Top/Bottom performers only
     if text in (
+        "📈 Top 10",
+        "Top 10",
+        "Top10",
         "🏆 Stock of the Day",
         "Stock of the Day",
-        "Stock of Day",
-        "✨ What's new?",
-        "What's new?",
     ) or lower in (
+        "top 10",
+        "📈 top 10",
         "stock of the day",
         "🏆 stock of the day",
-        "stock of day",
-        "what's new?",
-        "whats new?",
     ):
         await cleanup_trigger_message(update, context)
-        await stock_of_the_day_cmd(update, context)
+        await top10_cmd(update, context)
         return
 
-    # Daily Brief
+    # RNS Brief — curated RNS from Hive News Log only
     if text in (
+        "📰 RNS Brief",
+        "RNS Brief",
+        "RNS brief",
         "📰 Daily Brief",
         "Daily Brief",
-        "Daily brief",
     ) or lower in (
+        "rns brief",
+        "📰 rns brief",
         "daily brief",
         "📰 daily brief",
-        "brief",
     ):
         await cleanup_trigger_message(update, context)
-        await daily_brief_cmd(update, context)
+        await rns_brief_cmd(update, context)
         return
 
     # Match Link button even if emoji/spacing differs
@@ -3610,9 +3612,9 @@ def _format_daily_brief_news(
     max_page = 1 if len(rns) > 5 else 0
 
     lines = [
-        "📰 *Daily Brief — Top News*",
+        "📰 *RNS Brief*",
         f"_Hive RNS News Log · {day}_",
-        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + len(chunk) or start}_",
+        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + (len(chunk) or 0)}_",
         "",
     ]
     if not chunk:
@@ -3635,29 +3637,24 @@ def _format_daily_brief_news(
                 lines.append(f"   {r['link']}")
             lines.append("")
 
-    lines.append("_Use ‹ › to flip news pages · Performers for % day board._")
+    lines.append("_Use ‹ › to flip pages (1–5 / 6–10). Tap ticker for snapshot._")
     lines.append("_Not financial advice. DYOR._")
 
     nav = []
     if page > 0:
         nav.append(
-            InlineKeyboardButton("‹ News", callback_data="brief:news:0")
+            InlineKeyboardButton("‹ Prev", callback_data="brief:news:0")
         )
     nav.append(
         InlineKeyboardButton(f"{page + 1}/{max_page + 1}", callback_data="brief:noop")
     )
     if page < max_page:
         nav.append(
-            InlineKeyboardButton("News ›", callback_data="brief:news:1")
+            InlineKeyboardButton("Next ›", callback_data="brief:news:1")
         )
 
     kb = [
         nav,
-        [
-            InlineKeyboardButton(
-                "📈📉 Performers", callback_data="brief:pct:both:0"
-            )
-        ],
         [InlineKeyboardButton("« Hub", callback_data="hub:home")],
     ]
     # Snapshot shortcuts for visible tickers
@@ -3679,73 +3676,60 @@ def _format_daily_brief_pct(
     day: str,
     ranked: list[tuple[str, str, float]],
     *,
-    board: str = "both",  # "both" | "top" | "bot"
+    board: str = "top",  # "top" | "bot"
     page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Performers board (default both):
-      page 0 → Top 1–5 and Bottom 1–5
-      page 1 → Top 6–10 and Bottom 6–10
-    Single boards still supported for legacy callbacks.
+    Top 10 or Bottom 10 session % board.
+      page 0 → ranks 1–5
+      page 1 → ranks 6–10
     """
     page = 0 if page < 0 else (1 if page > 1 else page)
     start = page * 5
     worst = list(reversed(ranked))
     max_page = 1 if len(ranked) > 5 else 0
+    board = "bot" if board == "bot" else "top"
+    ordered = worst if board == "bot" else ranked
+    chunk = ordered[start : start + 5]
 
-    def _chunk(seq: list) -> list:
-        return seq[start : start + 5]
+    if board == "bot":
+        title = "📉 *Bottom 10 — session %*"
+        switch_btn = InlineKeyboardButton(
+            "📈 Top 10", callback_data="brief:pct:top:0"
+        )
+    else:
+        title = "📈 *Top 10 — session %*"
+        switch_btn = InlineKeyboardButton(
+            "📉 Bottom 10", callback_data="brief:pct:bot:0"
+        )
 
-    def _emit(
-        lines: list[str],
-        title: str,
-        chunk: list[tuple[str, str, float]],
-        rank_start: int,
-    ) -> None:
-        lines.append(title)
-        if not chunk:
-            lines.append("_No live quotes for this slice._")
-            lines.append("")
-            return
-        for i, (t, company, pct) in enumerate(chunk, rank_start):
+    lines = [
+        title,
+        f"_UK AIM Micro-Cap · live % · {day}_",
+        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + 5}_",
+        "",
+    ]
+    if not chunk:
+        lines.append("_No live quotes for this slice._")
+        lines.append("")
+    else:
+        for i, (tkr, company, pct) in enumerate(chunk, start + 1):
             sign = "+" if pct >= 0 else ""
             arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
             name = (company or "").strip()
             if len(name) > 28:
                 name = name[:25] + "…"
-            lines.append(f"{i}. *#{t}* {name}")
+            lines.append(f"{i}. *#{tkr}* {name}")
             lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
         lines.append("")
 
-    lines = [
-        "📈📉 *Daily Brief — Session performers*",
-        f"_UK AIM Micro-Cap · live % · {day}_",
-        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + 5}_",
-        "",
-    ]
-
-    show_top = board in ("both", "top")
-    show_bot = board in ("both", "bot")
-    top_chunk = _chunk(ranked) if show_top else []
-    bot_chunk = _chunk(worst) if show_bot else []
-
-    if show_top:
-        _emit(lines, f"🟢 *Top {start + 1}–{start + len(top_chunk)}*", top_chunk, start + 1)
-    if show_bot:
-        _emit(
-            lines,
-            f"🔴 *Bottom {start + 1}–{start + len(bot_chunk)}*",
-            bot_chunk,
-            start + 1,
-        )
-
-    lines.append("_‹ › more ranks · News for RNS brief · tap ticker for snapshot._")
+    lines.append("_‹ › ranks 6–10 · switch Top/Bottom · tap ticker for snapshot._")
     lines.append("_Yahoo Finance (LSE). Not FA. DYOR._")
 
     nav = []
     if page > 0:
         nav.append(
-            InlineKeyboardButton("‹", callback_data=f"brief:pct:both:0")
+            InlineKeyboardButton("‹", callback_data=f"brief:pct:{board}:0")
         )
     nav.append(
         InlineKeyboardButton(
@@ -3754,27 +3738,22 @@ def _format_daily_brief_pct(
     )
     if page < max_page:
         nav.append(
-            InlineKeyboardButton("›", callback_data=f"brief:pct:both:1")
+            InlineKeyboardButton("›", callback_data=f"brief:pct:{board}:1")
         )
 
     kb: list[list] = [nav] if nav else []
-    # Snapshot shortcuts (top then bottom)
-    for t, company, pct in top_chunk + bot_chunk:
+    for tkr, company, pct in chunk:
         sign = "+" if pct >= 0 else ""
         kb.append(
             [
                 InlineKeyboardButton(
-                    f"#{t} {sign}{pct:.1f}%",
-                    callback_data=f"sotd:snap:{t[:12]}",
+                    f"#{tkr} {sign}{pct:.1f}%",
+                    callback_data=f"sotd:snap:{tkr[:12]}",
                 )
             ]
         )
-    kb.append(
-        [
-            InlineKeyboardButton("📰 News", callback_data="brief:news:0"),
-            InlineKeyboardButton("« Hub", callback_data="hub:home"),
-        ]
-    )
+    kb.append([switch_btn])
+    kb.append([InlineKeyboardButton("« Hub", callback_data="hub:home")])
     return "\n".join(lines).strip(), InlineKeyboardMarkup(kb)
 
 
@@ -3782,7 +3761,7 @@ async def daily_brief_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Daily Brief opens on Top News only (fast path).
+    RNS Brief — curated news from Hive RNS News Log only.
     Auth + RNS each have hard timeouts so the UI never sits for minutes.
     """
     user = update.effective_user
@@ -3790,7 +3769,7 @@ async def daily_brief_cmd(
     if not msg:
         return
 
-    # Auth with overall 8s budget — never block Daily Brief for minutes
+    # Auth with overall 8s budget — never block RNS Brief for minutes
     try:
         ok = await asyncio.wait_for(is_authorized(update, context), timeout=8.0)
     except asyncio.TimeoutError:
@@ -3833,20 +3812,14 @@ async def daily_brief_cmd(
         rns = await _ensure_daily_brief_rns(day)
         if not rns:
             text = (
-                f"📰 *Daily Brief — Top News*\n"
+                f"📰 *RNS Brief*\n"
                 f"_Hive RNS News Log · {day}_\n\n"
                 "_No RNS rows for today yet "
                 "(or Notion timed out under 15s)._\n\n"
-                "Tap Performers for session %, or try again shortly."
+                "Try again shortly, or use Top 10 for session %."
             )
             markup = InlineKeyboardMarkup(
                 [
-                    [
-                        InlineKeyboardButton(
-                            "📈📉 Performers",
-                            callback_data="brief:pct:both:0",
-                        )
-                    ],
                     [InlineKeyboardButton("« Hub", callback_data="hub:home")],
                 ]
             )
@@ -3884,7 +3857,7 @@ async def daily_brief_cmd(
         try:
             asyncio.create_task(
                 log_member_activity(
-                    user, "Stock of the Day", notes="Daily Brief opened"
+                    user, "Stock of the Day", notes="RNS Brief opened"
                 )
             )
         except Exception:
@@ -3892,11 +3865,11 @@ async def daily_brief_cmd(
     except Exception as e:
         logger.error("daily_brief_cmd failed: %s", e)
         try:
-            await status.edit_text(f"Daily Brief failed: {e}")
+            await status.edit_text(f"RNS Brief failed: {e}")
         except Exception:
             try:
                 await context.bot.send_message(
-                    status.chat_id, f"Daily Brief failed: {e}"
+                    status.chat_id, f"RNS Brief failed: {e}"
                 )
             except Exception:
                 pass
@@ -3951,13 +3924,13 @@ async def daily_brief_button(
     # Performers — load Yahoo ranking only now (with progress + timeout)
     if data.startswith("brief:pct:"):
         parts = data.split(":")
-        board = parts[2] if len(parts) > 2 else "both"
+        board = parts[2] if len(parts) > 2 else "top"
         try:
             page = int(parts[3]) if len(parts) > 3 else 0
         except ValueError:
             page = 0
-        if board not in ("both", "top", "bot"):
-            board = "both"
+        if board not in ("top", "bot"):
+            board = "top"
 
         cached = _daily_brief_pct.get(day)
         if cached is None:
@@ -4039,41 +4012,50 @@ async def daily_brief_button(
     await remember_nav_panel(user.id, query.message)
 
 
-async def stock_of_the_day_cmd(
+async def top10_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Entry: let user choose % Today movers vs today's top RNS news.
+    Top 10 keyboard — Top 10 / Bottom 10 session % only.
     """
     user = update.effective_user
     msg = update.effective_message
     if not msg:
         return
-    if not await is_authorized(update, context):
+    try:
+        ok = await asyncio.wait_for(is_authorized(update, context), timeout=8.0)
+    except asyncio.TimeoutError:
+        ok = is_admin(user)
+    if not ok:
         await msg.reply_text(
-            "🔒 Only authorised members can use Stock of the Day.\n"
+            "🔒 Only authorised members can use Top 10.\n"
             "Send /request to ask for access.",
             reply_markup=main_reply_keyboard(),
         )
         return
 
-    await cleanup_trigger_message(update, context)
-    await clear_nav_panel(context.bot, user.id if user else None)
+    try:
+        await clear_nav_panel(context.bot, user.id if user else None)
+    except Exception:
+        pass
+    try:
+        await cleanup_trigger_message(update, context)
+    except Exception:
+        pass
 
     body = (
-        "🏆 *Stock of the Day*\n\n"
-        "Choose a board:\n\n"
-        "• *% Today* — top session movers across UK AIM Micro-Cap\n"
-        "• *RNS News* — most significant RNS from *today’s* News Log"
+        "📈 *Top 10*\n\n"
+        "Session % movers from UK AIM Micro-Cap.\n\n"
+        "Choose a board:"
     )
     kb = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "📈 % Today", callback_data="sotd:mode:pct"
+                    "📈 Top 10", callback_data="brief:pct:top:0"
                 ),
                 InlineKeyboardButton(
-                    "📰 RNS News", callback_data="sotd:mode:rns"
+                    "📉 Bottom 10", callback_data="brief:pct:bot:0"
                 ),
             ],
             [InlineKeyboardButton("« Hub", callback_data="hub:home")],
@@ -4086,6 +4068,20 @@ async def stock_of_the_day_cmd(
     )
     await remember_nav_panel(user.id if user else None, sent)
     await ensure_home_keyboard(context.bot, msg.chat_id)
+
+
+async def stock_of_the_day_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Back-compat alias → Top 10 chooser."""
+    await top10_cmd(update, context)
+
+
+async def rns_brief_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Home button alias → RNS Brief (news only)."""
+    await daily_brief_cmd(update, context)
 
 
 async def stock_of_the_day_pct(
