@@ -199,11 +199,15 @@ def notion_create_page_in_data_source(
 
     if not db_id:
         raise ValueError("Need data_source_id or database_id to create Notion page")
-    if not notion:
-        raise RuntimeError("Notion client is not initialised")
-    return notion.pages.create(
-        parent={"database_id": db_id},
-        properties=properties,
+    if notion:
+        return notion.pages.create(
+            parent={"database_id": db_id},
+            properties=properties,
+        )
+    return _notion_http(
+        "POST",
+        "pages",
+        {"parent": {"database_id": db_id}, "properties": properties},
     )
 
 
@@ -6502,7 +6506,38 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
 REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
-REQUEST_TYPE_WATCHLIST = "Other"
+REQUEST_TYPE_WATCHLIST = "My Watchlist"
+REQUEST_TYPE_SOTD = "Stock of the Day"
+REQUEST_TYPE_ACCESS = "Access request"
+REQUEST_TYPE_FOLLOW = "Follow stockpicker"
+
+# Live Notion Request History select options (must match DB)
+_HISTORY_SELECT_OPTIONS = {
+    "Access request",
+    "Telegram link",
+    "Stockpick",
+    "Security snapshot",
+    "Other",
+    "Stock of the Day",
+}
+
+_HISTORY_TYPE_PREFERRED = {
+    REQUEST_TYPE_STOCKPICK: "Stockpick",
+    REQUEST_TYPE_SNAPSHOT: "Security snapshot",
+    REQUEST_TYPE_TG_LINK: "Telegram link",
+    REQUEST_TYPE_ACCESS: "Access request",
+    REQUEST_TYPE_WATCHLIST: "Other",  # not yet a select option
+    REQUEST_TYPE_SOTD: "Stock of the Day",
+    REQUEST_TYPE_FOLLOW: "Other",
+    "Stockpick": "Stockpick",
+    "Security snapshot": "Security snapshot",
+    "Telegram link": "Telegram link",
+    "Access request": "Access request",
+    "My Watchlist": "Other",
+    "Stock of the Day": "Stock of the Day",
+    "Follow stockpicker": "Other",
+    "Other": "Other",
+}
 
 
 async def append_request_history(
@@ -6511,85 +6546,138 @@ async def append_request_history(
     *,
     details: str | None = None,
     status: str = "Logged",
-) -> None:
+) -> bool:
     """
     Create a standalone row in Hive Bot Request History (one row per request).
+    Maps unknown Request Type values to Other; retries with fallbacks.
+    Returns True if a row was created.
     """
     if not user:
-        return
+        return False
     if not NOTION_TOKEN and not notion:
-        return
-    ds_id = NOTION_HISTORY_DATA_SOURCE_ID
-    db_id = NOTION_HISTORY_DB_ID
+        logger.error("append_request_history: no Notion credentials")
+        return False
+    ds_id = (NOTION_HISTORY_DATA_SOURCE_ID or "").strip() or None
+    db_id = (NOTION_HISTORY_DB_ID or "").strip() or None
     if not ds_id and not db_id:
-        return
+        logger.error("append_request_history: HISTORY DB id missing")
+        return False
 
-    # Map bot types → Notion select options
-    type_map = {
-        "Stockpick": "Stockpick",
-        "Security snapshot": "Security snapshot",
-        "Telegram link": "Telegram link",
-        "Access request": "Access request",
-        REQUEST_TYPE_STOCKPICK: "Stockpick",
-        REQUEST_TYPE_SNAPSHOT: "Security snapshot",
-        REQUEST_TYPE_TG_LINK: "Telegram link",
-    }
-    notion_type = type_map.get(request_type, request_type if request_type in {
-        "Stockpick", "Security snapshot", "Telegram link", "Access request", "Other"
-    } else "Other")
+    preferred = _HISTORY_TYPE_PREFERRED.get(
+        request_type, request_type if request_type else "Other"
+    )
+    notion_type = preferred if preferred in _HISTORY_SELECT_OPTIONS else "Other"
+
+    detail_text = (details or "").strip()
+    if request_type and (
+        request_type != notion_type or preferred not in _HISTORY_SELECT_OPTIONS
+    ):
+        detail_text = f"[{request_type}] {detail_text}".strip()
+    elif request_type and not detail_text:
+        detail_text = request_type
 
     now = datetime.now(timezone.utc)
-    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
-    props = {
-        "Request": {"title": [{"text": {"content": title[:100]}}]},
-        "Telegram User ID": {
-            "rich_text": [{"text": {"content": str(user.id)}}]
-        },
-        "Full Name": {
-            "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
-        },
-        "Request Type": {"select": {"name": notion_type}},
-        "Requested At": {
-            "date": {
-                "start": now.isoformat().replace("+00:00", "Z"),
-            }
-        },
-        "Status": {"select": {"name": status if status in {
-            "Logged", "Pending", "Completed", "Denied"
-        } else "Logged"}},
-    }
-    if user.username:
-        props["Username"] = {
-            "rich_text": [{"text": {"content": user.username[:100]}}]
-        }
-    if details:
-        props["Details"] = {
-            "rich_text": [{"text": {"content": details[:1800]}}]
-        }
+    date_start = now.strftime("%Y-%m-%d")
 
-    try:
-        notion_create_page_in_data_source(
-            properties=props,
-            data_source_id=ds_id,
-            database_id=db_id,
+    def _props(type_label: str, detail: str, *, with_status: bool = True) -> dict:
+        title = (
+            f"{type_label} · {user.full_name or user.id} · "
+            f"{now.strftime('%Y-%m-%d %H:%M')}"
         )
-        logger.info(
-            "Request history row created user=%s type=%s", user.id, notion_type
-        )
-    except Exception as e:
-        logger.error(
-            "append_request_history failed for %s type=%s ds=%s db=%s: %s",
-            user.id, notion_type, ds_id, db_id, e,
-        )
+        p = {
+            "Request": {"title": [{"text": {"content": title[:100]}}]},
+            "Telegram User ID": {
+                "rich_text": [{"text": {"content": str(user.id)}}]
+            },
+            "Full Name": {
+                "rich_text": [
+                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
+                ]
+            },
+            "Request Type": {"select": {"name": type_label}},
+            "Requested At": {"date": {"start": date_start}},
+        }
+        if with_status:
+            p["Status"] = {
+                "select": {
+                    "name": status
+                    if status in {"Logged", "Pending", "Completed", "Denied"}
+                    else "Logged"
+                }
+            }
+        if user.username:
+            p["Username"] = {
+                "rich_text": [{"text": {"content": user.username[:100]}}]
+            }
+        if detail:
+            p["Details"] = {
+                "rich_text": [{"text": {"content": detail[:1800]}}]
+            }
+        return p
+
+    attempts = [
+        (notion_type, detail_text, True),
+        ("Other", f"[{request_type}] {detail_text}".strip(), True),
+        ("Other", f"[{request_type}] {detail_text}".strip(), False),
+    ]
+    seen = set()
+    for attempt_type, attempt_detail, with_status in attempts:
+        key = (attempt_type, with_status)
+        if key in seen:
+            continue
+        seen.add(key)
+        props = _props(attempt_type, attempt_detail, with_status=with_status)
         try:
-            if db_id and notion:
-                notion.pages.create(parent={"database_id": db_id}, properties=props)
-                logger.info(
-                    "Request history row created via fallback user=%s type=%s",
-                    user.id, notion_type,
-                )
-        except Exception as e2:
-            logger.error("append_request_history fallback failed: %s", e2)
+            notion_create_page_in_data_source(
+                properties=props,
+                data_source_id=ds_id,
+                database_id=db_id,
+            )
+            logger.info(
+                "Request history OK user=%s type=%s",
+                user.id,
+                attempt_type,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "append_request_history fail type=%s user=%s: %s",
+                attempt_type,
+                user.id,
+                e,
+            )
+            if db_id:
+                try:
+                    if notion:
+                        notion.pages.create(
+                            parent={"database_id": db_id},
+                            properties=props,
+                        )
+                    else:
+                        _notion_http(
+                            "POST",
+                            "pages",
+                            {
+                                "parent": {"database_id": db_id},
+                                "properties": props,
+                            },
+                        )
+                    logger.info(
+                        "Request history OK via db fallback user=%s type=%s",
+                        user.id,
+                        attempt_type,
+                    )
+                    return True
+                except Exception as e2:
+                    logger.warning(
+                        "append_request_history db fallback fail: %s", e2
+                    )
+    logger.error(
+        "append_request_history EXHAUSTED user=%s type=%s",
+        user.id,
+        request_type,
+    )
+    return False
 
 
 async def log_member_activity(
@@ -6609,9 +6697,16 @@ async def log_member_activity(
 
     # --- 1. Request History (always) ---
     try:
-        await append_request_history(
+        ok = await append_request_history(
             user, request_type, details=notes, status="Logged"
         )
+        if not ok:
+            logger.error(
+                "History write returned False user=%s type=%s notes=%s",
+                user.id,
+                request_type,
+                (notes or "")[:80],
+            )
     except Exception as he:
         logger.error(
             "append_request_history failed for %s type=%s: %s",
