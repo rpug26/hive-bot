@@ -239,6 +239,9 @@ _glink_requests: dict[str, dict] = {}
 _sotd_rns_likes: dict[str, set[int]] = {}
 # Cache last top-5 RNS payload per day so Like can refresh the board
 _sotd_rns_top_cache: dict[str, list[dict]] = {}
+# Daily Brief caches (per UTC day)
+_daily_brief_rns: dict[str, list[dict]] = {}  # day -> ranked RNS rows
+_daily_brief_pct: dict[str, list[tuple[str, str, float]]] = {}  # day -> ranked %
 
 
 def _sotd_like_key(day: str, ticker: str) -> str:
@@ -1925,7 +1928,7 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """
-    Home navigation – always-on persistent reply keyboard (7 items).
+    Home navigation – always-on persistent reply keyboard.
     Stays visible after /start and after every menu selection.
     """
     return ReplyKeyboardMarkup(
@@ -1939,10 +1942,11 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("🔗 Group Links"),
             ],
             [
-                KeyboardButton("📋 Menu"),
                 KeyboardButton("🏆 Stock of the Day"),
+                KeyboardButton("📰 Daily Brief"),
             ],
             [
+                KeyboardButton("📋 Menu"),
                 KeyboardButton("🙈 Hide"),
             ],
         ],
@@ -1996,8 +2000,9 @@ async def send_home_menu(bot, chat_id: int | None) -> None:
         "• 📌 My Stockpick\n"
         "• 📊 Stock Snapshot\n"
         "• 🔗 Group Links\n"
-        "• 📋 Menu\n"
         "• 🏆 Stock of the Day\n"
+        "• 📰 Daily Brief\n"
+        "• 📋 Menu\n"
         "• 🙈 Hide"
     )
     try:
@@ -2944,6 +2949,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await stock_of_the_day_cmd(update, context)
         return
 
+    # Daily Brief
+    if text in (
+        "📰 Daily Brief",
+        "Daily Brief",
+        "Daily brief",
+    ) or lower in (
+        "daily brief",
+        "📰 daily brief",
+        "brief",
+    ):
+        await cleanup_trigger_message(update, context)
+        await daily_brief_cmd(update, context)
+        return
+
     # Match Link button even if emoji/spacing differs
     if (
         text in (
@@ -3461,6 +3480,339 @@ async def _rank_tickers_by_live_pct(
     ranked.sort(key=lambda x: x[2], reverse=True)
     return ranked
 
+
+
+async def _ensure_daily_brief_data(day: str) -> tuple[list[dict], list[tuple[str, str, float]]]:
+    """Load & cache today's ranked RNS + live % ranking for Daily Brief."""
+    rns = _daily_brief_rns.get(day)
+    if rns is None:
+        rows = await _load_rns_for_day(day)
+        # Rank by significance (same as Stock of the Day RNS)
+        ticker_counts: dict[str, int] = {}
+        for r in rows:
+            if r.get("ticker"):
+                ticker_counts[r["ticker"]] = ticker_counts.get(r["ticker"], 0) + 1
+        for r in rows:
+            t = r.get("ticker") or ""
+            if ticker_counts.get(t, 0) >= 2:
+                r["score"] = min(100.0, float(r.get("score") or 0) + 5)
+        rows.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
+        rns = rows
+        _daily_brief_rns[day] = rns
+
+    pct = _daily_brief_pct.get(day)
+    if pct is None:
+        pairs = await _load_microcap_tickers(limit=None)
+        pct = await _rank_tickers_by_live_pct(pairs, concurrency=12) if pairs else []
+        _daily_brief_pct[day] = pct
+    return rns, pct
+
+
+def _format_daily_brief_news(
+    day: str, rns: list[dict], page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Page 0 = ranks 1–5, page 1 = ranks 6–10."""
+    page = 0 if page < 0 else (1 if page > 1 else page)
+    start = page * 5
+    chunk = rns[start : start + 5]
+    max_page = 1 if len(rns) > 5 else 0
+
+    lines = [
+        "📰 *Daily Brief — Top News*",
+        f"_Hive RNS News Log · {day}_",
+        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + len(chunk) or start}_",
+        "",
+    ]
+    if not chunk:
+        lines.append("_No RNS items for this page today._")
+    else:
+        for i, r in enumerate(chunk, start + 1):
+            t = (r.get("ticker") or "—").upper()
+            company = r.get("company") or ""
+            head = f"#{t}" if t != "—" else "RNS"
+            if company:
+                head = f"{head} {company}"
+            lines.append(f"{i}. *{head}*")
+            lines.append(f"   📰 {r.get('title') or '—'}")
+            if r.get("summary"):
+                s = r["summary"]
+                if len(s) > 160:
+                    s = s[:157] + "…"
+                lines.append(f"   _{s}_")
+            if r.get("link"):
+                lines.append(f"   {r['link']}")
+            lines.append("")
+
+    lines.append("_Use ‹ › to flip news pages · Performers for % day board._")
+    lines.append("_Not financial advice. DYOR._")
+
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("‹ News", callback_data="brief:news:0")
+        )
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{max_page + 1}", callback_data="brief:noop")
+    )
+    if page < max_page:
+        nav.append(
+            InlineKeyboardButton("News ›", callback_data="brief:news:1")
+        )
+
+    kb = [
+        nav,
+        [
+            InlineKeyboardButton(
+                "📈📉 Performers", callback_data="brief:pct:both:0"
+            )
+        ],
+        [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+    ]
+    # Snapshot shortcuts for visible tickers
+    for r in chunk:
+        t = (r.get("ticker") or "")[:12].upper()
+        if t:
+            kb.insert(
+                -1,
+                [
+                    InlineKeyboardButton(
+                        f"#{t}", callback_data=f"sotd:snap:{t}"
+                    )
+                ],
+            )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(kb)
+
+
+def _format_daily_brief_pct(
+    day: str,
+    ranked: list[tuple[str, str, float]],
+    *,
+    board: str = "both",  # "both" | "top" | "bot"
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Performers board (default both):
+      page 0 → Top 1–5 and Bottom 1–5
+      page 1 → Top 6–10 and Bottom 6–10
+    Single boards still supported for legacy callbacks.
+    """
+    page = 0 if page < 0 else (1 if page > 1 else page)
+    start = page * 5
+    worst = list(reversed(ranked))
+    max_page = 1 if len(ranked) > 5 else 0
+
+    def _chunk(seq: list) -> list:
+        return seq[start : start + 5]
+
+    def _emit(
+        lines: list[str],
+        title: str,
+        chunk: list[tuple[str, str, float]],
+        rank_start: int,
+    ) -> None:
+        lines.append(title)
+        if not chunk:
+            lines.append("_No live quotes for this slice._")
+            lines.append("")
+            return
+        for i, (t, company, pct) in enumerate(chunk, rank_start):
+            sign = "+" if pct >= 0 else ""
+            arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+            name = (company or "").strip()
+            if len(name) > 28:
+                name = name[:25] + "…"
+            lines.append(f"{i}. *#{t}* {name}")
+            lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
+        lines.append("")
+
+    lines = [
+        "📈📉 *Daily Brief — Session performers*",
+        f"_UK AIM Micro-Cap · live % · {day}_",
+        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + 5}_",
+        "",
+    ]
+
+    show_top = board in ("both", "top")
+    show_bot = board in ("both", "bot")
+    top_chunk = _chunk(ranked) if show_top else []
+    bot_chunk = _chunk(worst) if show_bot else []
+
+    if show_top:
+        _emit(lines, f"🟢 *Top {start + 1}–{start + len(top_chunk)}*", top_chunk, start + 1)
+    if show_bot:
+        _emit(
+            lines,
+            f"🔴 *Bottom {start + 1}–{start + len(bot_chunk)}*",
+            bot_chunk,
+            start + 1,
+        )
+
+    lines.append("_‹ › more ranks · News for RNS brief · tap ticker for snapshot._")
+    lines.append("_Yahoo Finance (LSE). Not FA. DYOR._")
+
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("‹", callback_data=f"brief:pct:both:0")
+        )
+    nav.append(
+        InlineKeyboardButton(
+            f"{page + 1}/{max_page + 1}", callback_data="brief:noop"
+        )
+    )
+    if page < max_page:
+        nav.append(
+            InlineKeyboardButton("›", callback_data=f"brief:pct:both:1")
+        )
+
+    kb: list[list] = [nav] if nav else []
+    # Snapshot shortcuts (top then bottom)
+    for t, company, pct in top_chunk + bot_chunk:
+        sign = "+" if pct >= 0 else ""
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    f"#{t} {sign}{pct:.1f}%",
+                    callback_data=f"sotd:snap:{t[:12]}",
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton("📰 News", callback_data="brief:news:0"),
+            InlineKeyboardButton("« Hub", callback_data="hub:home"),
+        ]
+    )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(kb)
+
+
+async def daily_brief_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Daily Brief:
+      1) Top News from Hive RNS News Log (pages of 5)
+      2) Top / Bottom session % performers (pages of 5)
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not msg:
+        return
+    if not await is_authorized(update, context):
+        await msg.reply_text(
+            "🔒 Only authorised members can use Daily Brief.\n"
+            "Send /request to ask for access.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    await cleanup_trigger_message(update, context)
+    await clear_nav_panel(context.bot, user.id if user else None)
+
+    day = datetime.now(timezone.utc).date().isoformat()
+    status = await msg.reply_text(
+        "📰 *Daily Brief*\n\nLoading today’s RNS + live %…",
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
+    )
+    await remember_nav_panel(user.id if user else None, status)
+
+    try:
+        rns, _pct = await _ensure_daily_brief_data(day)
+        text, markup = _format_daily_brief_news(day, rns, page=0)
+        try:
+            await status.edit_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await status.edit_text(
+                text.replace("*", "").replace("_", ""),
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        try:
+            await log_member_activity(
+                user, "Stock of the Day", notes="Daily Brief opened"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("daily_brief_cmd failed: %s", e)
+        try:
+            await status.edit_text(f"Daily Brief failed: {e}")
+        except Exception:
+            pass
+
+
+async def daily_brief_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Pagination / section switch for Daily Brief."""
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not query or not user:
+        return
+    data = query.data or ""
+    if data == "brief:noop":
+        await query.answer()
+        return
+    if not await is_authorized(update, context):
+        await query.answer("Authorised members only.", show_alert=True)
+        return
+
+    day = datetime.now(timezone.utc).date().isoformat()
+    await query.answer()
+
+    try:
+        rns, pct = await _ensure_daily_brief_data(day)
+    except Exception as e:
+        await query.answer(f"Load failed: {e}", show_alert=True)
+        return
+
+    text = ""
+    markup = None
+    if data.startswith("brief:news:"):
+        try:
+            page = int(data.split(":")[-1])
+        except ValueError:
+            page = 0
+        text, markup = _format_daily_brief_news(day, rns, page)
+    elif data.startswith("brief:pct:"):
+        # brief:pct:both:0 | brief:pct:top:0 | brief:pct:bot:1
+        parts = data.split(":")
+        board = parts[2] if len(parts) > 2 else "both"
+        try:
+            page = int(parts[3]) if len(parts) > 3 else 0
+        except ValueError:
+            page = 0
+        if board not in ("both", "top", "bot"):
+            board = "both"
+        text, markup = _format_daily_brief_pct(
+            day, pct, board=board, page=page
+        )
+    else:
+        text, markup = _format_daily_brief_news(day, rns, 0)
+
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        try:
+            await query.edit_message_text(
+                text.replace("*", "").replace("_", ""),
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("daily_brief_button edit failed: %s", e)
+    await remember_nav_panel(user.id, query.message)
 
 
 async def stock_of_the_day_cmd(
@@ -7211,6 +7563,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
     app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
+    app.add_handler(CallbackQueryHandler(daily_brief_button, pattern=r"^brief:"))
     app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
