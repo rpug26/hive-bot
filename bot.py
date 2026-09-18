@@ -235,6 +235,35 @@ _awaiting_snapshot: dict[int, bool] = {}
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
 _glink_requests: dict[str, dict] = {}
+# Stock of the Day RNS likes: "YYYY-MM-DD:TICKER" -> set of user_ids who liked
+_sotd_rns_likes: dict[str, set[int]] = {}
+# Cache last top-5 RNS payload per day so Like can refresh the board
+_sotd_rns_top_cache: dict[str, list[dict]] = {}
+
+
+def _sotd_like_key(day: str, ticker: str) -> str:
+    return f"{day}:{(ticker or '').upper().strip()}"
+
+
+def _sotd_like_count(day: str, ticker: str) -> int:
+    return len(_sotd_rns_likes.get(_sotd_like_key(day, ticker), set()))
+
+
+def _sotd_user_liked(day: str, ticker: str, user_id: int) -> bool:
+    return user_id in _sotd_rns_likes.get(_sotd_like_key(day, ticker), set())
+
+
+def _sotd_add_like(day: str, ticker: str, user_id: int) -> tuple[bool, int]:
+    """
+    Record one like per user per ticker per day.
+    Returns (newly_added, total_count).
+    """
+    key = _sotd_like_key(day, ticker)
+    bucket = _sotd_rns_likes.setdefault(key, set())
+    if user_id in bucket:
+        return False, len(bucket)
+    bucket.add(user_id)
+    return True, len(bucket)
 _active_watchlist_name: dict[int, str] = {}
 # user_id -> {chat_id, panel_msg_id} for seamless in-place watchlist UI
 _watchlist_ui: dict[int, dict] = {}  # panel msg tracking: chat_id, panel_msg_id, ...
@@ -3812,56 +3841,13 @@ async def stock_of_the_day_rns(
 
         rows.sort(key=lambda r: r["score"], reverse=True)
         top = rows[:5]
+        # Cache for Like refreshes (same process / day)
+        _sotd_rns_top_cache[day] = top
 
-        lines = [
-            "🏆 *Stock of the Day — RNS News*",
-            f"_Most significant updates · {day}_",
-            f"_From {len(rows)} RNS item(s) in today’s News Log_",
-            "",
-        ]
-        for i, r in enumerate(top, 1):
-            t = r.get("ticker") or "—"
-            company = r.get("company") or ""
-            head = f"#{t}" if t != "—" else "RNS"
-            if company:
-                head = f"{head} {company}"
-            lines.append(f"{i}. *{head}*")
-            lines.append(f"   📰 {r.get('title') or '—'}")
-            if r.get("summary"):
-                lines.append(f"   _{r['summary']}_")
-            lines.append(
-                f"   Significance *{r['score']:.0f}*/100 · {r.get('reason') or '—'}"
-            )
-            if r.get("link"):
-                lines.append(f"   {r['link']}")
-            lines.append("")
-
-        lines.append(
-            "_Ranked by topic significance + summary depth "
-            "(proxy for attention until readership metrics exist)._"
+        text, markup = _format_sotd_rns_board(
+            day, top, total_count=len(rows), viewer_id=user.id if user else None
         )
-        lines.append("_Not financial advice. DYOR._")
-
-        kb_rows = []
-        for r in top:
-            t = (r.get("ticker") or "")[:20]
-            label = f"#{t}" if t else (r.get("title") or "RNS")[:28]
-            if t:
-                kb_rows.append(
-                    [
-                        InlineKeyboardButton(
-                            label,
-                            callback_data=f"sotd:snap:{t}",
-                        )
-                    ]
-                )
-        kb_rows.append(
-            [
-                InlineKeyboardButton("« Boards", callback_data="sotd:menu"),
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ]
-        )
-        await _set("\n".join(lines).strip(), InlineKeyboardMarkup(kb_rows))
+        await _set(text, markup)
         chat_id = getattr(msg, "chat_id", None) or (
             update.effective_chat.id if update.effective_chat else None
         )
@@ -3870,6 +3856,102 @@ async def stock_of_the_day_rns(
     except Exception as e:
         logger.error("stock_of_the_day_rns failed: %s", e)
         await _set(f"Stock of the Day (RNS) failed: {e}")
+
+
+def _format_sotd_rns_board(
+    day: str,
+    top: list[dict],
+    *,
+    total_count: int | None = None,
+    viewer_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Build RNS top-5 board text + buttons including 👍 Like per item
+    and aggregate sentiment line.
+    """
+    lines = [
+        "🏆 *Stock of the Day — RNS News*",
+        f"_Most significant updates · {day}_",
+    ]
+    if total_count is not None:
+        lines.append(f"_From {total_count} RNS item(s) in today’s News Log_")
+    lines.append("")
+
+    total_likes = 0
+    for i, r in enumerate(top, 1):
+        t = (r.get("ticker") or "—").upper()
+        company = r.get("company") or ""
+        likes = _sotd_like_count(day, t) if t != "—" else 0
+        total_likes += likes
+        head = f"#{t}" if t != "—" else "RNS"
+        if company:
+            head = f"{head} {company}"
+        like_bit = f" · 👍 *{likes}*" if likes else ""
+        lines.append(f"{i}. *{head}*{like_bit}")
+        lines.append(f"   📰 {r.get('title') or '—'}")
+        if r.get("summary"):
+            summ = r["summary"]
+            if len(summ) > 180:
+                summ = summ[:177] + "…"
+            lines.append(f"   _{summ}_")
+        lines.append(
+            f"   Significance *{r.get('score', 0):.0f}*/100"
+            f" · {r.get('reason') or '—'}"
+        )
+        if r.get("link"):
+            lines.append(f"   {r['link']}")
+        lines.append("")
+
+    # Sentiment aggregate
+    ranked_likes = sorted(
+        (
+            ((r.get("ticker") or "").upper(), _sotd_like_count(day, (r.get("ticker") or "")))
+            for r in top
+            if (r.get("ticker") or "").strip()
+        ),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    lines.append(f"📊 *Sentiment (likes today):* {total_likes}")
+    if ranked_likes and ranked_likes[0][1] > 0:
+        parts = [f"#{t} {n}" for t, n in ranked_likes if n > 0][:5]
+        if parts:
+            lines.append("   " + " · ".join(parts))
+    lines.append("")
+    lines.append(
+        "_Tap 👍 to Like an RNS (1 like per member). "
+        "Snapshot opens company detail._"
+    )
+    lines.append("_Not financial advice. DYOR._")
+
+    kb_rows: list[list] = []
+    for r in top:
+        t = (r.get("ticker") or "")[:12].upper()
+        if not t:
+            continue
+        likes = _sotd_like_count(day, t)
+        liked = viewer_id and _sotd_user_liked(day, t, viewer_id)
+        like_label = f"{'✅ ' if liked else ''}👍 {likes}" if likes else "👍 Like"
+        # callback data must stay ≤ 64 bytes
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"#{t}",
+                    callback_data=f"sotd:snap:{t}",
+                ),
+                InlineKeyboardButton(
+                    like_label[:24],
+                    callback_data=f"sotd:like:{t}",
+                ),
+            ]
+        )
+    kb_rows.append(
+        [
+            InlineKeyboardButton("« Boards", callback_data="sotd:menu"),
+            InlineKeyboardButton("« Hub", callback_data="hub:home"),
+        ]
+    )
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(kb_rows)
 
 
 async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5149,6 +5231,60 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             update, context, edit_msg=query.message
         )
         await remember_nav_panel(user.id, query.message)
+        return
+
+    # 👍 Like on RNS top-5 board
+    if data.startswith("sotd:like:"):
+        if not await is_authorized(update, context):
+            await query.answer("Authorised members only.", show_alert=True)
+            return
+        ticker = data.replace("sotd:like:", "", 1).strip().upper()
+        if not ticker:
+            await query.answer("Missing ticker.", show_alert=True)
+            return
+        day = datetime.now(timezone.utc).date().isoformat()
+        added, count = _sotd_add_like(day, ticker, user.id)
+        if added:
+            await query.answer(f"Liked #{ticker} · {count} like(s)")
+        else:
+            await query.answer(f"Already liked #{ticker} · {count} like(s)")
+
+        top = _sotd_rns_top_cache.get(day) or []
+        if not top:
+            # Rebuild board if cache empty
+            await stock_of_the_day_rns(
+                update, context, edit_msg=query.message
+            )
+            await remember_nav_panel(user.id, query.message)
+            return
+        text, markup = _format_sotd_rns_board(
+            day, top, viewer_id=user.id
+        )
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("sotd like refresh failed: %s", e)
+        await remember_nav_panel(user.id, query.message)
+        try:
+            await log_member_activity(
+                user,
+                "Stock of the Day",
+                notes=f"Liked RNS #{ticker} ({count})",
+            )
+        except Exception:
+            pass
         return
 
     await query.answer()
