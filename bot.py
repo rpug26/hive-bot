@@ -50,6 +50,9 @@ if not TOKEN:
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")       # for #stockpick captures
 NOTION_TICKERS_DB_ID = os.getenv("NOTION_TICKERS_DB_ID")   # UK AIM Micro-Cap database
+NOTION_TICKERS_DATA_SOURCE_ID = (
+    os.getenv("NOTION_TICKERS_DATA_SOURCE_ID") or "09a9cf15-ffef-4f86-8767-db104ea66e11"
+).strip()
 # Auth DB container + data source (required for multi-source Notion API 2025-09-03+)
 NOTION_AUTH_DB_ID_ENV = (
     os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID") or ""
@@ -218,9 +221,6 @@ _nav_panel: dict[int, dict] = {}  # user_id -> {chat_id, message_id}
 _msp_ui: dict[int, dict] = {}  # user_id -> flags + league_ym / hist_ym
 # user_id -> waiting field name ("Summary" | "Next Catalyst" | "Target Price" | "Change")
 _awaiting_field: dict[int, str] = {}
-# My Stockpick guided submit flow: calendar → ticker → fields → Submit/Save/Hub
-# user_id -> {year, month, step, ticker, summary, catalyst, target, page_id}
-_awaiting_msp_flow: dict[int, dict] = {}
 # user_id -> "add" | "change" | "delete"
 _awaiting_watchlist: dict[int, str] = {}
 # user_id -> True while waiting for link search query
@@ -458,79 +458,14 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     db_id = os.getenv("NOTION_AUTH_DB_ID") or os.getenv("NOTION_DATABASE_ID")
 
     # ----- Group Links request management -----
-    if action in (
-        "glinkadd",
-        "glinkdone",
-        "glinkpending",
-        "glinknone",
-        "glinklist",
-    ):
-        # List all open / pending Group Links requests
-        if action == "glinklist":
-            open_items = [
-                (rid, r)
-                for rid, r in _glink_requests.items()
-                if (r.get("status") or "open") in ("open", "pending")
-            ]
-            if not open_items:
-                await query.message.reply_text(
-                    "📋 No open Group Links requests right now."
-                )
-                return
-            lines = [
-                f"📋 *Group Links pending* ({len(open_items)})\n",
-            ]
-            rows_kb: list[list] = []
-            for rid, r in sorted(
-                open_items, key=lambda x: x[0], reverse=True
-            )[:15]:
-                st = (r.get("status") or "open").upper()
-                q = r.get("query") or r.get("ticker") or "—"
-                nm = r.get("name") or "—"
-                uid = r.get("user_id") or "—"
-                lines.append(
-                    f"• `{rid}` · *{st}* · `{q}`\n"
-                    f"  {nm} (`{uid}`)"
-                )
-                rows_kb.append(
-                    [
-                        InlineKeyboardButton(
-                            f"➕ {rid}",
-                            callback_data=f"admin:glinkadd:{rid}",
-                        ),
-                        InlineKeyboardButton(
-                            f"⏳ {rid}",
-                            callback_data=f"admin:glinkpending:{rid}",
-                        ),
-                        InlineKeyboardButton(
-                            f"✅ {rid}",
-                            callback_data=f"admin:glinkdone:{rid}",
-                        ),
-                    ]
-                )
-            rows_kb.append(
-                [
-                    InlineKeyboardButton(
-                        "🔄 Refresh list",
-                        callback_data="admin:glinklist",
-                    )
-                ]
-            )
-            await query.message.reply_text(
-                "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(rows_kb),
-            )
-            return
-
+    if action in ("glinkadd", "glinkdone", "glinkpending"):
         if len(parts) < 3:
             return
         req_id = parts[2].strip()
         req = _glink_requests.get(req_id)
         if not req:
             await query.message.reply_text(
-                "This Group Links request expired or is unknown. "
-                "Ask the user to search again, or open 📋 All GL pending."
+                "This Group Links request expired or is unknown. Ask the user to search again."
             )
             return
 
@@ -538,63 +473,11 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         search_q = req.get("query") or req.get("ticker") or ""
 
         if action == "glinkpending":
-            # Scenario 3: no link in Notion / no TG group yet → tell user Pending
-            req["status"] = "pending"
-            _glink_requests[req_id] = req
-            user_msg = (
-                "⏳ *Group Links request — Pending*\n\n"
-                f"Search: `{search_q}`\n\n"
-                "We don’t have a Telegram group link saved for this yet "
-                "(and may not have a public group available right now).\n\n"
-                "Your request is *pending* with the admin team. "
-                "You’ll get a message here when a link is added or there’s an update.\n\n"
-                "You can search again anytime via 🔗 Group Links."
+            await query.message.reply_text(
+                f"⏳ Marked *Pending* for request `{req_id}` (`{search_q}`).\n"
+                f"User `{target_id}` has not been notified yet.",
+                parse_mode="Markdown",
             )
-            try:
-                await context.bot.send_message(
-                    chat_id=int(target_id),
-                    text=user_msg,
-                    parse_mode="Markdown",
-                )
-                await query.message.reply_text(
-                    f"⏳ Marked *Pending* for `{req_id}` (`{search_q}`).\n"
-                    f"User `{target_id}` has been notified.",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.error("glinkpending notify failed: %s", e)
-                await query.message.reply_text(
-                    f"Status set to Pending, but could not notify user: {e}"
-                )
-            return
-
-        if action == "glinknone":
-            # Explicit: no group exists / not available
-            req["status"] = "pending"
-            _glink_requests[req_id] = req
-            user_msg = (
-                "🔗 *Group Links update*\n\n"
-                f"Search: `{search_q}`\n\n"
-                "There is *no Telegram group link available* for this name "
-                "in our database at the moment.\n\n"
-                "Your request stays *pending*. If a group is created or a link "
-                "is added later, we’ll notify you.\n\n"
-                "Tap 🔗 Group Links to search again anytime."
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=int(target_id),
-                    text=user_msg,
-                    parse_mode="Markdown",
-                )
-                await query.message.reply_text(
-                    f"User `{target_id}` notified: *no link available* "
-                    f"(request `{req_id}` remains pending).",
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.error("glinknone notify failed: %s", e)
-                await query.message.reply_text(f"Could not notify user: {e}")
             return
 
         if action == "glinkdone":
@@ -607,8 +490,6 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         + "Tap 🔗 Group Links to look it up."
                     ),
                 )
-                req["status"] = "done"
-                _glink_requests[req_id] = req
                 await query.message.reply_text(
                     f"✅ User `{target_id}` notified for `{search_q}`.",
                     parse_mode="Markdown",
@@ -830,11 +711,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("This command is for admins only.")
         return
 
-    open_glinks = sum(
-        1
-        for r in _glink_requests.values()
-        if (r.get("status") or "open") in ("open", "pending")
-    )
+    open_glinks = len(_glink_requests)
     lines = [
         "🛠 *Admin control panel*\n",
         "*1. Bot Access requests (Authorised Users)*",
@@ -843,35 +720,15 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 🚫 *Denied* – set Status = Blocked, notify user",
         "• ⏳ *Pending* – keep in queue for later review",
         "Commands: `/pending`  `/approve <id>`  `/reject <id>`\n",
-        "*2. Group Links requests*",
-        "When a member searches 🔗 Group Links and no link is saved:",
-        "• ➕ *Add new group links* – paste `https://t.me/...`, save + notify",
-        "• ✅ *Added – Notify User* – notify only (link already in Notion)",
-        "• ⏳ *Pending → notify user* – no link yet; user is told it’s pending",
-        "• 🚫 *No group available* – tell user no TG group exists yet",
-        "• 📋 *All GL pending* – list every open/pending request",
+        "*2. Group Links / Security Summary requests*",
+        "When a member searches 🔗 Group Links and no link is saved, you get a DM with:",
+        "• ➕ *Add new group links* – paste `https://t.me/...`, save to Notion, notify user",
+        "• ✅ *Added – Notify User* – notify only (if you already updated Notion)",
+        "• ⏳ *Pending* – mark as pending (no user notify)",
         "• `/cancelglink` – cancel if you started Add but change your mind\n",
-        f"Open Group Links requests: *{open_glinks}*",
+        f"Open Group Links requests in memory: *{open_glinks}*",
     ]
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "📋 All Group Links pending",
-                    callback_data="admin:glinklist",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "⏳ Access pending",
-                    callback_data="admin:pending",
-                )
-            ],
-        ]
-    )
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=kb
-    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ------------------------------------------------------------
@@ -1127,69 +984,14 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                     pass
             return None
 
-        def find_date(*names):
-            """Read a Notion date property start (YYYY-MM-DD)."""
-            for name in names:
-                prop = props.get(name)
-                if not prop or not isinstance(prop, dict):
-                    continue
-                if prop.get("type") == "date" and prop.get("date"):
-                    start = (prop["date"] or {}).get("start") or ""
-                    if start:
-                        return start[:10]
-                # Fallback: plain text that looks like a date
-                raw = _get_plain_text(prop).strip()
-                if re.match(r"\d{4}-\d{2}-\d{2}", raw):
-                    return raw[:10]
-            return ""
-
-        summary_raw = find_prop(
-            "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
-        )
-        # Stale "Last RNS: YYYY-MM-DD" is often embedded in the summary text
-        # and lags the real Last RNS Date property — strip it for display.
-        summary_clean = re.sub(
-            r"(?i)(?:\s*[|｜]\s*)?Last RNS\s*:\s*\d{4}-\d{2}-\d{2}",
-            "",
-            summary_raw or "",
-        ).strip()
-        summary_clean = re.sub(r"\s+\n", "\n", summary_clean)
-        summary_clean = re.sub(r"[ \t]{2,}", " ", summary_clean)
-
-        last_rns_date = find_date("Last RNS Date", "Last RNS", "Latest RNS Date")
-        last_3_rns = find_prop("Last 3 RNS", "Last 3 RNS ", "Recent RNS")
-        # Normalize HTML breaks from Notion rich text
-        if last_3_rns:
-            last_3_rns = (
-                last_3_rns.replace("<br>", "\n")
-                .replace("<br/>", "\n")
-                .replace("<br />", "\n")
-            )
-            last_3_rns = re.sub(r"<[^>]+>", "", last_3_rns)
-            last_3_rns = re.sub(r"\n{3,}", "\n\n", last_3_rns).strip()
-
-        mcap = find_number("Market Cap GBPm", "Market Cap", "Mkt Cap", "Mcap")
-        mcap_display = ""
-        if mcap is not None:
-            mcap_display = f"£{mcap:.2f}m" if mcap < 1000 else f"£{mcap:,.0f}m"
-        # Prefer explicit Market Cap text line in summary if number missing
-        if not mcap_display and summary_raw:
-            m = re.search(
-                r"(?i)Market Cap\s*:\s*£?\s*([\d.]+)\s*m", summary_raw
-            )
-            if m:
-                mcap_display = f"£{m.group(1)}m"
-
         data = {
             "company": find_prop("Company", "Name", "Company Name"),
-            "summary": summary_clean or summary_raw,
+            "summary": find_prop(
+                "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
+            ),
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
-            "last_rns_date": last_rns_date,
-            "last_3_rns": last_3_rns,
-            "mcap": mcap_display,
-            "mcap_num": mcap,
             "day_change_pct": find_number(
                 "Day Change %",
                 "% Change",
@@ -1205,12 +1007,7 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "data": data,
             "expires": time.time() + CACHE_TTL_SECONDS,
         }
-        logger.info(
-            "Found ticker %s – company=%s last_rns=%s",
-            ticker,
-            data.get("company"),
-            data.get("last_rns_date") or "n/a",
-        )
+        logger.info("Found ticker %s – company=%s", ticker, data.get("company"))
         return data
         # --- END ---
 
@@ -1221,20 +1018,11 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
 async def get_stockpickers_for_ticker(ticker: str) -> list[str]:
     """
     Return unique Posted By names from Hive Stock Picks for this ticker.
-    (Names only — used in snapshot text / Follow buttons.)
-    """
-    detailed = await get_stockpickers_detailed_for_ticker(ticker)
-    return [d["name"] for d in detailed if d.get("name")]
-
-
-async def get_stockpickers_detailed_for_ticker(ticker: str) -> list[dict]:
-    """
-    Unique stockpickers for ticker this cycle from Hive Stock Picks.
-    Each item: {name, user_id} where user_id may be None if not in Notes.
     """
     if not notion or not ticker:
         return []
 
+    # Prefer dedicated stockpicks DB only
     db_id = (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip()
     if not db_id:
         db_id = "9095ded4-ad6a-4b25-9887-19a77baba12f"
@@ -1247,7 +1035,7 @@ async def get_stockpickers_detailed_for_ticker(ticker: str) -> list[dict]:
         db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
 
     ticker = ticker.upper().strip()
-    out: list[dict] = []
+    names: list[str] = []
     seen: set[str] = set()
 
     filters_to_try = [
@@ -1279,6 +1067,7 @@ async def get_stockpickers_detailed_for_ticker(ticker: str) -> list[dict]:
             props = page.get("properties", {})
             posted_by = _get_plain_text(props.get("Posted By")).strip()
             if not posted_by:
+                # fallback: title
                 posted_by = _get_plain_text(props.get("Stockpick & Month")).strip()
             if not posted_by:
                 continue
@@ -1286,277 +1075,16 @@ async def get_stockpickers_detailed_for_ticker(ticker: str) -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            notes = _get_plain_text(props.get("Notes")) or ""
-            uid = None
-            m = re.search(r"uid:(\d+)", notes)
-            if m:
-                uid = m.group(1)
-            out.append({"name": posted_by, "user_id": uid})
+            names.append(posted_by)
 
-        if not out:
+        if not names:
             logger.info(
                 "No stockpickers found for %s in db %s", ticker, db_id
             )
     except Exception as e:
         logger.error("Stockpickers lookup failed for %s db=%s: %s", ticker, db_id, e)
 
-    return out
-
-
-def _parse_following_blob(raw: str) -> list[dict]:
-    """
-    Parse Following rich_text from Auth DB.
-    Format entries: Name or Name|uid:123 — separated by ; or newlines.
-    """
-    items: list[dict] = []
-    seen: set[str] = set()
-    if not raw:
-        return items
-    for part in re.split(r"[;\n]+", raw):
-        part = part.strip()
-        if not part:
-            continue
-        uid = None
-        name = part
-        m = re.match(r"^(.*?)\|uid:(\d+)$", part.strip())
-        if m:
-            name = m.group(1).strip()
-            uid = m.group(2)
-        key = name.lower()
-        if not name or key in seen:
-            continue
-        seen.add(key)
-        items.append({"name": name, "user_id": uid})
-    return items
-
-
-def _serialize_following(items: list[dict]) -> str:
-    parts = []
-    for it in items:
-        name = (it.get("name") or "").strip()
-        if not name:
-            continue
-        uid = it.get("user_id")
-        if uid:
-            parts.append(f"{name}|uid:{uid}")
-        else:
-            parts.append(name)
-    return "; ".join(parts)[:1800]
-
-
-async def get_user_following(user) -> list[dict]:
-    """Load Following list for a Telegram user from Auth DB."""
-    if not user:
-        return []
-    if not notion and not NOTION_TOKEN:
-        return []
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not db_id and not ds_id:
-        return []
-    try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            return []
-        props = results[0].get("properties", {})
-        raw = (
-            _get_plain_text(props.get("Following"))
-            or _get_plain_text(props.get("Following Stockpickers"))
-            or ""
-        )
-        return _parse_following_blob(raw)
-    except Exception as e:
-        logger.warning("get_user_following failed for %s: %s", user.id, e)
-        return []
-
-
-async def add_following(user, *, name: str, target_uid: str | None = None) -> tuple[bool, str]:
-    """
-    Add a stockpicker to this user's Following list on Auth DB.
-    Requires rich_text property \"Following\" (or \"Following Stockpickers\").
-    Returns (ok, message).
-    """
-    if not user or not name:
-        return False, "Missing user or name."
-    if not notion and not NOTION_TOKEN:
-        return False, "Notion not configured."
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not db_id and not ds_id:
-        return False, "Auth DB not configured."
-
-    try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
-        if not results:
-            return False, "Your access profile was not found. Send /request first."
-
-        page = results[0]
-        page_id = page["id"]
-        props = page.get("properties", {})
-        prop_name = "Following" if "Following" in props else (
-            "Following Stockpickers" if "Following Stockpickers" in props else "Following"
-        )
-        raw = _get_plain_text(props.get(prop_name)) or ""
-        items = _parse_following_blob(raw)
-        key = name.strip().lower()
-        for it in items:
-            if (it.get("name") or "").lower() == key:
-                return True, f"You already follow *{name}*."
-            if target_uid and it.get("user_id") == str(target_uid):
-                return True, f"You already follow *{name}*."
-
-        items.append({"name": name.strip(), "user_id": str(target_uid) if target_uid else None})
-        blob = _serialize_following(items)
-        update_props = {
-            prop_name: {"rich_text": [{"text": {"content": blob}}]}
-        }
-        if notion:
-            notion.pages.update(page_id=page_id, properties=update_props)
-        else:
-            _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
-        return True, f"✅ You now follow *{name}*.\nYou’ll get a DM when they post a monthly stockpick."
-    except Exception as e:
-        err = str(e)
-        logger.error("add_following failed for %s: %s", user.id, e)
-        if "is not a property" in err or "property" in err.lower():
-            return (
-                False,
-                "Could not save follow — add a **Rich text** property named "
-                "`Following` on *Hive Bot Authorised Users*, then try again.",
-            )
-        return False, f"Could not save follow: {e}"
-
-
-async def notify_followers_of_stockpick(
-    *,
-    picker_name: str,
-    picker_uid: int | None,
-    ticker: str | None,
-    message: str,
-    bot,
-) -> int:
-    """
-    DM every authorised user who follows this stockpicker.
-    Match by name or uid stored in their Following field.
-    Returns number of DMs sent.
-    """
-    if not bot or not (picker_name or picker_uid):
-        return 0
-    if not notion and not NOTION_TOKEN:
-        return 0
-    db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
-        "NOTION_DATABASE_ID"
-    )
-    ds_id = NOTION_AUTH_DATA_SOURCE_ID
-    if not db_id and not ds_id:
-        return 0
-
-    needle_name = (picker_name or "").strip()
-    needle_uid = str(picker_uid) if picker_uid else ""
-    sent = 0
-    try:
-        # Pull authorised users in pages; filter Following client-side
-        # (Notion rich_text contains is case-sensitive / partial)
-        cursor = None
-        candidates: list[dict] = []
-        while True:
-            kwargs: dict = {
-                "page_size": 100,
-                "filter": {
-                    "property": "Status",
-                    "select": {"equals": "Authorised"},
-                },
-            }
-            if cursor:
-                kwargs["start_cursor"] = cursor
-            response = notion_query_data_source(
-                data_source_id=ds_id,
-                database_id=db_id,
-                **kwargs,
-            )
-            for page in response.get("results", []):
-                props = page.get("properties", {})
-                raw = (
-                    _get_plain_text(props.get("Following"))
-                    or _get_plain_text(props.get("Following Stockpickers"))
-                    or ""
-                )
-                if not raw:
-                    continue
-                items = _parse_following_blob(raw)
-                match = False
-                for it in items:
-                    if needle_uid and it.get("user_id") == needle_uid:
-                        match = True
-                        break
-                    if needle_name and (it.get("name") or "").lower() == needle_name.lower():
-                        match = True
-                        break
-                if not match:
-                    # soft contains fallback
-                    low = raw.lower()
-                    if needle_name and needle_name.lower() in low:
-                        match = True
-                    elif needle_uid and f"uid:{needle_uid}" in low:
-                        match = True
-                if not match:
-                    continue
-                uid = (
-                    _get_plain_text(props.get("Telegram User ID"))
-                    or _get_plain_text(props.get("Telegram ID"))
-                    or ""
-                ).strip()
-                if uid.isdigit() and (not needle_uid or uid != needle_uid):
-                    candidates.append({"uid": int(uid)})
-            if not response.get("has_more"):
-                break
-            cursor = response.get("next_cursor")
-            if not cursor:
-                break
-
-        t_label = f"#{ticker}" if ticker else "a new pick"
-        body = (
-            f"🔔 *Stockpicker you follow*\n\n"
-            f"*{picker_name or 'Member'}* just posted {t_label}:\n\n"
-            f"{(message or '')[:500]}\n\n"
-            f"_Open Stock Snapshot or My Stockpick to review._"
-        )
-        for c in candidates:
-            try:
-                await bot.send_message(
-                    chat_id=c["uid"],
-                    text=body,
-                    parse_mode="Markdown",
-                )
-                sent += 1
-            except Exception as e:
-                logger.warning("follow notify DM failed %s: %s", c["uid"], e)
-            await asyncio.sleep(0.35)
-    except Exception as e:
-        logger.error("notify_followers_of_stockpick failed: %s", e)
-    return sent
+    return names
     
 async def save_stockpick_to_notion(
     text: str,
@@ -2000,80 +1528,6 @@ def _strip_html(text: str) -> str:
     return cleaned
 
 
-def _parse_rns_log_page(page: dict, ticker: str) -> dict:
-    """Normalize one Hive RNS News Log page into a flat dict."""
-    props = page.get("properties", {})
-    title = _get_plain_text(props.get("Title")) or "RNS"
-    summary = _strip_html(_get_plain_text(props.get("AI Summary")))
-    company = _get_plain_text(props.get("Company")) or ""
-    link = ""
-    link_prop = props.get("Link") or {}
-    if isinstance(link_prop, dict):
-        link = (link_prop.get("url") or "").strip()
-    date_str = ""
-    date_prop = props.get("RNS Date") or {}
-    if isinstance(date_prop, dict):
-        d = date_prop.get("date") or {}
-        if isinstance(d, dict):
-            date_str = (d.get("start") or "")[:10]
-    source = ""
-    src = props.get("Source") or {}
-    if isinstance(src, dict) and src.get("select"):
-        source = (src["select"] or {}).get("name") or ""
-    return {
-        "ticker": ticker,
-        "title": title[:120],
-        "summary": summary[:280],
-        "company": company[:80],
-        "link": link,
-        "date": date_str,
-        "source": source,
-    }
-
-
-async def get_recent_rns_for_ticker(
-    ticker: str, *, limit: int = 3, force: bool = False
-) -> list[dict]:
-    """
-    Up to `limit` recent RNS rows for a ticker from Hive RNS News Log,
-    newest first. Used by Stock Snapshot for a complete picture.
-    """
-    t = (ticker or "").lstrip("#").upper().strip()
-    if not t:
-        return []
-    if not (notion or NOTION_TOKEN):
-        return []
-    ds_id = NOTION_RNS_DATA_SOURCE_ID
-    db_id = NOTION_RNS_DB_ID
-    if not ds_id and not db_id:
-        return []
-
-    try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Ticker",
-                "rich_text": {"equals": t},
-            },
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=max(3, min(limit, 10)),
-        )
-        out: list[dict] = []
-        for page in response.get("results", []):
-            props = page.get("properties", {})
-            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
-            if row_t != t:
-                continue
-            out.append(_parse_rns_log_page(page, t))
-            if len(out) >= limit:
-                break
-        return out
-    except Exception as e:
-        logger.warning("get_recent_rns_for_ticker(%s) failed: %s", t, e)
-        return []
-
-
 async def get_latest_rns_for_ticker(
     ticker: str, *, force: bool = False
 ) -> dict | None:
@@ -2098,8 +1552,52 @@ async def get_latest_rns_for_ticker(
             return cached
 
     try:
-        recent = await get_recent_rns_for_ticker(t, limit=1, force=force)
-        best = recent[0] if recent else None
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Ticker",
+                "rich_text": {"equals": t},
+            },
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=3,
+        )
+        results = response.get("results", [])
+        # Prefer exact ticker match (case-insensitive)
+        best = None
+        for page in results:
+            props = page.get("properties", {})
+            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
+            if row_t != t:
+                continue
+            title = _get_plain_text(props.get("Title")) or "RNS"
+            summary = _strip_html(_get_plain_text(props.get("AI Summary")))
+            company = _get_plain_text(props.get("Company")) or ""
+            link = ""
+            link_prop = props.get("Link") or {}
+            if isinstance(link_prop, dict):
+                link = (link_prop.get("url") or "").strip()
+            date_str = ""
+            date_prop = props.get("RNS Date") or {}
+            if isinstance(date_prop, dict):
+                d = date_prop.get("date") or {}
+                if isinstance(d, dict):
+                    date_str = (d.get("start") or "")[:10]
+            source = ""
+            src = props.get("Source") or {}
+            if isinstance(src, dict) and src.get("select"):
+                source = (src["select"] or {}).get("name") or ""
+            best = {
+                "ticker": t,
+                "title": title[:120],
+                "summary": summary[:280],
+                "company": company[:80],
+                "link": link,
+                "date": date_str,
+                "source": source,
+            }
+            break
+
         _rns_cache[t] = (now, best)
         return best
     except Exception as e:
@@ -2179,94 +1677,12 @@ def has_intent_keyword(text: str) -> bool:
     lower = text.lower()
     return any(kw in lower for kw in INTENT_KEYWORDS)
 
-def format_reply(
-    ticker: str,
-    data: dict,
-    stockpickers: list[str] | None = None,
-    *,
-    rns_latest: dict | None = None,
-    rns_recent: list | None = None,
-) -> str:
-    """
-    Full stock snapshot from UK AIM Micro-Cap + optional live RNS News Log.
-    Prefer structured Last RNS Date / Last 3 RNS over any stale date
-    embedded inside Summary & Next Catalyst text.
-    """
-    company = data.get("company") or "N/A"
-    status = data.get("status") or ""
-    mcap = data.get("mcap") or ""
-    header_bits = [f"🔖📑 *#{ticker}* – {company}"]
-    meta_line = []
-    if status:
-        meta_line.append(f"Status: {status}")
-    if mcap:
-        meta_line.append(f"Mkt Cap: {mcap}")
-    # Authoritative Last RNS Date (Notion date property)
-    last_rns = (data.get("last_rns_date") or "").strip()
-    if rns_latest and rns_latest.get("date"):
-        # Prefer the fresher of Micro-Cap date vs RNS News Log
-        log_date = (rns_latest.get("date") or "")[:10]
-        if not last_rns or log_date >= last_rns:
-            last_rns = log_date
-    if last_rns:
-        meta_line.append(f"Last RNS: {last_rns}")
-
-    text = header_bits[0] + "\n"
-    if meta_line:
-        text += " · ".join(meta_line) + "\n"
-    text += "\n"
-
-    overview = (data.get("company_overview") or "").strip()
-    if overview:
-        text += f"*Company Overview:*\n{overview[:500]}\n\n"
-
-    text += (
-        f"*Snapshot Summary:*\n"
-        f"{data.get('summary') or 'No summary available.'}\n\n"
+def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None) -> str:
+    text = (
+        f"🔖📑 *#{ticker}* – {data.get('company') or 'N/A'}\n\n"
+        f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
         f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
     )
-
-    # --- RNS section (no duplicate Latest vs Last 3) ---
-    # Order: Last 3 RNS first, then Latest only if not already covered
-    rns_block_parts: list[str] = []
-    last_3 = (data.get("last_3_rns") or "").strip()
-    last_3_norm = re.sub(r"\s+", " ", last_3).lower() if last_3 else ""
-
-    if last_3:
-        clipped = last_3 if len(last_3) <= 900 else last_3[:897] + "…"
-        rns_block_parts.append(f"*Last 3 RNS:*\n{clipped}")
-    elif rns_recent:
-        lines = ["*Last 3 RNS:*"]
-        for r in rns_recent[:3]:
-            d = r.get("date") or "—"
-            tit = r.get("title") or "RNS"
-            lines.append(f"• {d} — {tit}")
-        rns_block_parts.append("\n".join(lines))
-
-    # Latest from News Log only when it adds something new
-    if rns_latest and (rns_latest.get("title") or rns_latest.get("summary")):
-        lat_date = (rns_latest.get("date") or "")[:10]
-        lat_title = (rns_latest.get("title") or "").strip()
-        already_in_last3 = False
-        if last_3_norm:
-            # Same date or same title already present in Last 3 block
-            if lat_date and lat_date in last_3_norm:
-                already_in_last3 = True
-            elif lat_title and lat_title.lower()[:40] in last_3_norm:
-                already_in_last3 = True
-        if not already_in_last3:
-            line = "📌 *Latest RNS (News Log)*"
-            if lat_date:
-                line += f" · {lat_date}"
-            line += f"\n{lat_title or 'RNS'}"
-            if rns_latest.get("summary"):
-                line += f"\n_{rns_latest['summary'][:220]}_"
-            if rns_latest.get("link"):
-                line += f"\n[Read full RNS]({rns_latest['link']})"
-            rns_block_parts.append(line)
-
-    if rns_block_parts:
-        text += "\n" + "\n\n".join(rns_block_parts) + "\n"
 
     if stockpickers:
         quoted = ", ".join(f'"{n}"' for n in stockpickers)
@@ -2327,14 +1743,13 @@ async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
 
     Never delete the message that carries ReplyKeyboardMarkup — many Telegram
     clients drop the keyboard when that message is removed.
-    Uses a minimal 🏠 anchor to keep the chat clean.
     """
     if not bot or chat_id is None:
         return
     try:
         await bot.send_message(
             chat_id,
-            "🏠",
+            "🏠 Home",
             reply_markup=main_reply_keyboard(),
         )
     except Exception as e:
@@ -2403,57 +1818,22 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-# Short key → display name for Follow callbacks (callback_data max 64 chars)
-_follow_name_cache: dict[str, str] = {}
-
-
-def _follow_key(name: str) -> str:
-    import hashlib
-
-    return hashlib.md5((name or "").strip().lower().encode("utf-8")).hexdigest()[:10]
-
-
-def snapshot_action_keyboard(
-    ticker: str,
-    stockpickers: list | None = None,
-) -> InlineKeyboardMarkup:
-    """
-    Inline actions under a company snapshot.
-    Includes Follow buttons when this-month stockpickers are known.
-    """
+def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    """Inline actions under a company snapshot."""
     t = (ticker or "").upper()[:20]
-    rows: list[list[InlineKeyboardButton]] = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "➕ Save to My Watchlist",
-                callback_data=f"snap:save:{t}",
-            )
-        ],
-    ]
-    # Up to 3 Follow buttons (Telegram callback_data limit 64 bytes)
-    names: list[str] = []
-    if stockpickers:
-        for sp in stockpickers:
-            if isinstance(sp, dict):
-                n = (sp.get("name") or "").strip()
-            else:
-                n = str(sp or "").strip()
-            if n and n not in names:
-                names.append(n)
-    for name in names[:3]:
-        key = _follow_key(name)
-        _follow_name_cache[key] = name
-        label = name if len(name) <= 18 else name[:16] + "…"
-        rows.append(
             [
                 InlineKeyboardButton(
-                    f"➕ Follow {label}",
-                    callback_data=f"fol:add:{key}",
+                    "➕ Save to My Watchlist",
+                    callback_data=f"snap:save:{t}",
                 )
-            ]
-        )
-    rows.append([InlineKeyboardButton("« Hub", callback_data="hub:home")])
-    return InlineKeyboardMarkup(rows)
+            ],
+            [
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ],
+        ]
+    )
 
 
 def hub_home_keyboard() -> InlineKeyboardMarkup:
@@ -2582,102 +1962,15 @@ def _msp_state(user_id: int) -> dict:
         now = datetime.now(timezone.utc)
         st = {
             "league_open": False,
-            "follow_open": False,
-            "submit_open": False,
-            "picks_open": False,  # My Stockpicks (this month + history)
+            "mine_open": False,
+            "hist_open": False,
             "league_y": now.year,
             "league_m": now.month,
             "hist_y": now.year,
             "hist_m": now.month,
         }
         _msp_ui[user_id] = st
-    else:
-        # Back-compat if older keys missing
-        st.setdefault("follow_open", False)
-        st.setdefault("submit_open", False)
-        st.setdefault("picks_open", False)
-        st.setdefault("league_open", False)
     return st
-
-
-def _msp_close_all(st: dict, except_key: str | None = None) -> None:
-    for k in ("league_open", "follow_open", "submit_open", "picks_open"):
-        if k != except_key:
-            st[k] = False
-
-
-def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
-    m = month + delta
-    y = year
-    while m < 1:
-        m += 12
-        y -= 1
-    while m > 12:
-        m -= 12
-        y += 1
-    return y, m
-
-
-def _is_month_open_for_submit(year: int, month: int) -> bool:
-    """
-    Forward-looking calendar rules:
-    - Current month: open
-    - Future months: open
-    - Past months: closed
-    - Weekend grace: if previous month just ended, keep it open through
-      the first Monday (or day 1–2 of the new month).
-    """
-    now = datetime.now(timezone.utc)
-    cy, cm = now.year, now.month
-    if (year, month) > (cy, cm):
-        return True
-    if (year, month) == (cy, cm):
-        return True
-    py, pm = _shift_month(cy, cm, -1)
-    if (year, month) == (py, pm):
-        # Grace for month-end weekend / early rollover
-        if now.day <= 2:
-            return True
-        # If still weekend (Sat/Sun) in first days of new month
-        if now.weekday() >= 5 and now.day <= 3:
-            return True
-    return False
-
-
-def _submit_calendar_months() -> list[tuple[int, int]]:
-    """Six months starting at current month (forward-looking window)."""
-    now = datetime.now(timezone.utc)
-    out = []
-    y, m = now.year, now.month
-    for i in range(6):
-        out.append(_shift_month(y, m, i))
-    return out
-
-
-def _msp_review_text(flow: dict) -> str:
-    y, m = flow.get("year"), flow.get("month")
-    label = _month_label(y, m) if y and m else "—"
-    t = (flow.get("ticker") or "—").upper()
-    return (
-        f"✏️ *Submit · {label}*\n\n"
-        f"Ticker: *#{t}*\n"
-        f"Summary: {(flow.get('summary') or '—')[:200]}\n"
-        f"Catalyst: {(flow.get('catalyst') or '—')[:120]}\n"
-        f"Target: {flow.get('target') or '—'}\n\n"
-        f"_Submit = lock in · Save = keep draft · Hub = exit_"
-    )
-
-
-def _msp_review_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Submit", callback_data="msp:flow_submit"),
-                InlineKeyboardButton("💾 Save", callback_data="msp:flow_save"),
-            ],
-            [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-        ]
-    )
 
 
 async def send_clean(
@@ -2822,14 +2115,6 @@ async def _watchlist_finish_action(
     user = update.effective_user
     if user:
         await _delete_watchlist_prompt(context, user.id)
-        try:
-            await log_member_activity(
-                user,
-                REQUEST_TYPE_WATCHLIST,
-                notes=(summary or "Watchlist change")[:500],
-            )
-        except Exception as e:
-            logger.debug("watchlist activity log: %s", e)
     await cleanup_trigger_message(update, context)
 
     chat = update.effective_chat
@@ -3133,8 +2418,6 @@ async def notify_admin_missing_group_link(
         "ticker": ticker,
         "name": user.full_name or "—",
         "username": user.username or "N/A",
-        "status": "open",  # open | pending | done
-        "created": time.time(),
     }
 
     text = (
@@ -3145,11 +2428,7 @@ async def notify_admin_missing_group_link(
         f"• Search: `{query}`\n"
         f"• Request ID: `{req_id}`\n\n"
         f"{detail}\n\n"
-        "Choose an action:\n"
-        "• ➕ *Add* – paste invite link → save + notify user\n"
-        "• ✅ *Added* – notify user (link already in Notion)\n"
-        "• ⏳ *Pending* – no link yet → notify user request is pending\n"
-        "• 🚫 *No group* – tell user no TG group available (stays pending)"
+        "Choose an action:"
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -3167,18 +2446,8 @@ async def notify_admin_missing_group_link(
             ],
             [
                 InlineKeyboardButton(
-                    "⏳ Pending → notify user",
+                    "⏳ Pending",
                     callback_data=f"admin:glinkpending:{req_id}",
-                ),
-                InlineKeyboardButton(
-                    "🚫 No group available",
-                    callback_data=f"admin:glinknone:{req_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 All GL pending",
-                    callback_data="admin:glinklist",
                 )
             ],
         ]
@@ -3217,14 +2486,9 @@ async def _send_link_results(
         "You will be notified once it is updated."
     )
 
-    # Scenario 1: match + link → return links
-    # Scenario 2/3: no row or row without link → request submitted; admin can Add / Pending / No group
     if not rows:
         await update.message.reply_text(
-            f"(No Telegram Group link yet)\n\n{submitted}\n\n"
-            "If a group doesn’t exist yet, admin may mark your request "
-            "*Pending* and message you here.",
-            parse_mode="Markdown",
+            f"(No Telegram Group link yet)\n\n{submitted}",
             reply_markup=main_reply_keyboard(),
         )
         if context:
@@ -3235,30 +2499,21 @@ async def _send_link_results(
 
     lines = [f"🔗 Group links for {query}\n"]
     any_missing = False
-    any_found = False
     for r in rows[:8]:
         link = r.get("link") or ""
         ticker = r.get("ticker") or "—"
         company = r.get("company") or "—"
         if link:
-            any_found = True
             lines.append(f"• #{ticker} – {company}\n  {link}")
         else:
             any_missing = True
-            lines.append(
-                f"• #{ticker} – {company}\n  (No Telegram Group link yet)"
-            )
+            lines.append(f"• #{ticker} – {company}\n  (No Telegram Group link yet)")
     if any_missing:
         lines.append(f"\n{submitted}")
-        if not any_found:
-            lines.append(
-                "\n_Admin can reply Pending if no group link is available yet._"
-            )
     else:
         lines.append("\nTap 🔗 Group Links to search again.")
     await update.message.reply_text(
         "\n".join(lines),
-        parse_mode="Markdown",
         disable_web_page_preview=False,
         reply_markup=main_reply_keyboard(),
     )
@@ -3558,92 +2813,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await cleanup_trigger_message(update, context)
         return
 
-    # Guided My Stockpick submit flow (calendar → ticker → fields)
-    if user and user.id in _awaiting_msp_flow:
-        flow = _awaiting_msp_flow[user.id]
-        step = flow.get("step") or "ticker"
-        await cleanup_trigger_message(update, context)
-        chat_id = update.effective_chat.id if update.effective_chat else None
-
-        async def _prompt(next_step: str, prompt: str) -> None:
-            flow["step"] = next_step
-            _awaiting_msp_flow[user.id] = flow
-            if not chat_id:
-                return
-            sent = await context.bot.send_message(
-                chat_id,
-                prompt,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "⏭ Skip to review",
-                                callback_data="msp:flow_save",
-                            )
-                        ],
-                        [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-                    ]
-                ),
-            )
-            await remember_nav_panel(user.id, sent)
-
-        if step == "ticker":
-            ticks = extract_hashtag_tickers(text)
-            raw = (ticks[0] if ticks else text).strip().lstrip("#").upper()
-            raw = re.sub(r"[^A-Z0-9]", "", raw)[:6]
-            if not raw:
-                if chat_id:
-                    await context.bot.send_message(
-                        chat_id,
-                        "Please send a valid ticker (e.g. ALRT).",
-                        reply_markup=main_reply_keyboard(),
-                    )
-                return
-            flow["ticker"] = raw
-            await _prompt(
-                "summary",
-                f"Ticker set: *#{raw}*\n\nNow send your *Summary* (or Skip).",
-            )
-            return
-        if step == "summary":
-            flow["summary"] = text.strip()[:2000]
-            await _prompt(
-                "catalyst",
-                "Summary saved.\n\nNow send *Next Catalyst* (or Skip).",
-            )
-            return
-        if step == "catalyst":
-            flow["catalyst"] = text.strip()[:2000]
-            await _prompt(
-                "target",
-                "Catalyst saved.\n\nNow send *Target Price* (or Skip).",
-            )
-            return
-        if step == "target":
-            flow["target"] = text.strip()[:200]
-            flow["step"] = "review"
-            _awaiting_msp_flow[user.id] = flow
-            if chat_id:
-                sent = await context.bot.send_message(
-                    chat_id,
-                    _msp_review_text(flow),
-                    parse_mode="Markdown",
-                    reply_markup=_msp_review_keyboard(),
-                )
-                await remember_nav_panel(user.id, sent)
-            return
-        # Any other text while in review → stay on review
-        if chat_id:
-            sent = await context.bot.send_message(
-                chat_id,
-                _msp_review_text(flow),
-                parse_mode="Markdown",
-                reply_markup=_msp_review_keyboard(),
-            )
-            await remember_nav_panel(user.id, sent)
-        return
-
     # Watchlist follow-up
     if user and user.id in _awaiting_watchlist:
         action = _awaiting_watchlist.pop(user.id)
@@ -3789,23 +2958,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if page_id:
             _last_stockpick_page[user.id] = page_id
             await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
-            # Notify members who Follow this stockpicker
-            try:
-                n = await notify_followers_of_stockpick(
-                    picker_name=user_name,
-                    picker_uid=user.id if user else None,
-                    ticker=ticker,
-                    message=clean_text,
-                    bot=context.bot,
-                )
-                if n:
-                    logger.info(
-                        "Notified %s follower(s) of stockpick by %s",
-                        n,
-                        user_name,
-                    )
-            except Exception as ne:
-                logger.warning("follower notify failed: %s", ne)
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
@@ -3852,10 +3004,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         for t in tickers:
             try:
-                try:
-                    _ticker_cache.pop(t, None)
-                except Exception:
-                    pass
                 data = await get_ticker_from_notion(t)
                 if data:
                     await log_member_activity(user, REQUEST_TYPE_SNAPSHOT)
@@ -3864,22 +3012,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     except Exception as e:
                         logger.error("stockpickers failed for %s: %s", t, e)
                         stockpickers = []
-                    rns_latest = None
-                    rns_recent: list = []
-                    try:
-                        rns_recent = await get_recent_rns_for_ticker(
-                            t, limit=3, force=True
-                        )
-                        rns_latest = rns_recent[0] if rns_recent else None
-                    except Exception:
-                        pass
-                    body = format_reply(
-                        t,
-                        data,
-                        stockpickers,
-                        rns_latest=rns_latest,
-                        rns_recent=rns_recent,
-                    )
+                    body = format_reply(t, data, stockpickers)
                     try:
                         await update.message.reply_text(body, parse_mode="Markdown")
                     except Exception:
@@ -3996,24 +3129,40 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def _load_microcap_tickers(limit: int = 80) -> list[tuple[str, str]]:
+async def _load_microcap_tickers(limit: int | None = None) -> list[tuple[str, str]]:
     """
-    Return [(ticker, company), ...] from UK AIM Micro-Cap.
-    Used by Stock of the Day ranking.
+    Return [(ticker, company), ...] from the full UK AIM Micro-Cap universe.
+    Paginate until exhausted (or optional hard limit).
     """
     out: list[tuple[str, str]] = []
-    if not notion:
+    if not (notion or NOTION_TOKEN):
         return out
-    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or "").strip()
-    if not db_id:
+    db_id = (os.getenv("NOTION_TICKERS_DB_ID") or NOTION_TICKERS_DB_ID or "").strip()
+    ds_id = (os.getenv("NOTION_TICKERS_DATA_SOURCE_ID") or NOTION_TICKERS_DATA_SOURCE_ID or "").strip()
+    if not db_id and not ds_id:
         return out
+    hard_cap = limit if limit is not None else 5000
     try:
         cursor = None
-        while len(out) < limit:
-            kwargs = {"database_id": db_id, "page_size": min(50, limit - len(out))}
+        while len(out) < hard_cap:
+            page_size = min(100, hard_cap - len(out))
+            kwargs = {"page_size": page_size}
             if cursor:
                 kwargs["start_cursor"] = cursor
-            resp = notion.databases.query(**kwargs)
+            try:
+                resp = notion_query_data_source(
+                    data_source_id=ds_id or None,
+                    database_id=db_id or None,
+                    **kwargs,
+                )
+            except Exception:
+                # Classic client fallback
+                if not notion or not db_id:
+                    break
+                qkwargs = {"database_id": db_id, "page_size": page_size}
+                if cursor:
+                    qkwargs["start_cursor"] = cursor
+                resp = notion.databases.query(**qkwargs)
             for page in resp.get("results", []):
                 props = page.get("properties") or {}
                 t = (
@@ -4029,8 +3178,8 @@ async def _load_microcap_tickers(limit: int = 80) -> list[tuple[str, str]]:
                     or _get_plain_text(props.get("Name"))
                     or t
                 )
-                out.append((t, company))
-                if len(out) >= limit:
+                out.append((t, company[:80]))
+                if len(out) >= hard_cap:
                     break
             if not resp.get("has_more"):
                 break
@@ -4039,15 +3188,52 @@ async def _load_microcap_tickers(limit: int = 80) -> list[tuple[str, str]]:
                 break
     except Exception as e:
         logger.error("_load_microcap_tickers failed: %s", e)
-    # de-dupe preserve order
     seen = set()
-    uniq = []
+    uniq: list[tuple[str, str]] = []
     for t, c in out:
         if t in seen:
             continue
         seen.add(t)
         uniq.append((t, c))
+    logger.info("_load_microcap_tickers loaded %d unique names", len(uniq))
     return uniq
+
+
+async def _rank_tickers_by_live_pct(
+    pairs: list[tuple[str, str]],
+    *,
+    concurrency: int = 12,
+) -> list[tuple[str, str, float]]:
+    """
+    Fetch Yahoo session % for every ticker concurrently and return
+    only those with a live quote, sorted by % desc.
+    """
+    if not pairs:
+        return []
+    sem = asyncio.Semaphore(max(1, concurrency))
+    ranked: list[tuple[str, str, float]] = []
+
+    async def _one(t: str, company: str) -> tuple[str, str, float] | None:
+        async with sem:
+            pct = await asyncio.to_thread(_fetch_pct_on_day_live, t)
+        if pct is None:
+            return None
+        return (t, company, float(pct))
+
+    results = await asyncio.gather(
+        *[_one(t, c) for t, c in pairs],
+        return_exceptions=True,
+    )
+    for r in results:
+        if isinstance(r, Exception):
+            logger.debug("rank fetch error: %s", r)
+            continue
+        if r is None:
+            continue
+        ranked.append(r)
+    ranked.sort(key=lambda x: x[2], reverse=True)
+    return ranked
+
 
 
 async def stock_of_the_day_cmd(
@@ -4076,30 +3262,44 @@ async def stock_of_the_day_cmd(
         reply_markup=main_reply_keyboard(),
     )
     await remember_nav_panel(user.id if user else None, status)
-    try:
-        await log_member_activity(
-            user, REQUEST_TYPE_SOTD, notes="Stock of the Day"
-        )
-    except Exception:
-        pass
 
     try:
-        pairs = await _load_microcap_tickers(limit=60)
-        ranked: list[tuple[str, str, float]] = []
-        for t, company in pairs:
-            pct = _fetch_pct_on_day_live(t)
-            if pct is None:
-                continue
-            ranked.append((t, company, float(pct)))
-            await asyncio.sleep(0.08)
-        ranked.sort(key=lambda x: x[2], reverse=True)
+        # Full universe from Notion UK AIM Micro-Cap
+        pairs = await _load_microcap_tickers(limit=None)
+        if not pairs:
+            try:
+                await status.edit_text(
+                    "🏆 *Stock of the Day*\n\n"
+                    "Could not load the UK AIM Micro-Cap list from Notion.",
+                    parse_mode="Markdown",
+                    reply_markup=hub_back_keyboard(),
+                )
+            except Exception:
+                await msg.reply_text(
+                    "Could not load Stock of the Day right now.",
+                    reply_markup=main_reply_keyboard(),
+                )
+            return
+
+        try:
+            await status.edit_text(
+                f"🏆 Scanning *{len(pairs)}* AIM names for live session %…",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+        except Exception:
+            pass
+
+        ranked = await _rank_tickers_by_live_pct(pairs, concurrency=12)
         top = ranked[:5]
+        quoted = len(ranked)
 
         if not top:
             try:
                 await status.edit_text(
                     "🏆 *Stock of the Day*\n\n"
-                    "Could not load live % changes right now. Try again shortly.",
+                    f"Loaded *{len(pairs)}* names from Notion but no live "
+                    "Yahoo quotes returned. Try again shortly.",
                     parse_mode="Markdown",
                     reply_markup=hub_back_keyboard(),
                 )
@@ -4113,7 +3313,8 @@ async def stock_of_the_day_cmd(
         # Header board
         lines = [
             "🏆 *Stock of the Day*",
-            "_Top movers by session % change (UK AIM Micro-Cap)_",
+            "_Top movers by session % change (full UK AIM Micro-Cap)_",
+            f"_Scanned {len(pairs)} names · {quoted} with live Yahoo quotes_",
             "",
         ]
         for i, (t, company, pct) in enumerate(top, 1):
@@ -4123,7 +3324,7 @@ async def stock_of_the_day_cmd(
             lines.append(f"   {arrow} *{sign}{pct:.2f}%*")
         lines.append("")
         lines.append("_Tap a ticker below for the full snapshot._")
-        lines.append("_Not financial advice. DYOR._")
+        lines.append("_Prices: Yahoo Finance (LSE). Not financial advice. DYOR._")
 
         kb_rows = []
         for t, company, pct in top:
@@ -4307,11 +3508,6 @@ async def deliver_stock_snapshot(
         )
         return
     try:
-        # Bust ticker cache so Last RNS Date / Last 3 RNS are fresh
-        try:
-            _ticker_cache.pop(ticker, None)
-        except Exception:
-            pass
         meta = await get_ticker_from_notion(ticker)
         if not meta:
             sent = await context.bot.send_message(
@@ -4327,21 +3523,7 @@ async def deliver_stock_snapshot(
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
-        # Live RNS from Hive RNS News Log (may be newer than Micro-Cap summary text)
-        rns_latest = None
-        rns_recent: list = []
-        try:
-            rns_recent = await get_recent_rns_for_ticker(ticker, limit=3, force=True)
-            rns_latest = rns_recent[0] if rns_recent else None
-        except Exception as rexc:
-            logger.warning("snapshot RNS enrich failed for %s: %s", ticker, rexc)
-        body = format_reply(
-            ticker,
-            meta,
-            stockpickers,
-            rns_latest=rns_latest,
-            rns_recent=rns_recent,
-        )
+        body = format_reply(ticker, meta, stockpickers)
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
@@ -4353,14 +3535,14 @@ async def deliver_stock_snapshot(
                 msg.chat_id,
                 body,
                 parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         except Exception:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         if user:
@@ -4517,12 +3699,10 @@ async def show_stockpick_hub(
     edit: bool = False,
 ) -> None:
     """
-    My Stockpick home – 5 fixed components:
-      1) The Hive League Table
-      2) Follow Top Stockpickers
-      3) Submit Your Stockpick
-      4) My Stockpicks (this month + history)
-      5) Hub
+    My Stockpick home – two content parts + 3 expandable inline sections:
+      1) League table (month nav)
+      2) My pick this month (edit actions)
+      3) History (month nav)
     """
     user = update.effective_user
     if update.callback_query:
@@ -4544,50 +3724,63 @@ async def show_stockpick_hub(
 
     st = _msp_state(user.id)
     now = datetime.now(timezone.utc)
+    # Default cursors to current month
     ly, lm = st.get("league_y") or now.year, st.get("league_m") or now.month
     hy, hm = st.get("hist_y") or now.year, st.get("hist_m") or now.month
 
+    # --- Part 2 data: user's current month pick ---
     my_rows = await _fetch_stockpicks_month(now.year, now.month, mine_user=user)
     my_pick = my_rows[0] if my_rows else None
     if my_pick:
         _last_stockpick_page[user.id] = my_pick["page_id"]
 
-    following = await get_user_following(user)
-    following_names = {(it.get("name") or "").lower() for it in following}
+    # Who else picked the same ticker this month (followers / co-pickers)
+    co_pickers: list[str] = []
+    if my_pick and my_pick.get("ticker") and my_pick["ticker"] != "—":
+        all_month = await _fetch_stockpicks_month(now.year, now.month, mine_user=None)
+        for r in all_month:
+            if r["ticker"] == my_pick["ticker"]:
+                name = (r.get("posted_by") or "").strip()
+                if name and name != "—" and name.lower() != (user.full_name or "").lower():
+                    if name not in co_pickers:
+                        co_pickers.append(name)
 
-    # Landing text (always clean + short) — 5-component menu
     lines = [
         "📌 *My Stockpick*",
-        f"_{_month_label(now.year, now.month)}_",
         "",
-        "1. 🏆 Hive League Table",
-        "2. ⭐ Follow Top Stockpickers",
-        "3. ✏️ Submit Your Stockpick",
-        "4. 📚 My Stockpicks",
-        "5. « Hub",
+        "• View the *Hive Stockpicker League* for the month",
+        "• Enter or edit *your* stockpick this month",
+        "• Open *history* by month",
         "",
     ]
     if my_pick:
-        lines.append(f"Your pick: *#{my_pick['ticker']}*")
-        if my_pick.get("summary"):
-            lines.append(f"_{my_pick['summary'][:100]}_")
-    else:
-        lines.append("_No pick this month yet — open *3. Submit Your Stockpick*._")
-    if following_names:
         lines.append(
-            "Following: "
-            + ", ".join((it.get("name") or "") for it in following[:6] if it.get("name"))
+            f"*Your pick · {_month_label(now.year, now.month)}:* "
+            f"*#{my_pick['ticker']}*"
+        )
+        lines.append(f"Summary: {my_pick['summary'][:120]}")
+        lines.append(f"Catalyst: {my_pick['catalyst'][:80]}")
+        lines.append(f"Target: {my_pick['target']}")
+        if co_pickers:
+            lines.append(
+                "Also picked by: " + ", ".join(co_pickers[:8])
+            )
+    else:
+        lines.append(
+            f"_No stockpick yet for {_month_label(now.year, now.month)}. "
+            "Post `#stockpick #TICKER` in the group._"
         )
     lines.append("")
 
     keyboard: list[list] = []
 
-    # ========== 1) Hive League Table ==========
+    # --- Section 1: League ---
     if st.get("league_open"):
         league_rows = await _fetch_stockpicks_month(ly, lm, mine_user=None)
+        # Aggregate by ticker
         counts: dict[str, list[str]] = {}
         for r in league_rows:
-            t = r.get("ticker") or ""
+            t = r["ticker"]
             if not t or t == "—":
                 continue
             counts.setdefault(t, [])
@@ -4595,7 +3788,7 @@ async def show_stockpick_hub(
             if name and name not in counts[t]:
                 counts[t].append(name)
         ranked = sorted(counts.items(), key=lambda x: len(x[1]), reverse=True)
-        lines.append(f"🏆 *Hive League · {_month_label(ly, lm)}*")
+        lines.append(f"🏆 *League · {_month_label(ly, lm)}*")
         if not ranked:
             lines.append("_No stockpicks logged this month._")
         else:
@@ -4613,145 +3806,54 @@ async def show_stockpick_hub(
             ]
         )
         keyboard.append(
-            [InlineKeyboardButton("▴ Hide League", callback_data="msp:ui_league")]
+            [InlineKeyboardButton("▴ Hide league", callback_data="msp:ui_league")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "🏆 1. Hive League Table", callback_data="msp:ui_league"
+                    "🏆 League table ▾", callback_data="msp:ui_league"
                 )
             ]
         )
 
-    # ========== 2) Follow Top Stockpickers ==========
-    if st.get("follow_open"):
-        all_month = await _fetch_stockpicks_month(now.year, now.month, mine_user=None)
-        by_picker: dict[str, set[str]] = {}
-        for r in all_month:
-            name = (r.get("posted_by") or "").strip()
-            t = (r.get("ticker") or "").strip()
-            if not name or name == "—" or name.lower() == (user.full_name or "").lower():
-                continue
-            by_picker.setdefault(name, set())
-            if t and t != "—":
-                by_picker[name].add(t)
-        top = sorted(by_picker.items(), key=lambda x: len(x[1]), reverse=True)[:8]
-        lines.append("⭐ *Follow Top Stockpickers*")
-        lines.append("_Tap Follow — get a DM when they post a monthly pick._")
-        if not top:
-            lines.append("_No stockpickers yet this month._")
-        else:
-            for name, tickers in top:
-                tags = ", ".join(f"#{x}" for x in list(tickers)[:4])
-                mark = " ✓" if name.lower() in following_names else ""
-                lines.append(f"• *{name}*{mark} · {tags or '—'}")
-        lines.append("")
-        # Follow buttons (max 6)
-        for name, _tickers in top[:6]:
-            key = _follow_key(name)
-            _follow_name_cache[key] = name
-            label = name if len(name) <= 16 else name[:14] + "…"
-            already = name.lower() in following_names
-            btn = (
-                InlineKeyboardButton(
-                    f"✓ {label}", callback_data=f"fol:add:{key}"
-                )
-                if already
-                else InlineKeyboardButton(
-                    f"➕ Follow {label}", callback_data=f"fol:add:{key}"
-                )
-            )
-            keyboard.append([btn])
+    # --- Section 2: My pick this month ---
+    if st.get("mine_open"):
         keyboard.append(
-            [InlineKeyboardButton("▴ Hide Follow", callback_data="msp:ui_follow")]
+            [
+                InlineKeyboardButton("Summary", callback_data="sp:Summary"),
+                InlineKeyboardButton("Catalyst", callback_data="sp:Next Catalyst"),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton("Target", callback_data="sp:Target Price"),
+                InlineKeyboardButton("Edit pick", callback_data="sp:Change"),
+            ]
+        )
+        keyboard.append(
+            [InlineKeyboardButton("▴ Hide my pick", callback_data="msp:ui_mine")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "⭐ 2. Follow Top Stockpickers",
-                    callback_data="msp:ui_follow",
+                    "✏️ My pick this month ▾", callback_data="msp:ui_mine"
                 )
             ]
         )
 
-    # ========== 3) Submit Your Stockpick → 6-month calendar ==========
-    if st.get("submit_open"):
-        lines.append("✏️ *Submit Your Stockpick*")
-        lines.append("_Pick a month (open months only). Past months are closed._")
-        lines.append("")
-        # Calendar: 6 months, 3 per row
-        months = _submit_calendar_months()
-        row: list = []
-        for i, (yy, mm) in enumerate(months):
-            open_ok = _is_month_open_for_submit(yy, mm)
-            label = _month_label(yy, mm)
-            if open_ok:
-                btn = InlineKeyboardButton(
-                    f"📅 {label}",
-                    callback_data=f"msp:cal:{yy}-{mm:02d}",
-                )
-            else:
-                btn = InlineKeyboardButton(
-                    f"🔒 {label}",
-                    callback_data="msp:cal_locked",
-                )
-            row.append(btn)
-            if len(row) == 3:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
-        # If already has current-month pick, show shortcut
-        if my_pick and _is_month_open_for_submit(now.year, now.month):
-            lines.append(
-                f"_This month you already have *#{my_pick['ticker']}* — "
-                f"select { _month_label(now.year, now.month) } to update._"
-            )
-        lines.append("")
-        keyboard.append(
-            [InlineKeyboardButton("▴ Hide Submit", callback_data="msp:ui_submit")]
-        )
-    else:
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "✏️ 3. Submit Your Stockpick",
-                    callback_data="msp:ui_submit",
-                )
-            ]
-        )
-
-    # ========== 4) My Stockpicks — table (ticker, summary, catalyst, TP, %) ==========
-    if st.get("picks_open"):
-        lines.append(f"📚 *My Stockpicks · {_month_label(hy, hm)}*")
-        lines.append("`Ticker | Summary | Catalyst | TP | %`")
+    # --- Section 3: History ---
+    if st.get("hist_open"):
         hist_rows = await _fetch_stockpicks_month(hy, hm, mine_user=user)
+        lines.append(f"📚 *History · {_month_label(hy, hm)}*")
         if not hist_rows:
             lines.append("_No picks in this month._")
         else:
-            for r in hist_rows[:10]:
-                t = (r.get("ticker") or "—").upper()
-                summ = (r.get("summary") or "—").replace("\n", " ")[:40]
-                cat = (r.get("catalyst") or "—").replace("\n", " ")[:28]
-                tp = (r.get("target") or "—")[:12]
-                pct_s = "—"
-                try:
-                    pct = _fetch_pct_on_day_live(t) if t and t != "—" else None
-                    if pct is None:
-                        meta = await get_ticker_from_notion(t)
-                        if meta:
-                            pct = meta.get("day_change_pct")
-                    if pct is not None:
-                        pct_s = f"{pct:+.1f}%"
-                except Exception:
-                    pass
+            for r in hist_rows[:8]:
                 lines.append(
-                    f"*{t}*  {pct_s}\n"
-                    f"  S: {summ}\n"
-                    f"  C: {cat}\n"
-                    f"  TP: {tp}"
+                    f"• *#{r['ticker']}* · {r['date'][:10]}\n"
+                    f"  {r['summary'][:80]}"
                 )
         lines.append("")
         keyboard.append(
@@ -4763,37 +3865,20 @@ async def show_stockpick_hub(
                 InlineKeyboardButton("›", callback_data="msp:hist_next"),
             ]
         )
-        # Only allow edit when that month is still open
-        if _is_month_open_for_submit(hy, hm) and hist_rows:
-            keyboard.append(
-                [
-                    InlineKeyboardButton("Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton(
-                        "Catalyst", callback_data="sp:Next Catalyst"
-                    ),
-                ]
-            )
-            keyboard.append(
-                [
-                    InlineKeyboardButton("Target", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change", callback_data="sp:Change"),
-                ]
-            )
         keyboard.append(
-            [InlineKeyboardButton("▴ Hide My Stockpicks", callback_data="msp:ui_picks")]
+            [InlineKeyboardButton("▴ Hide history", callback_data="msp:ui_hist")]
         )
     else:
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    "📚 4. My Stockpicks", callback_data="msp:ui_picks"
+                    "📚 History ▾", callback_data="msp:ui_hist"
                 )
             ]
         )
 
-    # ========== 5) Hub ==========
     keyboard.append(
-        [InlineKeyboardButton("« 5. Hub", callback_data="hub:home")]
+        [InlineKeyboardButton("« Hub", callback_data="hub:home")]
     )
 
     text = "\n".join(lines)
@@ -4825,12 +3910,6 @@ async def mystockpick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     await cleanup_trigger_message(update, context)
     await clear_nav_panel(context.bot, user.id)
-    try:
-        await log_member_activity(
-            user, REQUEST_TYPE_STOCKPICK, notes="Opened My Stockpick"
-        )
-    except Exception:
-        pass
     await show_stockpick_hub(update, context, edit=False)
 
 async def show_my_stockpicks(
@@ -5439,313 +4518,51 @@ async def show_watchlist(
         logger.error("show_watchlist failed: %s", e)
         await msg.reply_text(f"Could not load watchlist.\nError: {str(e)[:300]}")
         
-async def _msp_persist_flow(
-    user, flow: dict, *, final: bool
-) -> tuple[str | None, str | None]:
-    """
-    Create or update Notion stockpick from guided flow.
-    Returns (page_id, error).
-    """
-    ticker = (flow.get("ticker") or "").upper().strip()
-    if not ticker:
-        return None, "Ticker is required."
-    y, m = flow.get("year"), flow.get("month")
-    if not y or not m:
-        return None, "Month is required."
-    if not _is_month_open_for_submit(int(y), int(m)):
-        return None, "That month is closed for new entries."
-
-    month_names = [
-        "", "January", "February", "March", "April", "May", "June",
-        "July", "August", "September", "October", "November", "December",
-    ]
-    period_value = month_names[int(m)]
-    text_parts = [f"#stockpick #{ticker}", f"#{period_value}"]
-    if flow.get("summary"):
-        text_parts.append(flow["summary"])
-    if flow.get("catalyst"):
-        text_parts.append(f"Catalyst: {flow['catalyst']}")
-    if flow.get("target"):
-        text_parts.append(f"TP: {flow['target']}")
-    text = "\n".join(text_parts)
-
-    # Prefer update existing page for that month
-    page_id = flow.get("page_id")
-    if not page_id:
-        try:
-            rows = await _fetch_stockpicks_month(int(y), int(m), mine_user=user)
-            if rows:
-                page_id = rows[0].get("page_id")
-        except Exception:
-            pass
-
-    if page_id and notion:
-        try:
-            props = {
-                "Ticker": {
-                    "rich_text": [{"text": {"content": ticker[:50]}}]
-                },
-                "Message": {
-                    "rich_text": [{"text": {"content": text[:2000]}}]
-                },
-                "Stockpick & Month": {
-                    "title": [
-                        {
-                            "text": {
-                                "content": f"#{ticker} ({period_value})"[:100]
-                            }
-                        }
-                    ]
-                },
-            }
-            if flow.get("summary"):
-                props["Summary"] = {
-                    "rich_text": [
-                        {"text": {"content": flow["summary"][:2000]}}
-                    ]
-                }
-            if flow.get("catalyst"):
-                props["Next Catalyst"] = {
-                    "rich_text": [
-                        {"text": {"content": flow["catalyst"][:2000]}}
-                    ]
-                }
-            if flow.get("target"):
-                props["Target Price"] = {
-                    "rich_text": [
-                        {"text": {"content": str(flow["target"])[:200]}}
-                    ]
-                }
-            # Pin Telegram Date inside the chosen month
-            day = min(28, datetime.now(timezone.utc).day)
-            if (int(y), int(m)) != (
-                datetime.now(timezone.utc).year,
-                datetime.now(timezone.utc).month,
-            ):
-                day = 1
-            props["Telegram Date"] = {
-                "date": {
-                    "start": f"{int(y):04d}-{int(m):02d}-{day:02d}"
-                }
-            }
-            notion.pages.update(page_id=page_id, properties=props)
-            return page_id, None
-        except Exception as e:
-            logger.warning("msp update failed, will create: %s", e)
-
-    page_id, err = await save_stockpick_to_notion(
-        text,
-        user.full_name if user else "Unknown",
-        ticker,
-        "Monthly",
-        period_value,
-        user_id=user.id if user else None,
-    )
-    if page_id and notion and (flow.get("summary") or flow.get("catalyst") or flow.get("target")):
-        try:
-            props = {}
-            if flow.get("summary"):
-                props["Summary"] = {
-                    "rich_text": [{"text": {"content": flow["summary"][:2000]}}]
-                }
-            if flow.get("catalyst"):
-                props["Next Catalyst"] = {
-                    "rich_text": [{"text": {"content": flow["catalyst"][:2000]}}]
-                }
-            if flow.get("target"):
-                props["Target Price"] = {
-                    "rich_text": [{"text": {"content": str(flow["target"])[:200]}}]
-                }
-            if props:
-                notion.pages.update(page_id=page_id, properties=props)
-        except Exception as e:
-            logger.warning("msp field patch failed: %s", e)
-    return page_id, err
-
-
 async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """My Stockpick hub – 5-section expand/collapse + month navigation."""
+    """My Stockpick hub expand/collapse + month navigation."""
     query = update.callback_query
     user = query.from_user if query else None
     if not query or not user:
         return
-    data = query.data or ""
-    action = data.replace("msp:", "", 1)
+    await query.answer()
+    action = (query.data or "").replace("msp:", "", 1)
     st = _msp_state(user.id)
     now = datetime.now(timezone.utc)
 
     def _shift(y: int, m: int, delta: int) -> tuple[int, int]:
-        y, m = _shift_month(y, m, delta)
-        # hist can go back; league not past future beyond now for ranking display
+        m = m + delta
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        # Don't go past current month
+        if y > now.year or (y == now.year and m > now.month):
+            return now.year, now.month
         return y, m
 
-    # ----- Calendar month locked -----
-    if action == "cal_locked":
-        await query.answer(
-            "That month is closed. Only current / future months (with weekend grace).",
-            show_alert=True,
-        )
-        return
-
-    # ----- Calendar month selected → start ticker step -----
-    if action.startswith("cal:"):
-        await query.answer()
-        try:
-            ym = action.replace("cal:", "", 1).strip()
-            y_s, m_s = ym.split("-")
-            y, m = int(y_s), int(m_s)
-        except Exception:
-            await query.answer("Invalid month.", show_alert=True)
-            return
-        if not _is_month_open_for_submit(y, m):
-            await query.answer("That month is closed.", show_alert=True)
-            return
-        existing = await _fetch_stockpicks_month(y, m, mine_user=user)
-        flow = {
-            "year": y,
-            "month": m,
-            "step": "ticker",
-            "ticker": (existing[0].get("ticker") if existing else "") or "",
-            "summary": (existing[0].get("summary") if existing else "") or "",
-            "catalyst": (existing[0].get("catalyst") if existing else "") or "",
-            "target": (existing[0].get("target") if existing else "") or "",
-            "page_id": existing[0].get("page_id") if existing else None,
-        }
-        if flow["summary"] == "—":
-            flow["summary"] = ""
-        if flow["catalyst"] == "—":
-            flow["catalyst"] = ""
-        if flow["target"] == "—":
-            flow["target"] = ""
-        _awaiting_msp_flow[user.id] = flow
-        label = _month_label(y, m)
-        try:
-            await query.edit_message_text(
-                f"✏️ *Submit · {label}*\n\n"
-                f"Send the *ticker* now (e.g. `ALRT` or `#ALRT`).\n"
-                f"Then you’ll add Summary → Catalyst → Target Price.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("« Hub", callback_data="hub:home")]]
-                ),
-            )
-            await remember_nav_panel(user.id, query.message)
-        except Exception:
-            await query.message.reply_text(
-                f"Send ticker for {label} (e.g. ALRT).",
-                reply_markup=main_reply_keyboard(),
-            )
-        return
-
-    # ----- Review actions: Submit / Save -----
-    if action in ("flow_submit", "flow_save"):
-        await query.answer()
-        flow = _awaiting_msp_flow.get(user.id)
-        if not flow or not flow.get("ticker"):
-            await query.answer("Start again from Submit Your Stockpick.", show_alert=True)
-            return
-        page_id, err = await _msp_persist_flow(
-            user, flow, final=(action == "flow_submit")
-        )
-        if err or not page_id:
-            try:
-                await query.edit_message_text(
-                    f"❌ Could not save: {err or 'unknown error'}",
-                    reply_markup=_msp_review_keyboard(),
-                )
-            except Exception:
-                await query.message.reply_text(f"Could not save: {err}")
-            return
-        flow["page_id"] = page_id
-        _last_stockpick_page[user.id] = page_id
-        try:
-            await log_member_activity(
-                user,
-                REQUEST_TYPE_STOCKPICK,
-                notes=(
-                    f"{'Submit' if action == 'flow_submit' else 'Save'} "
-                    f"#{flow.get('ticker')} {_month_label(flow['year'], flow['month'])}"
-                ),
-            )
-        except Exception:
-            pass
-        if action == "flow_submit":
-            try:
-                await notify_followers_of_stockpick(
-                    picker_name=user.full_name or "Member",
-                    picker_uid=user.id,
-                    ticker=flow.get("ticker"),
-                    message=flow.get("summary") or f"#{flow.get('ticker')}",
-                    bot=context.bot,
-                )
-            except Exception:
-                pass
-            _awaiting_msp_flow.pop(user.id, None)
-            msg = (
-                f"✅ *Submitted* #{flow.get('ticker')} · "
-                f"{_month_label(flow['year'], flow['month'])}\n"
-                f"Summary / Catalyst / Target saved."
-            )
-        else:
-            msg = (
-                f"💾 *Saved draft* #{flow.get('ticker')} · "
-                f"{_month_label(flow['year'], flow['month'])}\n"
-                f"You can Submit when ready."
-            )
-        try:
-            await query.edit_message_text(
-                msg,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "📚 My Stockpicks", callback_data="msp:ui_picks"
-                            )
-                        ],
-                        [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-                    ]
-                ),
-            )
-        except Exception:
-            await query.message.reply_text(msg.replace("*", ""))
-        return
-
-    await query.answer()
-
     if action == "ui_league":
-        open_now = not st.get("league_open")
-        _msp_close_all(st)
-        st["league_open"] = open_now
-    elif action == "ui_follow":
-        open_now = not st.get("follow_open")
-        _msp_close_all(st)
-        st["follow_open"] = open_now
-    elif action == "ui_submit":
-        open_now = not st.get("submit_open")
-        _msp_close_all(st)
-        st["submit_open"] = open_now
-        _awaiting_msp_flow.pop(user.id, None)
-    elif action == "ui_picks":
-        open_now = not st.get("picks_open")
-        _msp_close_all(st)
-        st["picks_open"] = open_now
-    # Legacy aliases from old keyboards
+        st["league_open"] = not st.get("league_open")
+        if st["league_open"]:
+            st["mine_open"] = False
+            st["hist_open"] = False
     elif action == "ui_mine":
-        open_now = not st.get("submit_open")
-        _msp_close_all(st)
-        st["submit_open"] = open_now
+        st["mine_open"] = not st.get("mine_open")
+        if st["mine_open"]:
+            st["league_open"] = False
+            st["hist_open"] = False
     elif action == "ui_hist":
-        open_now = not st.get("picks_open")
-        _msp_close_all(st)
-        st["picks_open"] = open_now
+        st["hist_open"] = not st.get("hist_open")
+        if st["hist_open"]:
+            st["league_open"] = False
+            st["mine_open"] = False
     elif action == "league_prev":
         st["league_y"], st["league_m"] = _shift(
             st.get("league_y") or now.year,
             st.get("league_m") or now.month,
             -1,
         )
-        _msp_close_all(st)
         st["league_open"] = True
     elif action == "league_next":
         st["league_y"], st["league_m"] = _shift(
@@ -5753,7 +4570,6 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             st.get("league_m") or now.month,
             1,
         )
-        _msp_close_all(st)
         st["league_open"] = True
     elif action == "hist_prev":
         st["hist_y"], st["hist_m"] = _shift(
@@ -5761,16 +4577,14 @@ async def msp_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             st.get("hist_m") or now.month,
             -1,
         )
-        _msp_close_all(st)
-        st["picks_open"] = True
+        st["hist_open"] = True
     elif action == "hist_next":
         st["hist_y"], st["hist_m"] = _shift(
             st.get("hist_y") or now.year,
             st.get("hist_m") or now.month,
             1,
         )
-        _msp_close_all(st)
-        st["picks_open"] = True
+        st["hist_open"] = True
     elif action in ("league_noop", "hist_noop"):
         return
 
@@ -5792,10 +4606,6 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     # Reuse snapshot delivery into this chat; keep Home keyboard
     try:
-        try:
-            _ticker_cache.pop(ticker, None)
-        except Exception:
-            pass
         meta = await get_ticker_from_notion(ticker)
         if not meta:
             await query.edit_message_text(
@@ -5808,20 +4618,7 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
-        rns_latest = None
-        rns_recent: list = []
-        try:
-            rns_recent = await get_recent_rns_for_ticker(ticker, limit=3, force=True)
-            rns_latest = rns_recent[0] if rns_recent else None
-        except Exception:
-            pass
-        body = format_reply(
-            ticker,
-            meta,
-            stockpickers,
-            rns_latest=rns_latest,
-            rns_recent=rns_recent,
-        )
+        body = format_reply(ticker, meta, stockpickers)
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
@@ -5832,13 +4629,13 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text(
                 body,
                 parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         except Exception:
             await query.edit_message_text(
                 body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker, stockpickers),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         await remember_nav_panel(user.id, query.message)
@@ -5932,79 +4729,6 @@ async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
 
-async def follow_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle Follow stockpicker from snapshot: fol:add:<key>."""
-    query = update.callback_query
-    user = query.from_user
-    data = query.data or ""
-    if not user:
-        await query.answer()
-        return
-
-    if not data.startswith("fol:add:"):
-        await query.answer()
-        return
-
-    key = data.replace("fol:add:", "", 1).strip()
-    name = _follow_name_cache.get(key)
-    if not name:
-        await query.answer(
-            "That Follow button expired — open the snapshot again.",
-            show_alert=True,
-        )
-        return
-
-    if not await is_authorized(update, context):
-        await query.answer("Authorised members only.", show_alert=True)
-        return
-
-    # Resolve optional Telegram uid from Hive Stock Picks Notes (uid:123)
-    target_uid = None
-    try:
-        db_id = (os.getenv("NOTION_STOCKPICKS_DB_ID") or "").strip() or (
-            "9095ded4-ad6a-4b25-9887-19a77baba12f"
-        )
-        raw = db_id.replace("-", "")
-        if len(raw) == 32:
-            db_id = f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}"
-        if notion:
-            resp = notion.databases.query(
-                database_id=db_id,
-                filter={
-                    "property": "Posted By",
-                    "rich_text": {"equals": name},
-                },
-                page_size=5,
-            )
-            for page in resp.get("results", []):
-                notes = _get_plain_text(page.get("properties", {}).get("Notes")) or ""
-                m = re.search(r"uid:(\d+)", notes)
-                if m:
-                    target_uid = m.group(1)
-                    break
-    except Exception as e:
-        logger.debug("follow uid resolve: %s", e)
-
-    ok, msg = await add_following(user, name=name, target_uid=target_uid)
-    await query.answer("Followed" if ok else "Could not follow", show_alert=not ok)
-    if ok:
-        try:
-            await log_member_activity(
-                user,
-                REQUEST_TYPE_FOLLOW,
-                notes=f"Follow {name}" + (f" uid:{target_uid}" if target_uid else ""),
-            )
-        except Exception:
-            pass
-    try:
-        await query.message.reply_text(msg, parse_mode="Markdown")
-    except Exception:
-        try:
-            await query.message.reply_text(msg.replace("*", ""))
-        except Exception:
-            pass
-
-
 async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -6020,60 +4744,25 @@ async def hub_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "hub:mypicks":
         await show_stockpick_hub(update, context, edit=True)
     elif data == "hub:home":
-        # Clean overlay: clear state + collapse prior panel in-place + Home keyboard
+        # Wipe previous panel, then land on Home with keyboard that STAYS
         if user:
             _awaiting_snapshot.pop(user.id, None)
             _awaiting_watchlist.pop(user.id, None)
             _awaiting_link.pop(user.id, None)
             _awaiting_field.pop(user.id, None)
-            _awaiting_msp_flow.pop(user.id, None)
             await clear_nav_panel(context.bot, user.id)
-            # Drop watchlist panel tracking so Hub does not leave a second message
-            try:
-                _watchlist_ui.pop(user.id, None)
-            except Exception:
-                pass
         chat_id = query.message.chat_id if query.message else None
-        home_text = (
-            "🏠 *Home*\n\n"
-            "• 👀 My Watchlist\n"
-            "• 📌 My Stockpick\n"
-            "• 📊 Stock Snapshot\n"
-            "• 🔗 Group Links\n"
-            "• 📋 Menu\n"
-            "• 🏆 Stock of the Day\n"
-            "• 🙈 Hide"
-        )
-        # Prefer EDIT of the current inline panel → no stacked leftover body
-        edited = False
+        # Remove the inline panel (snapshot / sotd / stockpick / etc.)
         try:
-            await query.edit_message_text(
-                home_text,
-                parse_mode="Markdown",
-                reply_markup=None,
-            )
-            edited = True
-            if user and query.message:
-                await remember_nav_panel(user.id, query.message)
+            await query.message.delete()
         except Exception:
             try:
-                await query.message.delete()
+                await query.edit_message_text("…")
             except Exception:
                 pass
-        # Attach full 7-button reply keyboard (Telegram requires a real message)
-        if chat_id and context.bot:
-            try:
-                if edited:
-                    # Minimal anchor so keyboard sticks without a second long menu
-                    await context.bot.send_message(
-                        chat_id,
-                        "🏠",
-                        reply_markup=main_reply_keyboard(),
-                    )
-                else:
-                    await send_home_menu(context.bot, chat_id)
-            except Exception:
-                await ensure_home_keyboard(context.bot, chat_id)
+        # Must send a non-deleted message with ReplyKeyboardMarkup
+        # or Telegram clients drop the Home menu entirely
+        await send_home_menu(context.bot, chat_id)
         return
 
 
@@ -6155,10 +4844,6 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 )
             return
         try:
-            try:
-                _ticker_cache.pop(ticker, None)
-            except Exception:
-                pass
             meta = await get_ticker_from_notion(ticker)
             if not meta:
                 body = f"No snapshot for #{ticker} in UK AIM Micro-Cap."
@@ -6171,22 +4856,7 @@ async def watchlist_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 stockpickers = await get_stockpickers_for_ticker(ticker)
             except Exception:
                 stockpickers = []
-            rns_latest = None
-            rns_recent: list = []
-            try:
-                rns_recent = await get_recent_rns_for_ticker(
-                    ticker, limit=3, force=True
-                )
-                rns_latest = rns_recent[0] if rns_recent else None
-            except Exception:
-                pass
-            body = format_reply(
-                ticker,
-                meta,
-                stockpickers,
-                rns_latest=rns_latest,
-                rns_recent=rns_recent,
-            )
+            body = format_reply(ticker, meta, stockpickers)
             pct = meta.get("day_change_pct")
             if pct is None:
                 pct = _fetch_pct_on_day_live(ticker)
@@ -6707,6 +5377,14 @@ async def handle_watchlist_text(
             bits = []
             if removed:
                 bits.append("Removed: " + ", ".join(f"#{x}" for x in removed))
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist remove: {', '.join('#'+x for x in removed)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist remove history log failed: %s", le)
             if missing:
                 bits.append("Not found: " + ", ".join(f"#{x}" for x in missing))
             await _watchlist_finish_action(
@@ -6748,6 +5426,14 @@ async def handle_watchlist_text(
                     f"✅ Added ({len(added)}): "
                     + ", ".join(f"#{x}" for x in added)
                 )
+                try:
+                    await log_member_activity(
+                        user,
+                        REQUEST_TYPE_WATCHLIST,
+                        notes=f"Watchlist add: {', '.join('#'+x for x in added)}",
+                    )
+                except Exception as le:
+                    logger.warning("watchlist add history log failed: %s", le)
             if updated:
                 lines.append(
                     f"♻️ Updated ({len(updated)}): "
@@ -7461,28 +6147,7 @@ async def mark_group_member_in_notion(user, *, is_member: bool) -> None:
 REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
-REQUEST_TYPE_WATCHLIST = "My Watchlist"
-REQUEST_TYPE_SOTD = "Stock of the Day"
-REQUEST_TYPE_ACCESS = "Access request"
-REQUEST_TYPE_FOLLOW = "Follow stockpicker"
-
-# Preferred Notion "Request Type" select labels (add these on History DB)
-_HISTORY_TYPE_PREFERRED = {
-    REQUEST_TYPE_STOCKPICK: "Stockpick",
-    REQUEST_TYPE_SNAPSHOT: "Security snapshot",
-    REQUEST_TYPE_TG_LINK: "Telegram link",
-    REQUEST_TYPE_ACCESS: "Access request",
-    REQUEST_TYPE_WATCHLIST: "My Watchlist",
-    REQUEST_TYPE_SOTD: "Stock of the Day",
-    REQUEST_TYPE_FOLLOW: "Follow stockpicker",
-    "Stockpick": "Stockpick",
-    "Security snapshot": "Security snapshot",
-    "Telegram link": "Telegram link",
-    "Access request": "Access request",
-    "My Watchlist": "My Watchlist",
-    "Stock of the Day": "Stock of the Day",
-    "Follow stockpicker": "Follow stockpicker",
-}
+REQUEST_TYPE_WATCHLIST = "Other"
 
 
 async def append_request_history(
@@ -7494,8 +6159,6 @@ async def append_request_history(
 ) -> None:
     """
     Create a standalone row in Hive Bot Request History (one row per request).
-    If Notion select option is missing, falls back to \"Other\" and puts the
-    real type in Details so nothing is silently dropped.
     """
     if not user:
         return
@@ -7506,102 +6169,101 @@ async def append_request_history(
     if not ds_id and not db_id:
         return
 
-    notion_type = _HISTORY_TYPE_PREFERRED.get(
-        request_type, request_type if request_type else "Other"
-    )
-    detail_text = details or ""
-    # Always keep original label in details for audit
-    if request_type and request_type != notion_type:
-        detail_text = f"[{request_type}] {detail_text}".strip()
-    elif request_type:
-        detail_text = detail_text or request_type
+    # Map bot types → Notion select options
+    type_map = {
+        "Stockpick": "Stockpick",
+        "Security snapshot": "Security snapshot",
+        "Telegram link": "Telegram link",
+        "Access request": "Access request",
+        REQUEST_TYPE_STOCKPICK: "Stockpick",
+        REQUEST_TYPE_SNAPSHOT: "Security snapshot",
+        REQUEST_TYPE_TG_LINK: "Telegram link",
+    }
+    notion_type = type_map.get(request_type, request_type if request_type in {
+        "Stockpick", "Security snapshot", "Telegram link", "Access request", "Other"
+    } else "Other")
 
     now = datetime.now(timezone.utc)
-
-    def _props(type_label: str, detail: str) -> dict:
-        title = (
-            f"{type_label} · {user.full_name or user.id} · "
-            f"{now.strftime('%Y-%m-%d %H:%M')}"
-        )
-        p = {
-            "Request": {"title": [{"text": {"content": title[:100]}}]},
-            "Telegram User ID": {
-                "rich_text": [{"text": {"content": str(user.id)}}]
-            },
-            "Full Name": {
-                "rich_text": [
-                    {"text": {"content": (user.full_name or "Unknown")[:100]}}
-                ]
-            },
-            "Request Type": {"select": {"name": type_label}},
-            "Requested At": {
-                "date": {
-                    "start": now.isoformat().replace("+00:00", "Z"),
-                }
-            },
-            "Status": {
-                "select": {
-                    "name": status
-                    if status
-                    in {"Logged", "Pending", "Completed", "Denied"}
-                    else "Logged"
-                }
-            },
+    title = f"{notion_type} · {user.full_name or user.id} · {now.strftime('%Y-%m-%d %H:%M')}"
+    props = {
+        "Request": {"title": [{"text": {"content": title[:100]}}]},
+        "Telegram User ID": {
+            "rich_text": [{"text": {"content": str(user.id)}}]
+        },
+        "Full Name": {
+            "rich_text": [{"text": {"content": (user.full_name or "Unknown")[:100]}}]
+        },
+        "Request Type": {"select": {"name": notion_type}},
+        "Requested At": {
+            "date": {
+                "start": now.isoformat().replace("+00:00", "Z"),
+            }
+        },
+        "Status": {"select": {"name": status if status in {
+            "Logged", "Pending", "Completed", "Denied"
+        } else "Logged"}},
+    }
+    if user.username:
+        props["Username"] = {
+            "rich_text": [{"text": {"content": user.username[:100]}}]
         }
-        if user.username:
-            p["Username"] = {
-                "rich_text": [{"text": {"content": user.username[:100]}}]
-            }
-        if detail:
-            p["Details"] = {
-                "rich_text": [{"text": {"content": detail[:1800]}}]
-            }
-        return p
+    if details:
+        props["Details"] = {
+            "rich_text": [{"text": {"content": details[:1800]}}]
+        }
 
-    # Try preferred type, then Other (covers incomplete Notion select options)
-    for attempt_type, attempt_detail in (
-        (notion_type, detail_text),
-        (
-            "Other",
-            f"[{request_type}] {detail_text}".strip()
-            if request_type
-            else detail_text,
-        ),
-    ):
+    try:
+        notion_create_page_in_data_source(
+            properties=props,
+            data_source_id=ds_id,
+            database_id=db_id,
+        )
+        logger.info(
+            "Request history row created user=%s type=%s", user.id, notion_type
+        )
+    except Exception as e:
+        logger.error(
+            "append_request_history failed for %s type=%s ds=%s db=%s: %s",
+            user.id, notion_type, ds_id, db_id, e,
+        )
         try:
-            notion_create_page_in_data_source(
-                properties=_props(attempt_type, attempt_detail),
-                data_source_id=ds_id,
-                database_id=db_id,
-            )
-            logger.info(
-                "Request history row created user=%s type=%s",
-                user.id,
-                attempt_type,
-            )
-            return
-        except Exception as e:
-            logger.warning(
-                "append_request_history try type=%s failed for %s: %s",
-                attempt_type,
-                user.id,
-                e,
-            )
-    logger.error("append_request_history exhausted retries for %s", user.id)
+            if db_id and notion:
+                notion.pages.create(parent={"database_id": db_id}, properties=props)
+                logger.info(
+                    "Request history row created via fallback user=%s type=%s",
+                    user.id, notion_type,
+                )
+        except Exception as e2:
+            logger.error("append_request_history fallback failed: %s", e2)
 
 
 async def log_member_activity(
     user, request_type: str, *, notes: str | None = None
 ) -> None:
     """
-    Update Hive Bot Authorised Users with last request date/type and increment count.
-    Uses data-source API so multi-source Auth DB updates reliably.
+    Consistent Notion auto-sync on every request:
+      1) Always write Hive Bot Request History (source of truth)
+      2) Best-effort update Hive Bot Authorised Users (count / last request)
+
+    History must never depend on finding an Auth row.
     """
     if not user:
         return
     if not notion and not NOTION_TOKEN:
         return
 
+    # --- 1. Request History (always) ---
+    try:
+        await append_request_history(
+            user, request_type, details=notes, status="Logged"
+        )
+    except Exception as he:
+        logger.error(
+            "append_request_history failed for %s type=%s: %s",
+            user.id, request_type, he,
+        )
+
+    # --- 2. Auth row activity counters (best-effort) ---
     db_id = NOTION_AUTH_DB_ID_ENV or os.getenv("NOTION_AUTH_DB_ID") or os.getenv(
         "NOTION_DATABASE_ID"
     )
@@ -7610,18 +6272,29 @@ async def log_member_activity(
         return
 
     try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Telegram User ID",
-                "title": {"equals": str(user.id)},
-            },
-            page_size=1,
-        )
-        results = response.get("results", [])
+        results = []
+        for filt in (
+            {"property": "Telegram User ID", "title": {"equals": str(user.id)}},
+            {"property": "Telegram User ID", "rich_text": {"equals": str(user.id)}},
+        ):
+            try:
+                response = notion_query_data_source(
+                    data_source_id=ds_id,
+                    database_id=db_id,
+                    filter=filt,
+                    page_size=1,
+                )
+                results = response.get("results", [])
+                if results:
+                    break
+            except Exception as fe:
+                logger.warning("log_member_activity filter failed: %s", fe)
+
         if not results:
-            logger.info("log_member_activity: no auth row for user %s", user.id)
+            logger.info(
+                "log_member_activity: no auth row for user %s (history already written)",
+                user.id,
+            )
             return
 
         page = results[0]
@@ -7638,115 +6311,46 @@ async def log_member_activity(
         elif isinstance(count_prop, (int, float)):
             count = int(count_prop)
 
-        # Prefer exact type on Auth "Last Request Type" select; fall back
-        type_candidates = [
-            _HISTORY_TYPE_PREFERRED.get(request_type, request_type),
-            request_type,
-            "Other",
-        ]
-        # de-dupe preserve order
-        seen_t: set[str] = set()
-        type_candidates = [
-            t for t in type_candidates if t and not (t in seen_t or seen_t.add(t))
-        ]
+        type_for_auth = request_type
+        if request_type not in ("Stockpick", "Security snapshot", "Telegram link"):
+            type_for_auth = "Security snapshot"
 
-        updated = False
-        last_err = None
-        for type_label in type_candidates:
-            update_props: dict = {
-                "Last Request Date": {
-                    "date": {
-                        "start": datetime.now(timezone.utc).date().isoformat()
-                    }
-                },
-                "Last Request Type": {"select": {"name": type_label}},
-                "Request Count": {"number": count + 1},
+        update_props: dict = {
+            "Last Request Date": {
+                "date": {"start": datetime.now(timezone.utc).date().isoformat()}
+            },
+            "Last Request Type": {"select": {"name": type_for_auth}},
+            "Request Count": {"number": count + 1},
+        }
+        if notes:
+            update_props["Notes"] = {
+                "rich_text": [{"text": {"content": notes[:1800]}}]
             }
-            if notes:
-                update_props["Notes"] = {
-                    "rich_text": [{"text": {"content": notes[:1800]}}]
-                }
-            try:
-                if notion:
-                    notion.pages.update(
-                        page_id=page_id, properties=update_props
-                    )
-                else:
-                    _notion_http(
-                        "PATCH",
-                        f"pages/{page_id}",
-                        {"properties": update_props},
-                    )
-                updated = True
-                logger.info(
-                    "Logged activity user=%s type=%s (stored=%s) count=%s",
-                    user.id,
-                    request_type,
-                    type_label,
-                    count + 1,
-                )
-                break
-            except Exception as e:
-                last_err = e
-                logger.warning(
-                    "log_member_activity type=%s failed for %s: %s",
-                    type_label,
-                    user.id,
-                    e,
-                )
 
-        if not updated:
-            # Still bump date/count without select if select options incomplete
-            try:
-                bare = {
-                    "Last Request Date": {
-                        "date": {
-                            "start": datetime.now(timezone.utc)
-                            .date()
-                            .isoformat()
-                        }
-                    },
-                    "Request Count": {"number": count + 1},
-                }
-                if notes:
-                    bare["Notes"] = {
-                        "rich_text": [
-                            {
-                                "text": {
-                                    "content": (
-                                        f"[{request_type}] {notes}"
-                                    )[:1800]
-                                }
-                            }
-                        ]
-                    }
-                if notion:
-                    notion.pages.update(page_id=page_id, properties=bare)
-                else:
-                    _notion_http(
-                        "PATCH", f"pages/{page_id}", {"properties": bare}
-                    )
-                logger.info(
-                    "Logged activity (no type select) user=%s type=%s",
-                    user.id,
-                    request_type,
-                )
-            except Exception as e2:
-                logger.error(
-                    "log_member_activity bare update failed for %s: %s / %s",
-                    user.id,
-                    last_err,
-                    e2,
-                )
-
-        # Standalone history row (one row per request)
-        await append_request_history(
-            user, request_type, details=notes, status="Logged"
-        )
+        try:
+            if notion:
+                notion.pages.update(page_id=page_id, properties=update_props)
+            else:
+                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
+            logger.info(
+                "Logged activity user=%s type=%s count=%s",
+                user.id, request_type, count + 1,
+            )
+        except Exception as ue:
+            logger.warning(
+                "Auth update with type failed user=%s: %s – retrying without type",
+                user.id, ue,
+            )
+            update_props.pop("Last Request Type", None)
+            if notion:
+                notion.pages.update(page_id=page_id, properties=update_props)
+            else:
+                _notion_http("PATCH", f"pages/{page_id}", {"properties": update_props})
     except Exception as e:
-        logger.error("log_member_activity failed for %s: %s", user.id, e)
+        logger.error("log_member_activity auth update failed for %s: %s", user.id, e)
 
-        
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Error while handling update: %s", context.error)
 
@@ -7814,7 +6418,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
-    app.add_handler(CallbackQueryHandler(follow_button, pattern=r"^fol:"))
     app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
     app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
