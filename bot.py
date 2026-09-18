@@ -3448,63 +3448,114 @@ async def _load_microcap_tickers(limit: int | None = None) -> list[tuple[str, st
 async def _rank_tickers_by_live_pct(
     pairs: list[tuple[str, str]],
     *,
-    concurrency: int = 12,
+    concurrency: int = 20,
+    overall_timeout: float = 40.0,
 ) -> list[tuple[str, str, float]]:
     """
-    Fetch Yahoo session % for every ticker concurrently and return
-    only those with a live quote, sorted by % desc.
+    Fetch Yahoo session % concurrently; return quotes sorted by % desc.
+    Hard overall timeout so Daily Brief / SOTD never hangs for minutes.
     """
     if not pairs:
         return []
+    # Cap universe size for interactive boards
+    if len(pairs) > 150:
+        pairs = pairs[:150]
     sem = asyncio.Semaphore(max(1, concurrency))
     ranked: list[tuple[str, str, float]] = []
 
     async def _one(t: str, company: str) -> tuple[str, str, float] | None:
         async with sem:
-            pct = await asyncio.to_thread(_fetch_pct_on_day_live, t)
+            try:
+                pct = await asyncio.wait_for(
+                    asyncio.to_thread(_fetch_pct_on_day_live, t),
+                    timeout=5.0,
+                )
+            except Exception:
+                return None
         if pct is None:
             return None
         return (t, company, float(pct))
 
-    results = await asyncio.gather(
-        *[_one(t, c) for t, c in pairs],
-        return_exceptions=True,
-    )
-    for r in results:
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *[_one(t, c) for t, c in pairs],
+                return_exceptions=True,
+            ),
+            timeout=overall_timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "_rank_tickers_by_live_pct timed out after %.0fs (%d pairs)",
+            overall_timeout,
+            len(pairs),
+        )
+        results = []
+
+    for r in results or []:
         if isinstance(r, Exception):
-            logger.debug("rank fetch error: %s", r)
             continue
         if r is None:
             continue
         ranked.append(r)
     ranked.sort(key=lambda x: x[2], reverse=True)
+    logger.info(
+        "_rank_tickers_by_live_pct got %d quotes from %d pairs",
+        len(ranked),
+        len(pairs),
+    )
     return ranked
 
 
-
-async def _ensure_daily_brief_data(day: str) -> tuple[list[dict], list[tuple[str, str, float]]]:
-    """Load & cache today's ranked RNS + live % ranking for Daily Brief."""
+async def _ensure_daily_brief_rns(day: str) -> list[dict]:
+    """Load & cache today's ranked RNS only (fast — Notion only)."""
     rns = _daily_brief_rns.get(day)
-    if rns is None:
-        rows = await _load_rns_for_day(day)
-        # Rank by significance (same as Stock of the Day RNS)
-        ticker_counts: dict[str, int] = {}
-        for r in rows:
-            if r.get("ticker"):
-                ticker_counts[r["ticker"]] = ticker_counts.get(r["ticker"], 0) + 1
-        for r in rows:
-            t = r.get("ticker") or ""
-            if ticker_counts.get(t, 0) >= 2:
-                r["score"] = min(100.0, float(r.get("score") or 0) + 5)
-        rows.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
-        rns = rows
-        _daily_brief_rns[day] = rns
+    if rns is not None:
+        return rns
+    rows = await _load_rns_for_day(day)
+    ticker_counts: dict[str, int] = {}
+    for r in rows:
+        if r.get("ticker"):
+            ticker_counts[r["ticker"]] = ticker_counts.get(r["ticker"], 0) + 1
+    for r in rows:
+        t = r.get("ticker") or ""
+        if ticker_counts.get(t, 0) >= 2:
+            r["score"] = min(100.0, float(r.get("score") or 0) + 5)
+    rows.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
+    _daily_brief_rns[day] = rows
+    return rows
 
+
+async def _ensure_daily_brief_pct(day: str) -> list[tuple[str, str, float]]:
+    """
+    Load & cache session % ranking (slower — Yahoo).
+    Only call when user opens Performers, not on Daily Brief open.
+    """
     pct = _daily_brief_pct.get(day)
-    if pct is None:
-        pairs = await _load_microcap_tickers(limit=None)
-        pct = await _rank_tickers_by_live_pct(pairs, concurrency=12) if pairs else []
-        _daily_brief_pct[day] = pct
+    if pct is not None:
+        return pct
+    # Cap at 120 names so board loads in ~15–30s not 5+ minutes
+    pairs = await _load_microcap_tickers(limit=120)
+    pct = (
+        await _rank_tickers_by_live_pct(
+            pairs, concurrency=20, overall_timeout=35.0
+        )
+        if pairs
+        else []
+    )
+    _daily_brief_pct[day] = pct
+    return pct
+
+
+async def _ensure_daily_brief_data(
+    day: str,
+) -> tuple[list[dict], list[tuple[str, str, float]]]:
+    """
+    Back-compat: RNS always; % only if already cached (else empty list).
+    Prefer _ensure_daily_brief_rns / _ensure_daily_brief_pct separately.
+    """
+    rns = await _ensure_daily_brief_rns(day)
+    pct = _daily_brief_pct.get(day) or []
     return rns, pct
 
 
@@ -3690,9 +3741,8 @@ async def daily_brief_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Daily Brief:
-      1) Top News from Hive RNS News Log (pages of 5)
-      2) Top / Bottom session % performers (pages of 5)
+    Daily Brief opens on Top News only (fast Notion query).
+    Live % performers load only when user taps Performers.
     """
     user = update.effective_user
     msg = update.effective_message
@@ -3711,14 +3761,15 @@ async def daily_brief_cmd(
 
     day = datetime.now(timezone.utc).date().isoformat()
     status = await msg.reply_text(
-        "📰 *Daily Brief*\n\nLoading today’s RNS + live %…",
+        "📰 *Daily Brief*\n\nLoading today’s RNS News Log…",
         parse_mode="Markdown",
         reply_markup=main_reply_keyboard(),
     )
     await remember_nav_panel(user.id if user else None, status)
 
     try:
-        rns, _pct = await _ensure_daily_brief_data(day)
+        # News only — do NOT rank Yahoo here (that was the 5+ min hang)
+        rns = await _ensure_daily_brief_rns(day)
         text, markup = _format_daily_brief_news(day, rns, page=0)
         try:
             await status.edit_text(
@@ -3764,24 +3815,37 @@ async def daily_brief_button(
         return
 
     day = datetime.now(timezone.utc).date().isoformat()
-    await query.answer()
 
-    try:
-        rns, pct = await _ensure_daily_brief_data(day)
-    except Exception as e:
-        await query.answer(f"Load failed: {e}", show_alert=True)
-        return
-
-    text = ""
-    markup = None
+    # News pages — fast
     if data.startswith("brief:news:"):
+        await query.answer()
         try:
             page = int(data.split(":")[-1])
         except ValueError:
             page = 0
+        rns = await _ensure_daily_brief_rns(day)
         text, markup = _format_daily_brief_news(day, rns, page)
-    elif data.startswith("brief:pct:"):
-        # brief:pct:both:0 | brief:pct:top:0 | brief:pct:bot:1
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("daily_brief news edit failed: %s", e)
+        await remember_nav_panel(user.id, query.message)
+        return
+
+    # Performers — load Yahoo ranking only now (with progress + timeout)
+    if data.startswith("brief:pct:"):
         parts = data.split(":")
         board = parts[2] if len(parts) > 2 else "both"
         try:
@@ -3790,12 +3854,75 @@ async def daily_brief_button(
             page = 0
         if board not in ("both", "top", "bot"):
             board = "both"
+
+        cached = _daily_brief_pct.get(day)
+        if cached is None:
+            await query.answer("Loading live %…")
+            try:
+                await query.edit_message_text(
+                    "📈📉 *Session performers*\n\n"
+                    "Fetching live day-% for AIM Micro-Cap "
+                    "(up to ~30s, then results)…",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            try:
+                pct = await _ensure_daily_brief_pct(day)
+            except Exception as e:
+                logger.error("daily brief pct load failed: %s", e)
+                try:
+                    await query.edit_message_text(
+                        f"Could not load performers: {e}\n\n"
+                        "Try again or open Stock of the Day → % Today.",
+                        reply_markup=InlineKeyboardMarkup(
+                            [
+                                [
+                                    InlineKeyboardButton(
+                                        "📰 News",
+                                        callback_data="brief:news:0",
+                                    )
+                                ],
+                                [
+                                    InlineKeyboardButton(
+                                        "« Hub", callback_data="hub:home"
+                                    )
+                                ],
+                            ]
+                        ),
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            await query.answer()
+            pct = cached
+
         text, markup = _format_daily_brief_pct(
             day, pct, board=board, page=page
         )
-    else:
-        text, markup = _format_daily_brief_news(day, rns, 0)
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    text.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("daily_brief pct edit failed: %s", e)
+        await remember_nav_panel(user.id, query.message)
+        return
 
+    await query.answer()
+    rns = await _ensure_daily_brief_rns(day)
+    text, markup = _format_daily_brief_news(day, rns, 0)
     try:
         await query.edit_message_text(
             text,
@@ -3804,14 +3931,7 @@ async def daily_brief_button(
             disable_web_page_preview=True,
         )
     except Exception:
-        try:
-            await query.edit_message_text(
-                text.replace("*", "").replace("_", ""),
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.warning("daily_brief_button edit failed: %s", e)
+        pass
     await remember_nav_panel(user.id, query.message)
 
 
@@ -3891,10 +4011,11 @@ async def stock_of_the_day_pct(
             except Exception:
                 pass
 
-    await _set("🏆 Scanning full AIM list for live session %…")
+    await _set("🏆 Scanning AIM list for live session %…")
 
     try:
-        pairs = await _load_microcap_tickers(limit=None)
+        # Cap + timeout — full universe Yahoo scan was hanging 5+ minutes
+        pairs = await _load_microcap_tickers(limit=150)
         if not pairs:
             await _set(
                 "🏆 *Stock of the Day — % Today*\n\n"
@@ -3903,7 +4024,9 @@ async def stock_of_the_day_pct(
             return
 
         await _set(f"🏆 Scanning *{len(pairs)}* AIM names for live session %…")
-        ranked = await _rank_tickers_by_live_pct(pairs, concurrency=12)
+        ranked = await _rank_tickers_by_live_pct(
+            pairs, concurrency=20, overall_timeout=40.0
+        )
         top = ranked[:5]
         quoted = len(ranked)
 
@@ -3917,7 +4040,7 @@ async def stock_of_the_day_pct(
 
         lines = [
             "🏆 *Stock of the Day — % Today*",
-            "_Top movers by session % (full UK AIM Micro-Cap)_",
+            "_Top movers by session % (UK AIM Micro-Cap sample)_",
             f"_Scanned {len(pairs)} · {quoted} with live Yahoo quotes_",
             "",
         ]
