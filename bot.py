@@ -21,6 +21,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telegram.ext import (
@@ -1121,17 +1122,32 @@ async def require_authorized(
     else:
         reason_lines.append("Send /request for access, then /status to check.")
 
-    reason_lines.append("\nUse /status anytime to see your current checks.")
+    reason_lines.append("\nOpen a *private chat* with me and send /request or /status.")
+    body = "\n".join(reason_lines)
+    plain = (
+        "Access denied. Hive group member + Authorised in Notion required. "
+        "Open private chat: /request and /status."
+    )
+    if not _is_private(update):
+        try:
+            await cleanup_trigger_message(update, context)
+        except Exception:
+            pass
+        if user:
+            try:
+                await context.bot.send_message(user.id, body, parse_mode="Markdown")
+            except Exception:
+                try:
+                    await context.bot.send_message(user.id, plain)
+                except Exception:
+                    pass
+        return False
     try:
         await msg.reply_text(
-            "\n".join(reason_lines),
-            parse_mode="Markdown",
+            body, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
         )
     except Exception:
-        await msg.reply_text(
-            "Access denied. You must be a Hive group member and Authorised in Notion. "
-            "Send /request and /status."
-        )
+        await msg.reply_text(plain, reply_markup=ReplyKeyboardRemove())
     return False
 
 
@@ -2131,14 +2147,39 @@ def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
+async def ensure_home_keyboard(
+    bot,
+    chat_id: int | None,
+    *,
+    chat_type: str | None = None,
+    update: "Update | None" = None,
+    authorised: bool | None = None,
+) -> None:
     """
-    Re-assert the persistent Home reply keyboard.
+    Re-assert Home reply keyboard — *private authorised chats only*.
 
-    Never delete the message that carries ReplyKeyboardMarkup — many Telegram
-    clients drop the keyboard when that message is removed.
+    Never show the menu keyboard in groups/supergroups/channels.
     """
     if not bot or chat_id is None:
+        return
+    # Resolve chat type
+    ctype = chat_type
+    if ctype is None and update is not None and update.effective_chat:
+        ctype = update.effective_chat.type
+    if (ctype and ctype != "private") or (
+        ctype is None and isinstance(chat_id, int) and chat_id < 0
+    ):
+        try:
+            pulse = await bot.send_message(
+                chat_id,
+                "​",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await safe_delete_message(bot, chat_id, pulse.message_id)
+        except Exception as e:
+            logger.debug("group keyboard strip failed: %s", e)
+        return
+    if authorised is False:
         return
     try:
         await bot.send_message(
@@ -2150,12 +2191,13 @@ async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
         logger.debug("ensure_home_keyboard failed: %s", e)
 
 
-async def send_home_menu(bot, chat_id: int | None) -> None:
+async def send_home_menu(bot, chat_id: int | None, *, chat_type: str | None = None) -> None:
     """
-    Land on Home with the full 7-button reply keyboard.
-    Message is kept on purpose so the keyboard stays visible.
+    Land on Home with the full reply keyboard — private chats only.
     """
     if not bot or chat_id is None:
+        return
+    if chat_type and chat_type != "private":
         return
     text = (
         "🏠 *Home*\n\n"
@@ -2177,33 +2219,18 @@ async def send_home_menu(bot, chat_id: int | None) -> None:
         )
     except Exception as e:
         logger.error("send_home_menu failed: %s", e)
-        try:
-            await bot.send_message(
-                chat_id,
-                "Home",
-                reply_markup=main_reply_keyboard(),
-            )
-        except Exception:
-            pass
 
 
-def menu_inline_keyboard() -> InlineKeyboardMarkup:
-    """Simplified Menu – access + help only."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("🏠 Start", callback_data="cmd:start"),
-                InlineKeyboardButton("🔐 Status", callback_data="cmd:status"),
-            ],
-            [
-                InlineKeyboardButton("📨 Request access", callback_data="cmd:request"),
-                InlineKeyboardButton("❓ FAQ", callback_data="cmd:faq"),
-            ],
-            [
-                InlineKeyboardButton("« Hub", callback_data="hub:home"),
-            ],
-        ]
-    )
+def home_markup_for(update: Update | None, *, authorised: bool = True):
+    """Reply keyboard only in private chat for authorised users; never in groups."""
+    if update is None:
+        return main_reply_keyboard() if authorised else ReplyKeyboardRemove()
+    if not _is_private(update):
+        return ReplyKeyboardRemove()
+    if not authorised:
+        return ReplyKeyboardRemove()
+    return main_reply_keyboard()
+
 
 
 def hub_back_keyboard() -> InlineKeyboardMarkup:
@@ -2492,6 +2519,34 @@ def hub_home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+
+async def group_silent_or_ephemeral(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    delete_after: float = 0.0,
+    parse_mode: str | None = None,
+) -> None:
+    """
+    Group footprint control: by default do not post.
+    If delete_after > 0, post then delete (needs bot delete rights).
+    """
+    if delete_after <= 0:
+        return
+    try:
+        sent = await context.bot.send_message(
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await asyncio.sleep(min(delete_after, 3.0))
+        await safe_delete_message(context.bot, sent.chat_id, sent.message_id)
+    except Exception as e:
+        logger.debug("group_silent_or_ephemeral failed: %s", e)
+
+
 def _is_private(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type == "private")
@@ -2512,12 +2567,9 @@ async def safe_delete_message(
 
 
 async def cleanup_trigger_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove the user's button/command message so the chat stays clean."""
+    """Remove the user's button/command message so the chat stays clean (groups too)."""
     msg = update.effective_message or update.message
     if not msg or not context or not context.bot:
-        return
-    # Prefer private chats (always allowed for bot↔user)
-    if not _is_private(update) and not is_admin(update.effective_user):
         return
     await safe_delete_message(context.bot, msg.chat_id, msg.message_id)
 
@@ -3549,7 +3601,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 1. #stockpick capture
     if "#stockpick" in clean_lower:
-        if not await require_authorized(update, context):
+        in_private = _is_private(update)
+        chat_id = update.effective_chat.id if update.effective_chat else None
+
+        if not await is_authorized(update, context):
+            # No group footprint — nudge in DM only
+            await cleanup_trigger_message(update, context)
+            if user and not in_private:
+                try:
+                    await context.bot.send_message(
+                        user.id,
+                        "🔒 To log a #stockpick you need bot access.\n"
+                        "Open me in private chat and send /request.",
+                    )
+                except Exception:
+                    pass
+            elif in_private:
+                await context.bot.send_message(
+                    chat_id,
+                    "🔒 Not authorised yet. Send /request to ask for access.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
             return
 
         if await has_submitted_this_month(user):
@@ -3559,35 +3631,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 page_id = await find_this_month_stockpick_page(user)
                 if page_id:
                     _last_stockpick_page[user.id] = page_id
-
-            keyboard = [
-                [
-                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
-                ],
-                [
-                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
-                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
-                ],
-            ]
             await cleanup_trigger_message(update, context)
-            chat_id = update.effective_chat.id if update.effective_chat else None
-            if chat_id:
+            note = (
+                f"⚠️ You already submitted a #stockpick for *{month_name}*.\n"
+                "Open 📌 *My Stockpick* in private chat to add details or change it."
+            )
+            if in_private:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                        InlineKeyboardButton(
+                            "Next Catalyst", callback_data="sp:Next Catalyst"
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Target Price", callback_data="sp:Target Price"
+                        ),
+                        InlineKeyboardButton(
+                            "Change my stockpick", callback_data="sp:Change"
+                        ),
+                    ],
+                ]
                 sent = await context.bot.send_message(
                     chat_id,
-                    f"⚠️ You already submitted a #stockpick for *{month_name}*.\n"
-                    "One pick per month — add details or change it:",
+                    note,
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
                 await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(context.bot, chat_id)
+                await ensure_home_keyboard(
+                    context.bot, chat_id, chat_type="private", authorised=True
+                )
+            else:
+                # Group: zero footprint; DM the member
+                try:
+                    await context.bot.send_message(
+                        user.id, note, parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
             return
 
         user_name = user.full_name if user else "Unknown"
         tickers = extract_hashtag_tickers(clean_text)
-        ticker = tickers[0] if tickers else None
+        ticker = None
+        skip = set(MONTH_HASHTAGS.keys()) | {"stockpick", "stockpicks", "hive", "aim"}
+        for t in tickers:
+            if t.lower() not in skip:
+                ticker = t
+                break
         period_type, period_value = extract_period(clean_text)
+        if not period_value:
+            period_type, period_value = (
+                "Monthly",
+                datetime.now(timezone.utc).strftime("%B"),
+            )
 
         page_id, save_error = await save_stockpick_to_notion(
             clean_text,
@@ -3598,35 +3697,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             user_id=user.id if user else None,
         )
 
-        # Wipe the user's #stockpick message for a clean chat
+        # Remove the group/private trigger message immediately
         await cleanup_trigger_message(update, context)
-        await clear_nav_panel(context.bot, user.id if user else None)
-        chat_id = update.effective_chat.id if update.effective_chat else None
+        if user:
+            await clear_nav_panel(context.bot, user.id)
 
         if page_id:
             _last_stockpick_page[user.id] = page_id
-            await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
+            try:
+                await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
+            except Exception:
+                pass
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
             if period_type and period_value:
                 reply += f"\n📅 {period_type}: *{period_value}*"
-            reply += "\nSaved. Expand *My pick this month* to add details."
+            reply += "\nSaved to Notion. Open *My Stockpick* in private chat for details."
 
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "✏️ My pick this month ▾", callback_data="msp:ui_mine"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "📌 Open My Stockpick", callback_data="hub:mypicks"
-                    )
-                ],
-                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-            ]
-            if chat_id:
+            if in_private:
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            "✏️ My pick this month ▾", callback_data="msp:ui_mine"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📌 Open My Stockpick", callback_data="hub:mypicks"
+                        )
+                    ],
+                    [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+                ]
                 sent = await context.bot.send_message(
                     chat_id,
                     reply,
@@ -3634,15 +3736,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
                 await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(context.bot, chat_id)
-        else:
-            if chat_id:
-                await context.bot.send_message(
-                    chat_id,
-                    "Could not save your #stockpick right now.\n"
-                    f"Error: {save_error or 'unknown'}",
-                    reply_markup=main_reply_keyboard(),
+                await ensure_home_keyboard(
+                    context.bot, chat_id, chat_type="private", authorised=True
                 )
+            else:
+                # Group: no reply in group — confirm in DM only
+                try:
+                    await context.bot.send_message(
+                        user.id,
+                        reply,
+                        parse_mode="Markdown",
+                        reply_markup=main_reply_keyboard(),
+                    )
+                except Exception:
+                    logger.info(
+                        "Could not DM stockpick confirm to user %s",
+                        user.id if user else None,
+                    )
+        else:
+            err = f"Could not save your #stockpick right now.\nError: {save_error or 'unknown'}"
+            if in_private and chat_id:
+                await context.bot.send_message(
+                    chat_id, err, reply_markup=main_reply_keyboard()
+                )
+            elif user:
+                try:
+                    await context.bot.send_message(user.id, err)
+                except Exception:
+                    pass
         return
 
     # 2. Ticker lookup (snapshot / summary) – authorised only
@@ -3726,18 +3847,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Remove /start (or Start button text) so only the welcome stays
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
+    markup = main_reply_keyboard() if authorised else ReplyKeyboardRemove()
+    if chat and chat.type != "private":
+        # Never surface menu or long greetings in groups
+        return
     if chat:
         await context.bot.send_message(
             chat_id=chat.id,
             text=text,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=markup,
         )
     elif update.message:
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=markup,
         )
 
 
