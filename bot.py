@@ -11,7 +11,7 @@ import re
 import asyncio
 import time
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from notion_client import Client
@@ -21,7 +21,6 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     KeyboardButton,
 )
 from telegram.ext import (
@@ -231,9 +230,8 @@ _awaiting_field: dict[int, str] = {}
 _awaiting_watchlist: dict[int, str] = {}
 # user_id -> True while waiting for link search query
 _awaiting_link: dict[int, bool] = {}
-# user_id -> waiting for ticker input after Stock Brief button
+# user_id -> waiting for ticker input after Stock Snapshot button
 _awaiting_snapshot: dict[int, bool] = {}
-_awaiting_backfill: dict[int, bool] = {}  # admin paste/forward stockpick backfill
 # admin_id -> Group Links request they are fulfilling (paste URL next)
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
@@ -1122,32 +1120,17 @@ async def require_authorized(
     else:
         reason_lines.append("Send /request for access, then /status to check.")
 
-    reason_lines.append("\nOpen a *private chat* with me and send /request or /status.")
-    body = "\n".join(reason_lines)
-    plain = (
-        "Access denied. Hive group member + Authorised in Notion required. "
-        "Open private chat: /request and /status."
-    )
-    if not _is_private(update):
-        try:
-            await cleanup_trigger_message(update, context)
-        except Exception:
-            pass
-        if user:
-            try:
-                await context.bot.send_message(user.id, body, parse_mode="Markdown")
-            except Exception:
-                try:
-                    await context.bot.send_message(user.id, plain)
-                except Exception:
-                    pass
-        return False
+    reason_lines.append("\nUse /status anytime to see your current checks.")
     try:
         await msg.reply_text(
-            body, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
+            "\n".join(reason_lines),
+            parse_mode="Markdown",
         )
     except Exception:
-        await msg.reply_text(plain, reply_markup=ReplyKeyboardRemove())
+        await msg.reply_text(
+            "Access denied. You must be a Hive group member and Authorised in Notion. "
+            "Send /request and /status."
+        )
     return False
 
 
@@ -1266,7 +1249,6 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             return None
 
         data = {
-            "page_id": results[0].get("id"),
             "company": find_prop("Company", "Name", "Company Name"),
             "summary": find_prop(
                 "Summary & Next Catalyst", "Summary", "Overview", "Thesis"
@@ -1274,17 +1256,6 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
             "red_flags": find_prop("Red Flags", "Risks", "Red Flag", "Key Risks"),
             "company_overview": find_prop("Company Overview", "Investment Thesis"),
             "status": find_prop("Status"),
-            "next_catalyst": find_prop(
-                "Next Catalyst", "Catalyst", "Next catalyst"
-            ),
-            "catalyst_score": find_number(
-                "Catalyst Score",
-                "Next Catalyst Score",
-                "Contract Win Score",
-                "Weighted Total",
-            ),
-            "last_rns": find_prop("Last 3 RNS", "Last RNS", "Latest RNS"),
-            "last_rns_date": None,
             "day_change_pct": find_number(
                 "Day Change %",
                 "% Change",
@@ -1295,11 +1266,6 @@ async def get_ticker_from_notion(ticker: str) -> dict | None:
                 "Change",
             ),
         }
-        for dname in ("Last RNS Date", "Last RNS", "RNS Date"):
-            dp = props.get(dname) or {}
-            if isinstance(dp, dict) and dp.get("type") == "date" and dp.get("date"):
-                data["last_rns_date"] = (dp["date"].get("start") or "")[:10]
-                break
 
         _ticker_cache[ticker] = {
             "data": data,
@@ -1466,105 +1432,6 @@ async def save_stockpick_to_notion(
         logger.error("Failed to write #stockpick to Notion: %s", msg)
         return None, msg
 
-async def already_have_stockpick_message(
-    user_id: int | None, ticker: str | None, message_text: str
-) -> bool:
-    """
-    Dedup: same user + ticker + similar message already in Hive Stock Picks
-    in the last 7 days.
-    """
-    if not notion:
-        return False
-    db_id = (
-        os.getenv("NOTION_STOCKPICKS_DB_ID")
-        or os.getenv("NOTION_DATABASE_ID")
-        or "9095ded4ad6a4b25988719a77baba12f"
-    )
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
-        resp = notion.databases.query(
-            database_id=db_id,
-            filter={"property": "Telegram Date", "date": {"on_or_after": since}},
-            page_size=100,
-        )
-        needle = (message_text or "").strip().lower()[:120]
-        t = (ticker or "").upper()
-        uid_marker = f"uid:{user_id}" if user_id else None
-        for page in resp.get("results", []):
-            props = page.get("properties") or {}
-            notes = _get_plain_text(props.get("Notes")).lower()
-            msg = _get_plain_text(props.get("Message")).strip().lower()
-            row_t = _get_plain_text(props.get("Ticker")).upper().strip()
-            if t and row_t and row_t != t:
-                continue
-            if uid_marker and uid_marker in notes and needle and needle[:80] in msg:
-                return True
-            if needle and needle[:100] and needle[:100] in msg and (not t or row_t == t):
-                return True
-        return False
-    except Exception as e:
-        logger.warning("already_have_stockpick_message failed: %s", e)
-        return False
-
-
-async def capture_stockpick_from_text(
-    *,
-    text: str,
-    user_name: str,
-    user_id: int | None,
-    skip_month_limit: bool = False,
-) -> tuple[str | None, str | None, str | None]:
-    """
-    Core capture used by live group posts and admin backfill.
-    Returns (page_id, ticker, error_or_status).
-    """
-    clean = (text or "").strip()
-    if "#stockpick" not in clean.lower():
-        return None, None, "no_stockpick_tag"
-    tickers = extract_hashtag_tickers(clean)
-    # Prefer non-month, non-generic tags
-    ticker = None
-    skip = set(MONTH_HASHTAGS.keys()) | {
-        "stockpick", "stockpicks", "hive", "aim"
-    }
-    for t in tickers:
-        if t.lower() in skip:
-            continue
-        ticker = t
-        break
-    if not ticker and tickers:
-        # last resort: first tag that isn't stockpick
-        for t in tickers:
-            if t.lower() != "stockpick":
-                ticker = t
-                break
-    if not ticker:
-        return None, None, "missing_ticker"
-    if await already_have_stockpick_message(user_id, ticker, clean):
-        return None, ticker, "duplicate"
-    if not skip_month_limit and user_id:
-        # Lightweight month check using existing helper needs a user-like object
-        pass
-    period_type, period_value = extract_period(clean)
-    # Default period to current month if none tagged
-    if not period_value:
-        period_type, period_value = (
-            "Monthly",
-            datetime.now(timezone.utc).strftime("%B"),
-        )
-    page_id, err = await save_stockpick_to_notion(
-        clean,
-        user_name,
-        ticker,
-        period_type,
-        period_value,
-        user_id=user_id,
-    )
-    if page_id:
-        return page_id, ticker, None
-    return None, ticker, err or "save_failed"
-
-
 async def has_submitted_this_month(user) -> bool:
     """
     Return True if this Telegram user already has a #stockpick
@@ -1639,7 +1506,6 @@ MONTH_HASHTAGS = {
     "august": "August", "aug": "August",
     "september": "September", "sep": "September", "sept": "September",
     "october": "October", "oct": "October",
-    "octobee": "October", "octoberbee": "October", "octbee": "October",
     "november": "November", "nov": "November",
     "december": "December", "dec": "December",
 }
@@ -1950,27 +1816,17 @@ async def get_latest_rns_for_ticker(
             return cached
 
     try:
-        results = []
-        filters_to_try = [
-            {"property": "Ticker", "rich_text": {"equals": t}},
-            {"property": "Ticker", "rich_text": {"equals": f"#{t}"}},
-            {"property": "Ticker", "title": {"equals": t}},
-            {"property": "Ticker", "rich_text": {"contains": t}},
-        ]
-        for f in filters_to_try:
-            try:
-                response = notion_query_data_source(
-                    data_source_id=ds_id,
-                    database_id=db_id,
-                    filter=f,
-                    sorts=[{"property": "RNS Date", "direction": "descending"}],
-                    page_size=5,
-                )
-                results = response.get("results", [])
-                if results:
-                    break
-            except Exception as fe:
-                logger.debug("RNS filter %s failed: %s", f, fe)
+        response = notion_query_data_source(
+            data_source_id=ds_id,
+            database_id=db_id,
+            filter={
+                "property": "Ticker",
+                "rich_text": {"equals": t},
+            },
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=3,
+        )
+        results = response.get("results", [])
         # Prefer exact ticker match (case-insensitive)
         best = None
         for page in results:
@@ -2107,8 +1963,7 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """
     Home navigation – always-on persistent reply keyboard.
-    Buttons: Watchlist, Stockpick, Stock Brief, Group Links,
-    Top 10, RNS Brief, Menu, Hide.
+    Stays visible after /start and after every menu selection.
     """
     return ReplyKeyboardMarkup(
         [
@@ -2117,7 +1972,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("📌 My Stockpick"),
             ],
             [
-                KeyboardButton("📊 Stock Brief"),
+                KeyboardButton("📊 Stock Snapshot"),
                 KeyboardButton("🔗 Group Links"),
             ],
             [
@@ -2147,39 +2002,14 @@ def hidden_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-async def ensure_home_keyboard(
-    bot,
-    chat_id: int | None,
-    *,
-    chat_type: str | None = None,
-    update: "Update | None" = None,
-    authorised: bool | None = None,
-) -> None:
+async def ensure_home_keyboard(bot, chat_id: int | None) -> None:
     """
-    Re-assert Home reply keyboard — *private authorised chats only*.
+    Re-assert the persistent Home reply keyboard.
 
-    Never show the menu keyboard in groups/supergroups/channels.
+    Never delete the message that carries ReplyKeyboardMarkup — many Telegram
+    clients drop the keyboard when that message is removed.
     """
     if not bot or chat_id is None:
-        return
-    # Resolve chat type
-    ctype = chat_type
-    if ctype is None and update is not None and update.effective_chat:
-        ctype = update.effective_chat.type
-    if (ctype and ctype != "private") or (
-        ctype is None and isinstance(chat_id, int) and chat_id < 0
-    ):
-        try:
-            pulse = await bot.send_message(
-                chat_id,
-                "​",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            await safe_delete_message(bot, chat_id, pulse.message_id)
-        except Exception as e:
-            logger.debug("group keyboard strip failed: %s", e)
-        return
-    if authorised is False:
         return
     try:
         await bot.send_message(
@@ -2191,22 +2021,21 @@ async def ensure_home_keyboard(
         logger.debug("ensure_home_keyboard failed: %s", e)
 
 
-async def send_home_menu(bot, chat_id: int | None, *, chat_type: str | None = None) -> None:
+async def send_home_menu(bot, chat_id: int | None) -> None:
     """
-    Land on Home with the full reply keyboard — private chats only.
+    Land on Home with the full 7-button reply keyboard.
+    Message is kept on purpose so the keyboard stays visible.
     """
     if not bot or chat_id is None:
-        return
-    if chat_type and chat_type != "private":
         return
     text = (
         "🏠 *Home*\n\n"
         "• 👀 My Watchlist\n"
         "• 📌 My Stockpick\n"
-        "• 📊 Stock Brief — summary, catalyst & RNS\n"
+        "• 📊 Stock Snapshot\n"
         "• 🔗 Group Links\n"
-        "• 📈 Top 10 — session movers\n"
-        "• 📰 RNS Brief — significant RNS today\n"
+        "• 🏆 Stock of the Day\n"
+        "• 📰 Daily Brief\n"
         "• 📋 Menu\n"
         "• 🙈 Hide"
     )
@@ -2219,18 +2048,33 @@ async def send_home_menu(bot, chat_id: int | None, *, chat_type: str | None = No
         )
     except Exception as e:
         logger.error("send_home_menu failed: %s", e)
+        try:
+            await bot.send_message(
+                chat_id,
+                "Home",
+                reply_markup=main_reply_keyboard(),
+            )
+        except Exception:
+            pass
 
 
-def home_markup_for(update: Update | None, *, authorised: bool = True):
-    """Reply keyboard only in private chat for authorised users; never in groups."""
-    if update is None:
-        return main_reply_keyboard() if authorised else ReplyKeyboardRemove()
-    if not _is_private(update):
-        return ReplyKeyboardRemove()
-    if not authorised:
-        return ReplyKeyboardRemove()
-    return main_reply_keyboard()
-
+def menu_inline_keyboard() -> InlineKeyboardMarkup:
+    """Simplified Menu – access + help only."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🏠 Start", callback_data="cmd:start"),
+                InlineKeyboardButton("🔐 Status", callback_data="cmd:status"),
+            ],
+            [
+                InlineKeyboardButton("📨 Request access", callback_data="cmd:request"),
+                InlineKeyboardButton("❓ FAQ", callback_data="cmd:faq"),
+            ],
+            [
+                InlineKeyboardButton("« Hub", callback_data="hub:home"),
+            ],
+        ]
+    )
 
 
 def hub_back_keyboard() -> InlineKeyboardMarkup:
@@ -2240,250 +2084,22 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def brief_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
-    """
-    Stock Brief panel (as designed):
-      Row 1: Stock Summary (primary)
-      Row 2: Snap Shot | RNS News | « Hub
-    Snap Shot = Catalyst Score + Next Catalyst only.
-    """
+def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    """Inline actions under a company snapshot."""
     t = (ticker or "").upper()[:20]
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "📋 Stock Summary",
-                    callback_data=f"sbrief:sum:{t}",
+                    "➕ Save to My Watchlist",
+                    callback_data=f"snap:save:{t}",
                 )
             ],
             [
-                InlineKeyboardButton(
-                    "⚡ Snap Shot",
-                    callback_data=f"sbrief:cat:{t}",
-                ),
-                InlineKeyboardButton(
-                    "📰 RNS News",
-                    callback_data=f"sbrief:rns:{t}:0",
-                ),
                 InlineKeyboardButton("« Hub", callback_data="hub:home"),
             ],
         ]
     )
-
-
-def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
-    """Back-compat alias → Stock Brief keyboard."""
-    return brief_action_keyboard(ticker)
-
-
-async def sync_microcap_with_latest_rns(ticker: str) -> dict | None:
-    """
-    Pull latest RNS for ticker from Hive RNS News Log and update
-    UK AIM Micro-Cap (Last RNS Date + Last 3 RNS head).
-    """
-    t = (ticker or "").lstrip("#").upper().strip()
-    if not t:
-        return None
-    latest = await get_latest_rns_for_ticker(t, force=True)
-    if not latest:
-        return None
-    meta = await get_ticker_from_notion(t)
-    page_id = (meta or {}).get("page_id")
-    if not page_id or not (notion or NOTION_TOKEN):
-        return latest
-    title = latest.get("title") or "RNS"
-    date_str = latest.get("date") or ""
-    summary = (latest.get("summary") or "")[:500]
-    link = latest.get("link") or ""
-    head = f"• {date_str} | {title}"
-    if summary:
-        head += f"\n  {summary[:220]}"
-    if link:
-        head += f"\n  {link}"
-    old_last = (meta or {}).get("last_rns") or ""
-    blocks = [b.strip() for b in old_last.split("• ") if b.strip()]
-    new_blocks = [head.lstrip("• ").strip()]
-    for b in blocks:
-        if title.lower() in b.lower() and (not date_str or date_str in b):
-            continue
-        new_blocks.append(b)
-        if len(new_blocks) >= 3:
-            break
-    last3 = "\n\n".join(f"• {b}" for b in new_blocks)
-    props: dict = {}
-    if date_str:
-        props["Last RNS Date"] = {"date": {"start": date_str}}
-    props["Last 3 RNS"] = {"rich_text": [{"text": {"content": last3[:1900]}}]}
-    try:
-        if notion:
-            try:
-                notion.pages.update(page_id=page_id, properties=props)
-            except Exception as e1:
-                logger.warning("sync RNS props failed %s: %s", t, e1)
-                if date_str:
-                    try:
-                        notion.pages.update(
-                            page_id=page_id,
-                            properties={"Last RNS Date": {"date": {"start": date_str}}},
-                        )
-                    except Exception as e2:
-                        logger.warning("sync RNS date failed %s: %s", t, e2)
-        _ticker_cache.pop(t, None)
-        logger.info("Synced latest RNS into Micro-Cap for %s (%s)", t, date_str)
-    except Exception as e:
-        logger.error("sync_microcap_with_latest_rns failed %s: %s", t, e)
-    return latest
-
-
-def format_brief_header(ticker: str, data: dict, *, pct: float | None = None) -> str:
-    company = data.get("company") or "N/A"
-    lines = [f"📊 *Stock Brief* · *#{ticker}* — {company}"]
-    if pct is not None:
-        sign = "+" if pct >= 0 else ""
-        arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
-        lines.append(f"{arrow} Session: *{sign}{pct:.2f}%*")
-    rns_d = data.get("last_rns_date") or ""
-    if rns_d:
-        lines.append(f"Last RNS date: *{rns_d}*")
-    lines.append("")
-    lines.append("_Choose a view below._")
-    return "\n".join(lines)
-
-
-def format_stock_summary(
-    ticker: str,
-    data: dict,
-    stockpickers: list[str] | None = None,
-    latest_rns: dict | None = None,
-) -> str:
-    """
-    Stock Summary view. Always surfaces latest RNS (from News Log) first
-    when provided — does not rely on stale Micro-Cap summary alone.
-    """
-    company = data.get("company") or "N/A"
-    lines: list[str] = [
-        f"📋 *Stock Summary* · *#{ticker}* — {company}",
-        "",
-    ]
-
-    # --- Latest RNS (live from Hive RNS News Log) ---
-    rns = latest_rns or data.get("latest_rns")
-    lines.append("*Latest RNS*")
-    if rns:
-        date_bit = rns.get("date") or data.get("last_rns_date") or "—"
-        lines.append(f"*{date_bit}* · {rns.get('title') or 'RNS'}")
-        if rns.get("summary"):
-            lines.append(rns["summary"])
-        if rns.get("link"):
-            lines.append(rns["link"])
-    else:
-        fallback = (data.get("last_rns") or "").strip()
-        if fallback:
-            lines.append(fallback[:500])
-        else:
-            lines.append("_No RNS in News Log for this ticker yet._")
-
-    lines.append("")
-    lines.append("*Snapshot Summary*")
-    lines.append(data.get("summary") or "No summary available.")
-
-    lines.append("")
-    lines.append("*Red Flags*")
-    lines.append(data.get("red_flags") or "None noted.")
-
-    if data.get("company_overview"):
-        lines.append("")
-        lines.append("*Company Overview*")
-        lines.append(data["company_overview"])
-
-    lines.append("")
-    lines.append(f"*#{ticker} This Month Hive Stockpicker*")
-    if stockpickers:
-        quoted = ", ".join(f'"{n}"' for n in stockpickers)
-        lines.append(quoted)
-    else:
-        lines.append("_None yet_")
-
-    lines.append("")
-    lines.append("_🔋 Powered by The Hive 🐝 BuzzBot. Not financial advice. DYOR._")
-    return "\n".join(lines)
-
-
-
-def format_catalyst_snapshot(ticker: str, data: dict) -> str:
-    company = data.get("company") or "N/A"
-    score = data.get("catalyst_score")
-    score_s = f"*{score:g}*" if isinstance(score, (int, float)) else "_n/a_"
-    nxt = data.get("next_catalyst") or ""
-    if not nxt and data.get("summary"):
-        s = data["summary"]
-        low = s.lower()
-        for marker in ("next catalysts", "next catalyst", "catalysts"):
-            idx = low.find(marker)
-            if idx >= 0:
-                nxt = s[idx:][:600]
-                break
-    if not nxt:
-        nxt = "_No catalyst detail on file._"
-    return "\n".join(
-        [
-            f"⚡ *Snap Shot* · *#{ticker}* — {company}",
-            "",
-            "*Catalyst Score*",
-            score_s,
-            "",
-            "*Next Catalyst*",
-            nxt,
-            "",
-            "_Not financial advice. DYOR._",
-        ]
-    )
-
-
-
-async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 10) -> list[dict]:
-    """Newest RNS rows for a ticker from Hive RNS News Log."""
-    t = (ticker or "").lstrip("#").upper().strip()
-    if not t or not (notion or NOTION_TOKEN):
-        return []
-    ds_id = NOTION_RNS_DATA_SOURCE_ID
-    db_id = NOTION_RNS_DB_ID
-    out: list[dict] = []
-    try:
-        resp = notion_query_data_source(
-            data_source_id=ds_id or None,
-            database_id=db_id or None,
-            filter={"property": "Ticker", "rich_text": {"equals": t}},
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=min(20, max(limit, 5)),
-        )
-        for page in resp.get("results", []):
-            props = page.get("properties") or {}
-            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
-            if row_t and row_t != t:
-                continue
-            title = _get_plain_text(props.get("Title")) or "RNS"
-            summary = _strip_html(_get_plain_text(props.get("AI Summary")) or "")
-            link = ""
-            lp = props.get("Link") or {}
-            if isinstance(lp, dict):
-                link = (lp.get("url") or "").strip()
-            date_str = ""
-            dp = props.get("RNS Date") or {}
-            if isinstance(dp, dict) and dp.get("date"):
-                date_str = (dp["date"].get("start") or "")[:10]
-            out.append({
-                "title": title[:140],
-                "summary": summary[:320],
-                "link": link,
-                "date": date_str,
-            })
-            if len(out) >= limit:
-                break
-    except Exception as e:
-        logger.error("_fetch_rns_history_for_ticker(%s) failed: %s", t, e)
-    return out
-
 
 
 def hub_home_keyboard() -> InlineKeyboardMarkup:
@@ -2519,34 +2135,6 @@ def hub_home_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-
-async def group_silent_or_ephemeral(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    text: str,
-    *,
-    delete_after: float = 0.0,
-    parse_mode: str | None = None,
-) -> None:
-    """
-    Group footprint control: by default do not post.
-    If delete_after > 0, post then delete (needs bot delete rights).
-    """
-    if delete_after <= 0:
-        return
-    try:
-        sent = await context.bot.send_message(
-            chat_id,
-            text,
-            parse_mode=parse_mode,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await asyncio.sleep(min(delete_after, 3.0))
-        await safe_delete_message(context.bot, sent.chat_id, sent.message_id)
-    except Exception as e:
-        logger.debug("group_silent_or_ephemeral failed: %s", e)
-
-
 def _is_private(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type == "private")
@@ -2567,9 +2155,12 @@ async def safe_delete_message(
 
 
 async def cleanup_trigger_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove the user's button/command message so the chat stays clean (groups too)."""
+    """Remove the user's button/command message so the chat stays clean."""
     msg = update.effective_message or update.message
     if not msg or not context or not context.bot:
+        return
+    # Prefer private chats (always allowed for bot↔user)
+    if not _is_private(update) and not is_admin(update.effective_user):
         return
     await safe_delete_message(context.bot, msg.chat_id, msg.message_id)
 
@@ -3360,17 +2951,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    # Stock Brief – Home keyboard
+    # Stock Snapshot – Home keyboard
     if text in (
-        "📊 Stock Brief",
-        "Stock Brief",
         "📊 Stock Snapshot",
         "Stock Snapshot",
         "📊 Snapshot",
         "Snapshot",
     ) or lower in (
-        "stock brief",
-        "📊 stock brief",
         "stock snapshot",
         "📊 stock snapshot",
         "snapshot",
@@ -3438,12 +3025,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await cleanup_trigger_message(update, context)
         return
 
-        # Admin stockpick backfill (paste / forward)
-    if user and user.id in _awaiting_backfill:
-        if await process_backfill_message(update, context):
-            return
-
-# Stock Brief follow-up – user typed a ticker after tapping the button
+    # Stock Snapshot follow-up – user typed a ticker after tapping the button
     if user and user.id in _awaiting_snapshot:
         _awaiting_snapshot.pop(user.id, None)
         raw = text.strip()
@@ -3601,27 +3183,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 1. #stockpick capture
     if "#stockpick" in clean_lower:
-        in_private = _is_private(update)
-        chat_id = update.effective_chat.id if update.effective_chat else None
-
-        if not await is_authorized(update, context):
-            # No group footprint — nudge in DM only
-            await cleanup_trigger_message(update, context)
-            if user and not in_private:
-                try:
-                    await context.bot.send_message(
-                        user.id,
-                        "🔒 To log a #stockpick you need bot access.\n"
-                        "Open me in private chat and send /request.",
-                    )
-                except Exception:
-                    pass
-            elif in_private:
-                await context.bot.send_message(
-                    chat_id,
-                    "🔒 Not authorised yet. Send /request to ask for access.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
+        if not await require_authorized(update, context):
             return
 
         if await has_submitted_this_month(user):
@@ -3631,62 +3193,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 page_id = await find_this_month_stockpick_page(user)
                 if page_id:
                     _last_stockpick_page[user.id] = page_id
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
+                    InlineKeyboardButton("Next Catalyst", callback_data="sp:Next Catalyst"),
+                ],
+                [
+                    InlineKeyboardButton("Target Price", callback_data="sp:Target Price"),
+                    InlineKeyboardButton("Change my stockpick", callback_data="sp:Change"),
+                ],
+            ]
             await cleanup_trigger_message(update, context)
-            note = (
-                f"⚠️ You already submitted a #stockpick for *{month_name}*.\n"
-                "Open 📌 *My Stockpick* in private chat to add details or change it."
-            )
-            if in_private:
-                keyboard = [
-                    [
-                        InlineKeyboardButton("Add Summary", callback_data="sp:Summary"),
-                        InlineKeyboardButton(
-                            "Next Catalyst", callback_data="sp:Next Catalyst"
-                        ),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "Target Price", callback_data="sp:Target Price"
-                        ),
-                        InlineKeyboardButton(
-                            "Change my stockpick", callback_data="sp:Change"
-                        ),
-                    ],
-                ]
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            if chat_id:
                 sent = await context.bot.send_message(
                     chat_id,
-                    note,
+                    f"⚠️ You already submitted a #stockpick for *{month_name}*.\n"
+                    "One pick per month — add details or change it:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
                 await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(
-                    context.bot, chat_id, chat_type="private", authorised=True
-                )
-            else:
-                # Group: zero footprint; DM the member
-                try:
-                    await context.bot.send_message(
-                        user.id, note, parse_mode="Markdown"
-                    )
-                except Exception:
-                    pass
+                await ensure_home_keyboard(context.bot, chat_id)
             return
 
         user_name = user.full_name if user else "Unknown"
         tickers = extract_hashtag_tickers(clean_text)
-        ticker = None
-        skip = set(MONTH_HASHTAGS.keys()) | {"stockpick", "stockpicks", "hive", "aim"}
-        for t in tickers:
-            if t.lower() not in skip:
-                ticker = t
-                break
+        ticker = tickers[0] if tickers else None
         period_type, period_value = extract_period(clean_text)
-        if not period_value:
-            period_type, period_value = (
-                "Monthly",
-                datetime.now(timezone.utc).strftime("%B"),
-            )
 
         page_id, save_error = await save_stockpick_to_notion(
             clean_text,
@@ -3697,38 +3232,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             user_id=user.id if user else None,
         )
 
-        # Remove the group/private trigger message immediately
+        # Wipe the user's #stockpick message for a clean chat
         await cleanup_trigger_message(update, context)
-        if user:
-            await clear_nav_panel(context.bot, user.id)
+        await clear_nav_panel(context.bot, user.id if user else None)
+        chat_id = update.effective_chat.id if update.effective_chat else None
 
         if page_id:
             _last_stockpick_page[user.id] = page_id
-            try:
-                await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
-            except Exception:
-                pass
+            await log_member_activity(user, REQUEST_TYPE_STOCKPICK)
             reply = "✅ Captured your #stockpick"
             if ticker:
                 reply += f" (#{ticker})"
             if period_type and period_value:
                 reply += f"\n📅 {period_type}: *{period_value}*"
-            reply += "\nSaved to Notion. Open *My Stockpick* in private chat for details."
+            reply += "\nSaved. Expand *My pick this month* to add details."
 
-            if in_private:
-                keyboard = [
-                    [
-                        InlineKeyboardButton(
-                            "✏️ My pick this month ▾", callback_data="msp:ui_mine"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "📌 Open My Stockpick", callback_data="hub:mypicks"
-                        )
-                    ],
-                    [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-                ]
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        "✏️ My pick this month ▾", callback_data="msp:ui_mine"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📌 Open My Stockpick", callback_data="hub:mypicks"
+                    )
+                ],
+                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+            ]
+            if chat_id:
                 sent = await context.bot.send_message(
                     chat_id,
                     reply,
@@ -3736,34 +3268,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
                 await remember_nav_panel(user.id, sent)
-                await ensure_home_keyboard(
-                    context.bot, chat_id, chat_type="private", authorised=True
-                )
-            else:
-                # Group: no reply in group — confirm in DM only
-                try:
-                    await context.bot.send_message(
-                        user.id,
-                        reply,
-                        parse_mode="Markdown",
-                        reply_markup=main_reply_keyboard(),
-                    )
-                except Exception:
-                    logger.info(
-                        "Could not DM stockpick confirm to user %s",
-                        user.id if user else None,
-                    )
+                await ensure_home_keyboard(context.bot, chat_id)
         else:
-            err = f"Could not save your #stockpick right now.\nError: {save_error or 'unknown'}"
-            if in_private and chat_id:
+            if chat_id:
                 await context.bot.send_message(
-                    chat_id, err, reply_markup=main_reply_keyboard()
+                    chat_id,
+                    "Could not save your #stockpick right now.\n"
+                    f"Error: {save_error or 'unknown'}",
+                    reply_markup=main_reply_keyboard(),
                 )
-            elif user:
-                try:
-                    await context.bot.send_message(user.id, err)
-                except Exception:
-                    pass
         return
 
     # 2. Ticker lookup (snapshot / summary) – authorised only
@@ -3827,11 +3340,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Home keyboard (always available):\n"
             "• 👀 My Watchlist\n"
             "• 📌 My Stockpick\n"
-            "• 📊 Stock Brief — summary, catalyst & RNS\n"
+            "• 📊 Stock Snapshot\n"
             "• 🔗 Group Links\n"
-            "• 📈 Top 10 — session movers\n"
-            "• 📰 RNS Brief — significant RNS today\n"
             "• 📋 Menu\n"
+            "• 🏆 Stock of the Day\n"
             "• 🙈 Hide\n\n"
             "In the group: `@Bot #KEFI summary` or `#stockpick …`"
         )
@@ -3847,138 +3359,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Remove /start (or Start button text) so only the welcome stays
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
-    markup = main_reply_keyboard() if authorised else ReplyKeyboardRemove()
-    if chat and chat.type != "private":
-        # Never surface menu or long greetings in groups
-        return
     if chat:
         await context.bot.send_message(
             chat_id=chat.id,
             text=text,
             parse_mode="Markdown",
-            reply_markup=markup,
+            reply_markup=main_reply_keyboard(),
         )
     elif update.message:
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
-            reply_markup=markup,
+            reply_markup=main_reply_keyboard(),
         )
-
-
-async def backfill_stockpicks_cmd(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """
-    Admin only: paste or forward group #stockpick posts from the last day(s)
-    to backfill Notion. Telegram Bot API cannot read group history, so the
-    admin must forward or paste the posts.
-    """
-    user = update.effective_user
-    msg = update.effective_message
-    if not msg or not user:
-        return
-    if not is_admin(user):
-        await msg.reply_text("Admin only.")
-        return
-    _awaiting_backfill[user.id] = True
-    await cleanup_trigger_message(update, context)
-    await msg.reply_text(
-        "📥 *Stockpick backfill mode*\n\n"
-        "Telegram bots *cannot* read past group history.\n"
-        "To capture missed picks since yesterday:\n\n"
-        "1. In the Hive group, *forward* each `#stockpick` post here, or\n"
-        "2. *Paste* one post per message (must include `#stockpick` + `#TICKER`).\n\n"
-        "I will write each one into *Hive Stock Picks* (skips duplicates).\n"
-        "Send /donebackfill when finished.",
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
-
-
-async def done_backfill_cmd(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
-        return
-    _awaiting_backfill.pop(user.id, None)
-    await msg.reply_text(
-        "✅ Backfill mode closed.",
-        reply_markup=main_reply_keyboard(),
-    )
-
-
-async def process_backfill_message(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> bool:
-    """
-    Handle admin backfill paste or forward. Returns True if consumed.
-    """
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg or user.id not in _awaiting_backfill:
-        return False
-    if not is_admin(user):
-        _awaiting_backfill.pop(user.id, None)
-        return False
-
-    # Prefer forward origin for author name/id when available
-    text = (msg.text or msg.caption or "").strip()
-    if not text:
-        await msg.reply_text("No text on that message — forward the original post.")
-        return True
-
-    author_name = user.full_name or "Admin"
-    author_id = user.id
-    if msg.forward_from:
-        author_name = msg.forward_from.full_name or author_name
-        author_id = msg.forward_from.id
-    elif getattr(msg, "forward_sender_name", None):
-        author_name = msg.forward_sender_name
-        author_id = None  # hidden forward — still save text
-    elif msg.forward_from_chat and not msg.forward_from:
-        # channel / hidden user
-        author_name = msg.forward_sender_name or author_name
-
-    if "#stockpick" not in text.lower():
-        await msg.reply_text(
-            "Skipped — needs `#stockpick` in the text.\n"
-            "Send /donebackfill to exit.",
-            parse_mode="Markdown",
-        )
-        return True
-
-    page_id, ticker, err = await capture_stockpick_from_text(
-        text=text,
-        user_name=author_name,
-        user_id=author_id,
-        skip_month_limit=True,
-    )
-    if page_id:
-        bit = f" #{ticker}" if ticker else ""
-        await msg.reply_text(
-            f"✅ Backfilled{bit} → Notion (*{author_name}*)",
-            parse_mode="Markdown",
-        )
-        try:
-            await log_member_activity(
-                user, REQUEST_TYPE_STOCKPICK, notes=f"backfill{bit}"
-            )
-        except Exception:
-            pass
-    elif err == "duplicate":
-        await msg.reply_text(
-            f"↷ Already in Notion"
-            + (f" (#{ticker})" if ticker else "")
-            + " — skipped."
-        )
-    elif err == "missing_ticker":
-        await msg.reply_text("⚠️ Needs a `#TICKER` hashtag as well as `#stockpick`.")
-    else:
-        await msg.reply_text(f"Could not save: {err or 'unknown'}")
-    return True
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3990,7 +3383,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /request – Request access\n"
         "• /faq – FAQ\n\n"
         "Features are on the Home keyboard:\n"
-        "My Watchlist · My Stockpick · Stock Brief · Group Links · Top 10 · RNS Brief"
+        "My Watchlist · My Stockpick · Stock Snapshot · Group Links"
     )
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
@@ -4464,7 +3857,7 @@ async def daily_brief_cmd(
         try:
             asyncio.create_task(
                 log_member_activity(
-                    user, "Stock of the Day", notes="RNS Brief opened"
+                    user, REQUEST_TYPE_RNS_BRIEF, notes="RNS Brief opened"
                 )
             )
         except Exception:
@@ -4480,114 +3873,6 @@ async def daily_brief_cmd(
                 )
             except Exception:
                 pass
-
-
-async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stock Brief views: Summary / Catalyst / RNS News (paged). Uses sbrief: prefix."""
-    query = update.callback_query
-    user = query.from_user if query else None
-    if not query or not user:
-        return
-    data = query.data or ""
-    if not data.startswith("sbrief:"):
-        return
-    parts = data.split(":")
-    if len(parts) < 3:
-        await query.answer()
-        return
-    view = parts[1]
-    ticker = parts[2].upper().strip()
-    page = 0
-    if view == "rns" and len(parts) >= 4:
-        try:
-            page = max(0, int(parts[3]))
-        except ValueError:
-            page = 0
-    await query.answer()
-    if not ticker:
-        return
-    try:
-        try:
-            await sync_microcap_with_latest_rns(ticker)
-        except Exception:
-            pass
-        meta = await get_ticker_from_notion(ticker) or {}
-        if not meta and view != "rns":
-            await query.edit_message_text(
-                f"No data for #{ticker} in UK AIM Micro-Cap.",
-                reply_markup=hub_back_keyboard(),
-            )
-            return
-        pct = meta.get("day_change_pct")
-        if pct is None:
-            pct = _fetch_pct_on_day_live(ticker)
-        if view == "sum":
-            try:
-                stockpickers = await get_stockpickers_for_ticker(ticker)
-            except Exception:
-                stockpickers = []
-            body = format_brief_header(ticker, meta, pct=pct)
-            body += "\n\n" + format_stock_summary(ticker, meta, stockpickers)
-            markup = brief_action_keyboard(ticker)
-        elif view == "cat":
-            body = format_brief_header(ticker, meta, pct=pct)
-            body += "\n\n" + format_catalyst_snapshot(ticker, meta)
-            markup = brief_action_keyboard(ticker)
-        elif view == "rns":
-            items = await _fetch_rns_history_for_ticker(ticker, limit=10)
-            page_size = 5
-            total = len(items)
-            total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
-            if page >= total_pages:
-                page = total_pages - 1
-            chunk = items[page * page_size : page * page_size + page_size]
-            company = meta.get("company") or ticker
-            lines = [
-                f"📰 *RNS News* · *#{ticker}* — {company}",
-                f"_Last {total} update(s) · page {page + 1}/{total_pages}_",
-                "",
-            ]
-            if not chunk:
-                lines.append("_No RNS found in Hive RNS News Log for this ticker._")
-            else:
-                for i, r in enumerate(chunk, start=page * page_size + 1):
-                    lines.append(f"*{i}. {r.get('date') or '—'}* · {r.get('title') or 'RNS'}")
-                    if r.get("summary"):
-                        lines.append(f"_{r['summary'][:260]}_")
-                    if r.get("link"):
-                        lines.append(r["link"])
-                    lines.append("")
-            body = "\n".join(lines).strip()
-            nav = []
-            if page > 0:
-                nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"sbrief:rns:{ticker[:20]}:{page-1}"))
-            nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data=f"sbrief:rns:{ticker[:20]}:{page}"))
-            if page < total_pages - 1:
-                nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"sbrief:rns:{ticker[:20]}:{page+1}"))
-            markup = InlineKeyboardMarkup([
-                nav,
-                [
-                    InlineKeyboardButton("📋 Stock Summary", callback_data=f"sbrief:sum:{ticker[:20]}"),
-                    InlineKeyboardButton("⚡ Snap Shot", callback_data=f"sbrief:cat:{ticker[:20]}"),
-                ],
-                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
-            ])
-        else:
-            return
-        if len(body) > 3900:
-            body = body[:3900] + "\n\n…truncated"
-        try:
-            await query.edit_message_text(body, parse_mode="Markdown", reply_markup=markup, disable_web_page_preview=True)
-        except Exception:
-            await query.edit_message_text(body.replace("*","").replace("_",""), reply_markup=markup, disable_web_page_preview=True)
-        await remember_nav_panel(user.id, query.message)
-        await ensure_home_keyboard(context.bot, query.message.chat_id if query.message else None)
-    except Exception as e:
-        logger.error("sbrief_button failed %s: %s", data, e)
-        try:
-            await query.edit_message_text(f"Could not open view: {e}", reply_markup=hub_back_keyboard())
-        except Exception:
-            pass
 
 
 async def daily_brief_button(
@@ -4710,6 +3995,19 @@ async def daily_brief_button(
             except Exception as e:
                 logger.warning("daily_brief pct edit failed: %s", e)
         await remember_nav_panel(user.id, query.message)
+        # Log board open once (page 0 only) to Request History
+        if page == 0:
+            try:
+                board_label = "Top 10" if board == "top" else "Bottom 10"
+                asyncio.create_task(
+                    log_member_activity(
+                        user,
+                        REQUEST_TYPE_TOP10,
+                        notes=f"{board_label} board viewed",
+                    )
+                )
+            except Exception:
+                pass
         return
 
     await query.answer()
@@ -4783,6 +4081,14 @@ async def top10_cmd(
     )
     await remember_nav_panel(user.id if user else None, sent)
     await ensure_home_keyboard(context.bot, msg.chat_id)
+    try:
+        asyncio.create_task(
+            log_member_activity(
+                user, REQUEST_TYPE_TOP10, notes="Top 10 menu opened"
+            )
+        )
+    except Exception:
+        pass
 
 
 async def stock_of_the_day_cmd(
@@ -5304,7 +4610,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif data == "menu":
         await menu_cmd(_proxy_update(), context)
     elif data == "snap":
-        # Same entry as Home "Stock Brief" – prompt for ticker
+        # Same entry as Home "Stock Snapshot" – prompt for ticker
         await stock_snapshot_prompt(_proxy_update(), context)
     elif data == "mystockpick":
         await mystockpick_cmd(_proxy_update(), context)
@@ -5323,7 +4629,7 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
-        "• 📊 *Stock Brief* on the Home keyboard looks up any AIM ticker.\n"
+        "• 📊 *Stock Snapshot* on the Home keyboard looks up any AIM ticker.\n"
         "• Use `#stockpick` in the group to log ideas.\n"
         "• Contact a human admin in The Hive group if something looks wrong.",
         parse_mode="Markdown",
@@ -5336,7 +4642,7 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def stock_snapshot_prompt(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Home keyboard → Stock Brief: ask for a ticker."""
+    """Home keyboard → Stock Snapshot: ask for a ticker."""
     user = update.effective_user
     msg = update.effective_message
     if not msg or not user:
@@ -5352,12 +4658,8 @@ async def stock_snapshot_prompt(
     await cleanup_trigger_message(update, context)
     await clear_nav_panel(context.bot, user.id)
     sent = await msg.reply_text(
-        "📊 *Stock Brief*\n\n"
-        "Send a ticker (e.g. `ALRT` or `#KEFI`).\n\n"
-        "After load you get:\n"
-        "• *Stock Summary* — full brief\n"
-        "• *Snap Shot* — catalyst score & next catalyst\n"
-        "• *RNS News* — last 10 RNS (5 per page)",
+        "📊 *Stock Snapshot*\n\n"
+        "Send a ticker (e.g. `ALRT` or `#KEFI`).",
         parse_mode="Markdown",
         reply_markup=hub_back_keyboard(),
     )
@@ -5409,48 +4711,30 @@ async def deliver_stock_snapshot(
                 await remember_nav_panel(user.id, sent)
             await ensure_home_keyboard(context.bot, msg.chat_id)
             return
-        latest_rns = None
-        try:
-            latest_rns = await sync_microcap_with_latest_rns(ticker)
-            if latest_rns:
-                meta = await get_ticker_from_notion(ticker) or meta
-                meta["latest_rns"] = latest_rns
-        except Exception as se:
-            logger.warning("RNS auto-sync on brief failed %s: %s", ticker, se)
-
         try:
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
+        body = format_reply(ticker, meta, stockpickers)
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
-        try:
-            forced = await get_latest_rns_for_ticker(ticker, force=True)
-            if forced:
-                latest_rns = forced
-                meta["latest_rns"] = forced
-                if forced.get("date"):
-                    meta["last_rns_date"] = forced["date"]
-        except Exception as re:
-            logger.warning("force RNS on deliver failed %s: %s", ticker, re)
-        body = format_brief_header(ticker, meta, pct=pct)
-        body += "\n\n" + format_stock_summary(
-            ticker, meta, stockpickers, latest_rns=latest_rns
-        )
+        if pct is not None:
+            sign = "+" if pct >= 0 else ""
+            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
         try:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body,
                 parse_mode="Markdown",
-                reply_markup=brief_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         except Exception:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body.replace("*", "").replace("_", ""),
-                reply_markup=brief_action_keyboard(ticker),
+                reply_markup=snapshot_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         if user:
@@ -5473,7 +4757,7 @@ async def deliver_stock_snapshot(
 
 async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /snap              → prompt (same as Stock Brief button)
+    /snap              → prompt (same as Stock Snapshot button)
     /snap #80M         → snapshot for authorised users
     /snap 80M          → same
     """
@@ -5492,7 +4776,7 @@ async def snap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 tickers.append(t)
 
     if not tickers:
-        # No args → same UX as Home Stock Brief button
+        # No args → same UX as Home Stock Snapshot button
         await stock_snapshot_prompt(update, context)
         return
 
@@ -6665,7 +5949,7 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def snapshot_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle snap:save:TICKER from Stock Brief inline actions."""
+    """Handle snap:save:TICKER from Stock Snapshot inline actions."""
     query = update.callback_query
     user = query.from_user if query else None
     if not query or not user:
@@ -8017,16 +7301,6 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if has_mention and hashtag_tickers:
         return True
 
-    # 4) #stockpick contributions: authorised + ticker is enough (no @ required)
-    #    so Hive members can post picks in-thread and the bot still logs them.
-    if "#stockpick" in lower and hashtag_tickers:
-        logger.info(
-            "Group #stockpick capture allowed without @mention user_id=%s tickers=%s",
-            update.effective_user.id if update.effective_user else None,
-            hashtag_tickers,
-        )
-        return True
-
     # Everything else in the group: stay mute
     return False
     
@@ -8182,18 +7456,24 @@ REQUEST_TYPE_STOCKPICK = "Stockpick"
 REQUEST_TYPE_SNAPSHOT = "Security snapshot"
 REQUEST_TYPE_TG_LINK = "Telegram link"
 REQUEST_TYPE_WATCHLIST = "My Watchlist"
-REQUEST_TYPE_SOTD = "Stock of the Day"
+REQUEST_TYPE_SOTD = "Stock of the Day"  # legacy alias
+REQUEST_TYPE_TOP10 = "Top 10"
+REQUEST_TYPE_RNS_BRIEF = "RNS Brief"
 REQUEST_TYPE_ACCESS = "Access request"
 REQUEST_TYPE_FOLLOW = "Follow stockpicker"
 
-# Live Notion Request History select options (must match DB)
+# Live Notion Request History select options (must match DB when present).
+# Unknown names fall back to "Other" with [Type] prefix in Details.
 _HISTORY_SELECT_OPTIONS = {
     "Access request",
     "Telegram link",
     "Stockpick",
     "Security snapshot",
-    "Other",
+    "My Watchlist",
+    "Top 10",
+    "RNS Brief",
     "Stock of the Day",
+    "Other",
 }
 
 _HISTORY_TYPE_PREFERRED = {
@@ -8201,15 +7481,19 @@ _HISTORY_TYPE_PREFERRED = {
     REQUEST_TYPE_SNAPSHOT: "Security snapshot",
     REQUEST_TYPE_TG_LINK: "Telegram link",
     REQUEST_TYPE_ACCESS: "Access request",
-    REQUEST_TYPE_WATCHLIST: "Other",  # not yet a select option
-    REQUEST_TYPE_SOTD: "Stock of the Day",
+    REQUEST_TYPE_WATCHLIST: "My Watchlist",
+    REQUEST_TYPE_SOTD: "Top 10",  # legacy → Top 10
+    REQUEST_TYPE_TOP10: "Top 10",
+    REQUEST_TYPE_RNS_BRIEF: "RNS Brief",
     REQUEST_TYPE_FOLLOW: "Other",
     "Stockpick": "Stockpick",
     "Security snapshot": "Security snapshot",
     "Telegram link": "Telegram link",
     "Access request": "Access request",
-    "My Watchlist": "Other",
-    "Stock of the Day": "Stock of the Day",
+    "My Watchlist": "My Watchlist",
+    "Top 10": "Top 10",
+    "RNS Brief": "RNS Brief",
+    "Stock of the Day": "Top 10",
     "Follow stockpicker": "Other",
     "Other": "Other",
 }
@@ -8524,9 +7808,6 @@ def main() -> None:
     app.add_handler(CommandHandler("faq", with_command_cleanup(faq)))
     app.add_handler(CommandHandler("snap", with_command_cleanup(snap_cmd)))
     app.add_handler(CommandHandler("mystockpick", with_command_cleanup(mystockpick_cmd)))
-    app.add_handler(CommandHandler("backfill_stockpicks", with_command_cleanup(backfill_stockpicks_cmd)))
-    app.add_handler(CommandHandler("backfillstockpicks", with_command_cleanup(backfill_stockpicks_cmd)))
-    app.add_handler(CommandHandler("donebackfill", with_command_cleanup(done_backfill_cmd)))
     app.add_handler(CommandHandler("help", with_command_cleanup(menu_cmd)))
     app.add_handler(CommandHandler("tickers", with_command_cleanup(snap_cmd)))
     app.add_handler(CommandHandler("status", with_command_cleanup(status_cmd)))
@@ -8547,7 +7828,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
     app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
-    app.add_handler(CallbackQueryHandler(sbrief_button, pattern=r"^sbrief:"))
     app.add_handler(CallbackQueryHandler(daily_brief_button, pattern=r"^brief:"))
     app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
     app.add_handler(CallbackQueryHandler(admin_button, pattern=r"^admin:"))
