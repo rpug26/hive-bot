@@ -2086,8 +2086,8 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
 
 def brief_action_keyboard(ticker: str, *, rns_page: int = 0) -> InlineKeyboardMarkup:
     """
-    Stock Brief panel (consolidated design):
-      Row 1: Stock Summary | Snap Shot | RNS News
+    Stock Brief panel:
+      Row 1: Summary | Snap Shot | RNS News
       Row 2: Save to My Watchlist
       Row 3: « Hub
     """
@@ -2096,7 +2096,7 @@ def brief_action_keyboard(ticker: str, *, rns_page: int = 0) -> InlineKeyboardMa
         [
             [
                 InlineKeyboardButton(
-                    "📋 Stock Summary",
+                    "📋 Summary",
                     callback_data=f"sbrief:sum:{t}",
                 ),
                 InlineKeyboardButton(
@@ -2279,29 +2279,51 @@ def format_catalyst_snapshot(ticker: str, data: dict) -> str:
     )
 
 
+def _plain_md(text: str, limit: int = 400) -> str:
+    """Strip characters that break Telegram Markdown parse_mode."""
+    if not text:
+        return ""
+    s = str(text)
+    for ch in ("*", "_", "`", "["):
+        s = s.replace(ch, "")
+    s = " ".join(s.split())
+    return s[:limit]
+
+
 async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 12) -> list[dict]:
-    """Newest RNS rows for a ticker from Hive RNS News Log."""
+    """
+    Newest RNS rows for a ticker from Hive RNS News Log.
+    Tries several Notion filters so pagination can reach 12 items.
+    """
     t = (ticker or "").lstrip("#").upper().strip()
     if not t or not (notion or NOTION_TOKEN):
         return []
     ds_id = NOTION_RNS_DATA_SOURCE_ID
     db_id = NOTION_RNS_DB_ID
     out: list[dict] = []
-    try:
-        resp = notion_query_data_source(
-            data_source_id=ds_id or None,
-            database_id=db_id or None,
-            filter={"property": "Ticker", "rich_text": {"equals": t}},
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=min(24, max(limit, 12)),
-        )
-        for page in resp.get("results", []):
+    seen: set[str] = set()
+
+    filters = [
+        {"property": "Ticker", "rich_text": {"equals": t}},
+        {"property": "Ticker", "rich_text": {"equals": f"#{t}"}},
+        {"property": "Ticker", "rich_text": {"contains": t}},
+        {"property": "Ticker", "title": {"equals": t}},
+        {"property": "Ticker", "title": {"contains": t}},
+    ]
+
+    def _consume(pages: list) -> None:
+        nonlocal out
+        for page in pages or []:
             props = page.get("properties") or {}
-            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
+            row_t = (
+                _get_plain_text(props.get("Ticker")) or ""
+            ).lstrip("#").upper().strip()
             if row_t and row_t != t:
                 continue
             title = _get_plain_text(props.get("Title")) or "RNS"
-            summary = _strip_html(_get_plain_text(props.get("AI Summary")) or "")
+            summary = _strip_html(
+                _get_plain_text(props.get("AI Summary")) or ""
+            )
             link = ""
             lp = props.get("Link") or {}
             if isinstance(lp, dict):
@@ -2310,14 +2332,50 @@ async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 12) -> list[di
             dp = props.get("RNS Date") or {}
             if isinstance(dp, dict) and dp.get("date"):
                 date_str = (dp["date"].get("start") or "")[:10]
-            out.append({
-                "title": title[:140],
-                "summary": summary[:320],
-                "link": link,
-                "date": date_str,
-            })
+            key = f"{date_str}|{title[:80]}|{link}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "title": title[:140],
+                    "summary": summary[:280],
+                    "link": link,
+                    "date": date_str,
+                }
+            )
+            if len(out) >= limit:
+                return
+
+    try:
+        for filt in filters:
             if len(out) >= limit:
                 break
+            try:
+                resp = notion_query_data_source(
+                    data_source_id=ds_id or None,
+                    database_id=db_id or None,
+                    filter=filt,
+                    sorts=[
+                        {
+                            "property": "RNS Date",
+                            "direction": "descending",
+                        }
+                    ],
+                    page_size=min(24, max(limit, 12)),
+                )
+                _consume(resp.get("results", []))
+            except Exception as fe:
+                logger.debug(
+                    "_fetch_rns_history filter skip %s: %s", filt, fe
+                )
+                continue
+        # Sort by date desc when mixed sources
+        out.sort(key=lambda r: r.get("date") or "", reverse=True)
+        out = out[:limit]
+        logger.info(
+            "_fetch_rns_history_for_ticker(%s) → %d rows", t, len(out)
+        )
     except Exception as e:
         logger.error("_fetch_rns_history_for_ticker(%s) failed: %s", t, e)
     return out
@@ -6245,41 +6303,56 @@ async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             body = format_catalyst_snapshot(ticker, meta)
             markup = brief_action_keyboard(ticker)
         elif view == "rns":
-            # Last 12 RNS from Hive RNS News Log · 4 per page (‹ ›)
+            # Last 12 RNS · 4 per page with explicit ‹ › navigation
             rows = await _fetch_rns_history_for_ticker(ticker, limit=12)
             page_size = 4
-            max_page = max(0, (len(rows) - 1) // page_size) if rows else 0
+            n = len(rows)
+            max_page = max(0, (n - 1) // page_size) if n else 0
             if page > max_page:
                 page = max_page
+            if page < 0:
+                page = 0
             start = page * page_size
             chunk = rows[start : start + page_size]
-            company = meta.get("company") or "N/A"
+            company = _plain_md(meta.get("company") or "N/A", 40)
             end_n = start + len(chunk)
             lines = [
-                f"📰 *RNS News* · *#{ticker}* — {company}",
-                f"_Last {len(rows)} from Hive RNS News Log · "
-                f"showing {start + 1}–{end_n} · page {page + 1}/{max_page + 1}_",
+                f"RNS News · #{ticker} — {company}",
+                f"Last {n} from Hive RNS News Log · "
+                f"items {start + 1}–{end_n or 0} · page {page + 1}/{max_page + 1}",
                 "",
             ]
             if not chunk:
-                lines.append("_No RNS rows in Hive RNS News Log for this ticker._")
+                lines.append(
+                    "No RNS rows in Hive RNS News Log for this ticker yet."
+                )
             else:
                 for i, r in enumerate(chunk, start=start + 1):
                     date_bit = r.get("date") or "—"
-                    lines.append(f"*{i}. {date_bit}* · {r.get('title') or 'RNS'}")
+                    title = _plain_md(r.get("title") or "RNS", 120)
+                    lines.append(f"{i}. {date_bit} · {title}")
                     if r.get("summary"):
-                        lines.append(r["summary"])
+                        lines.append(_plain_md(r["summary"], 240))
                     if r.get("link"):
                         lines.append(r["link"])
                     lines.append("")
+            lines.append("Use ‹ Prev / Next › to move 4 at a time.")
             body = "\n".join(lines).strip()
-            # Pagination row for RNS view
+
+            # Always build a full nav row when there is more than one page
             nav = []
             if page > 0:
                 nav.append(
                     InlineKeyboardButton(
                         "‹ Prev",
                         callback_data=f"sbrief:rns:{ticker}:{page - 1}",
+                    )
+                )
+            else:
+                nav.append(
+                    InlineKeyboardButton(
+                        "·",
+                        callback_data="sbrief:noop",
                     )
                 )
             nav.append(
@@ -6295,10 +6368,18 @@ async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         callback_data=f"sbrief:rns:{ticker}:{page + 1}",
                     )
                 )
+            else:
+                nav.append(
+                    InlineKeyboardButton(
+                        "·",
+                        callback_data="sbrief:noop",
+                    )
+                )
+
             kb_rows = [
                 [
                     InlineKeyboardButton(
-                        "📋 Stock Summary",
+                        "📋 Summary",
                         callback_data=f"sbrief:sum:{ticker}",
                     ),
                     InlineKeyboardButton(
@@ -6307,44 +6388,55 @@ async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     ),
                     InlineKeyboardButton(
                         "📰 RNS News",
-                        callback_data=f"sbrief:rns:{ticker}:{page}",
+                        callback_data=f"sbrief:rns:{ticker}:0",
                     ),
                 ],
-            ]
-            if nav:
-                kb_rows.append(nav)
-            kb_rows.append(
+                nav,
                 [
                     InlineKeyboardButton(
                         "➕ Save to My Watchlist",
                         callback_data=f"snap:save:{ticker}",
                     )
-                ]
-            )
-            kb_rows.append(
-                [InlineKeyboardButton("« Hub", callback_data="hub:home")]
-            )
+                ],
+                [InlineKeyboardButton("« Hub", callback_data="hub:home")],
+            ]
             markup = InlineKeyboardMarkup(kb_rows)
         else:
             await query.answer()
             return
 
+        # Prefer plain text for RNS pages (avoids Markdown entity failures)
+        use_md = view != "rns"
         try:
             await query.edit_message_text(
                 body,
-                parse_mode="Markdown",
+                parse_mode="Markdown" if use_md else None,
                 reply_markup=markup,
                 disable_web_page_preview=True,
             )
-        except Exception:
+        except Exception as e1:
+            logger.warning("sbrief edit md/plain failed: %s", e1)
             try:
                 await query.edit_message_text(
-                    body.replace("*", "").replace("_", ""),
+                    body.replace("*", "").replace("_", "").replace("`", ""),
                     reply_markup=markup,
                     disable_web_page_preview=True,
                 )
-            except Exception as e:
-                logger.warning("sbrief edit failed: %s", e)
+            except Exception as e2:
+                logger.warning(
+                    "sbrief edit retry failed: %s — sending new message", e2
+                )
+                try:
+                    sent = await context.bot.send_message(
+                        query.message.chat_id,
+                        body.replace("*", "").replace("_", ""),
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                    await remember_nav_panel(user.id, sent)
+                except Exception as e3:
+                    logger.error("sbrief send fallback failed: %s", e3)
+                    return
         await remember_nav_panel(user.id, query.message)
     except Exception as e:
         logger.error("sbrief_button failed %s: %s", data, e)
