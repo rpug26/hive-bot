@@ -2084,11 +2084,30 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
-    """Inline actions under a company snapshot."""
+def brief_action_keyboard(ticker: str, *, rns_page: int = 0) -> InlineKeyboardMarkup:
+    """
+    Stock Brief panel (consolidated design):
+      Row 1: Stock Summary | Snap Shot | RNS News
+      Row 2: Save to My Watchlist
+      Row 3: « Hub
+    """
     t = (ticker or "").upper()[:20]
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton(
+                    "📋 Stock Summary",
+                    callback_data=f"sbrief:sum:{t}",
+                ),
+                InlineKeyboardButton(
+                    "⚡ Snap Shot",
+                    callback_data=f"sbrief:cat:{t}",
+                ),
+                InlineKeyboardButton(
+                    "📰 RNS News",
+                    callback_data=f"sbrief:rns:{t}:{int(rns_page)}",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     "➕ Save to My Watchlist",
@@ -2100,6 +2119,208 @@ def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def snapshot_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
+    """Back-compat alias → Stock Brief keyboard."""
+    return brief_action_keyboard(ticker)
+
+
+async def sync_microcap_with_latest_rns(ticker: str) -> dict | None:
+    """
+    Pull latest RNS for ticker from Hive RNS News Log and update
+    UK AIM Micro-Cap (Last RNS Date + Last 3 RNS head) when possible.
+    """
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t:
+        return None
+    latest = await get_latest_rns_for_ticker(t, force=True)
+    if not latest:
+        return None
+    meta = await get_ticker_from_notion(t)
+    page_id = (meta or {}).get("page_id")
+    if not page_id or not (notion or NOTION_TOKEN):
+        return latest
+    title = latest.get("title") or "RNS"
+    date_str = latest.get("date") or ""
+    summary = (latest.get("summary") or "")[:500]
+    link = latest.get("link") or ""
+    head = f"• {date_str} | {title}"
+    if summary:
+        head += f"\n  {summary[:220]}"
+    if link:
+        head += f"\n  {link}"
+    old_last = (meta or {}).get("last_rns") or ""
+    blocks = [b.strip() for b in old_last.split("• ") if b.strip()]
+    new_blocks = [head.lstrip("• ").strip()]
+    for b in blocks:
+        if title.lower() in b.lower() and (not date_str or date_str in b):
+            continue
+        new_blocks.append(b)
+        if len(new_blocks) >= 3:
+            break
+    last3 = "\n\n".join(f"• {b}" for b in new_blocks)
+    props: dict = {}
+    if date_str:
+        props["Last RNS Date"] = {"date": {"start": date_str}}
+    props["Last 3 RNS"] = {"rich_text": [{"text": {"content": last3[:1900]}}]}
+    try:
+        if notion:
+            try:
+                notion.pages.update(page_id=page_id, properties=props)
+            except Exception as e1:
+                logger.warning("sync RNS props failed %s: %s", t, e1)
+                if date_str:
+                    try:
+                        notion.pages.update(
+                            page_id=page_id,
+                            properties={"Last RNS Date": {"date": {"start": date_str}}},
+                        )
+                    except Exception as e2:
+                        logger.warning("sync RNS date failed %s: %s", t, e2)
+        _ticker_cache.pop(t, None)
+        logger.info("Synced latest RNS into Micro-Cap for %s (%s)", t, date_str)
+    except Exception as e:
+        logger.error("sync_microcap_with_latest_rns failed %s: %s", t, e)
+    return latest
+
+
+def format_brief_header(ticker: str, data: dict, *, pct: float | None = None) -> str:
+    company = data.get("company") or "N/A"
+    lines = [f"📊 *Stock Brief* · *#{ticker}* — {company}"]
+    if pct is not None:
+        sign = "+" if pct >= 0 else ""
+        arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+        lines.append(f"{arrow} Session: *{sign}{pct:.2f}%*")
+    rns_d = data.get("last_rns_date") or ""
+    if rns_d:
+        lines.append(f"Last RNS date: *{rns_d}*")
+    lines.append("")
+    lines.append("_Choose a view below._")
+    return "\n".join(lines)
+
+
+def format_stock_summary(
+    ticker: str,
+    data: dict,
+    stockpickers: list[str] | None = None,
+    latest_rns: dict | None = None,
+) -> str:
+    """Stock Summary view — latest RNS first when available."""
+    company = data.get("company") or "N/A"
+    lines: list[str] = [
+        f"📋 *Stock Summary* · *#{ticker}* — {company}",
+        "",
+    ]
+    rns = latest_rns or data.get("latest_rns")
+    lines.append("*Latest RNS*")
+    if rns:
+        date_bit = rns.get("date") or data.get("last_rns_date") or "—"
+        lines.append(f"*{date_bit}* · {rns.get('title') or 'RNS'}")
+        if rns.get("summary"):
+            lines.append(rns["summary"])
+        if rns.get("link"):
+            lines.append(rns["link"])
+    else:
+        fallback = (data.get("last_rns") or "").strip()
+        if fallback:
+            lines.append(fallback[:500])
+        else:
+            lines.append("_No RNS in News Log for this ticker yet._")
+    lines.append("")
+    lines.append("*Snapshot Summary*")
+    lines.append(data.get("summary") or "No summary available.")
+    lines.append("")
+    lines.append("*Red Flags*")
+    lines.append(data.get("red_flags") or "None noted.")
+    if data.get("company_overview"):
+        lines.append("")
+        lines.append("*Company Overview*")
+        lines.append(data["company_overview"])
+    lines.append("")
+    lines.append(f"*#{ticker} This Month Hive Stockpicker*")
+    if stockpickers:
+        quoted = ", ".join(f'"{n}"' for n in stockpickers)
+        lines.append(quoted)
+    else:
+        lines.append("_None yet_")
+    lines.append("")
+    lines.append("_🔋 Powered by The Hive 🐝 BuzzBot. Not financial advice. DYOR._")
+    return "\n".join(lines)
+
+
+def format_catalyst_snapshot(ticker: str, data: dict) -> str:
+    company = data.get("company") or "N/A"
+    score = data.get("catalyst_score")
+    score_s = f"*{score:g}*" if isinstance(score, (int, float)) else "_n/a_"
+    nxt = data.get("next_catalyst") or ""
+    if not nxt and data.get("summary"):
+        s = data["summary"]
+        low = s.lower()
+        for marker in ("next catalysts", "next catalyst", "catalysts"):
+            idx = low.find(marker)
+            if idx >= 0:
+                nxt = s[idx:][:600]
+                break
+    if not nxt:
+        nxt = "_No catalyst detail on file._"
+    return "\n".join(
+        [
+            f"⚡ *Snap Shot* · *#{ticker}* — {company}",
+            "",
+            "*Catalyst Score*",
+            score_s,
+            "",
+            "*Next Catalyst*",
+            nxt,
+            "",
+            "_Not financial advice. DYOR._",
+        ]
+    )
+
+
+async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 10) -> list[dict]:
+    """Newest RNS rows for a ticker from Hive RNS News Log."""
+    t = (ticker or "").lstrip("#").upper().strip()
+    if not t or not (notion or NOTION_TOKEN):
+        return []
+    ds_id = NOTION_RNS_DATA_SOURCE_ID
+    db_id = NOTION_RNS_DB_ID
+    out: list[dict] = []
+    try:
+        resp = notion_query_data_source(
+            data_source_id=ds_id or None,
+            database_id=db_id or None,
+            filter={"property": "Ticker", "rich_text": {"equals": t}},
+            sorts=[{"property": "RNS Date", "direction": "descending"}],
+            page_size=min(20, max(limit, 5)),
+        )
+        for page in resp.get("results", []):
+            props = page.get("properties") or {}
+            row_t = (_get_plain_text(props.get("Ticker")) or "").upper().strip()
+            if row_t and row_t != t:
+                continue
+            title = _get_plain_text(props.get("Title")) or "RNS"
+            summary = _strip_html(_get_plain_text(props.get("AI Summary")) or "")
+            link = ""
+            lp = props.get("Link") or {}
+            if isinstance(lp, dict):
+                link = (lp.get("url") or "").strip()
+            date_str = ""
+            dp = props.get("RNS Date") or {}
+            if isinstance(dp, dict) and dp.get("date"):
+                date_str = (dp["date"].get("start") or "")[:10]
+            out.append({
+                "title": title[:140],
+                "summary": summary[:320],
+                "link": link,
+                "date": date_str,
+            })
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        logger.error("_fetch_rns_history_for_ticker(%s) failed: %s", t, e)
+    return out
 
 
 def hub_home_keyboard() -> InlineKeyboardMarkup:
@@ -3855,13 +4076,11 @@ async def daily_brief_cmd(
                 except Exception as e3:
                     logger.error("daily_brief_cmd send fallback failed: %s", e3)
         try:
-            asyncio.create_task(
-                log_member_activity(
-                    user, REQUEST_TYPE_RNS_BRIEF, notes="RNS Brief opened"
-                )
+            await log_member_activity(
+                user, REQUEST_TYPE_RNS_BRIEF, notes="RNS Brief opened"
             )
-        except Exception:
-            pass
+        except Exception as le:
+            logger.warning("RNS Brief history log failed: %s", le)
     except Exception as e:
         logger.error("daily_brief_cmd failed: %s", e)
         try:
@@ -3999,12 +4218,10 @@ async def daily_brief_button(
         if page == 0:
             try:
                 board_label = "Top 10" if board == "top" else "Bottom 10"
-                asyncio.create_task(
-                    log_member_activity(
-                        user,
-                        REQUEST_TYPE_TOP10,
-                        notes=f"{board_label} board viewed",
-                    )
+                await log_member_activity(
+                    user,
+                    REQUEST_TYPE_TOP10,
+                    notes=f"{board_label} board viewed",
                 )
             except Exception:
                 pass
@@ -4082,13 +4299,11 @@ async def top10_cmd(
     await remember_nav_panel(user.id if user else None, sent)
     await ensure_home_keyboard(context.bot, msg.chat_id)
     try:
-        asyncio.create_task(
-            log_member_activity(
-                user, REQUEST_TYPE_TOP10, notes="Top 10 menu opened"
-            )
+        await log_member_activity(
+            user, REQUEST_TYPE_TOP10, notes="Top 10 menu opened"
         )
-    except Exception:
-        pass
+    except Exception as le:
+        logger.warning("Top 10 history log failed: %s", le)
 
 
 async def stock_of_the_day_cmd(
@@ -4672,7 +4887,7 @@ async def deliver_stock_snapshot(
     context: ContextTypes.DEFAULT_TYPE,
     ticker: str,
 ) -> None:
-    """Look up ticker and show snapshot + Save to Watchlist / Hub (minimal UI)."""
+    """Look up ticker and open Stock Brief on Stock Summary (multi-view UI)."""
     user = update.effective_user
     msg = update.effective_message
     if not msg:
@@ -4700,6 +4915,17 @@ async def deliver_stock_snapshot(
         )
         return
     try:
+        # Force-fetch latest RNS and best-effort sync into Micro-Cap
+        latest_rns = None
+        try:
+            latest_rns = await sync_microcap_with_latest_rns(ticker)
+        except Exception as se:
+            logger.warning("sync_microcap_with_latest_rns: %s", se)
+            try:
+                latest_rns = await get_latest_rns_for_ticker(ticker, force=True)
+            except Exception:
+                latest_rns = None
+
         meta = await get_ticker_from_notion(ticker)
         if not meta:
             sent = await context.bot.send_message(
@@ -4715,33 +4941,36 @@ async def deliver_stock_snapshot(
             stockpickers = await get_stockpickers_for_ticker(ticker)
         except Exception:
             stockpickers = []
-        body = format_reply(ticker, meta, stockpickers)
+        body = format_stock_summary(
+            ticker, meta, stockpickers, latest_rns=latest_rns
+        )
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
         if pct is not None:
             sign = "+" if pct >= 0 else ""
-            body = f"% on day: *{sign}{pct:.2f}%*\n\n" + body
+            arrow = "🟢" if pct > 0 else ("🔴" if pct < 0 else "⚪")
+            body = f"{arrow} Session: *{sign}{pct:.2f}%*\n\n" + body
         try:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body,
                 parse_mode="Markdown",
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=brief_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         except Exception:
             sent = await context.bot.send_message(
                 msg.chat_id,
                 body.replace("*", "").replace("_", ""),
-                reply_markup=snapshot_action_keyboard(ticker),
+                reply_markup=brief_action_keyboard(ticker),
                 disable_web_page_preview=True,
             )
         if user:
             await remember_nav_panel(user.id, sent)
         try:
             await log_member_activity(
-                user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} stock snapshot"
+                user, REQUEST_TYPE_SNAPSHOT, notes=f"#{ticker} stock brief"
             )
         except Exception:
             pass
@@ -5944,6 +6173,175 @@ async def sotd_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text(
                 f"Snapshot failed: {e}", reply_markup=hub_back_keyboard()
             )
+        except Exception:
+            pass
+
+
+
+async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stock Brief view switcher: Summary / Snap Shot / RNS News (paged)."""
+    query = update.callback_query
+    user = query.from_user if query else None
+    if not query or not user:
+        return
+    data = query.data or ""
+    if not data.startswith("sbrief:"):
+        return
+    if data == "sbrief:noop":
+        await query.answer()
+        return
+    parts = data.split(":")
+    # sbrief:sum:TICKER | sbrief:cat:TICKER | sbrief:rns:TICKER:page
+    if len(parts) < 3:
+        await query.answer()
+        return
+    view = parts[1]
+    ticker = (parts[2] or "").upper().strip()
+    page = 0
+    if view == "rns" and len(parts) >= 4:
+        try:
+            page = max(0, int(parts[3]))
+        except ValueError:
+            page = 0
+    if not ticker:
+        await query.answer("Missing ticker.", show_alert=True)
+        return
+    if not await is_authorized(update, context):
+        await query.answer("Authorised members only.", show_alert=True)
+        return
+    await query.answer()
+    try:
+        meta = await get_ticker_from_notion(ticker)
+        if not meta:
+            try:
+                await query.edit_message_text(
+                    f"No data for #{ticker} in UK AIM Micro-Cap.",
+                    reply_markup=hub_back_keyboard(),
+                )
+            except Exception:
+                pass
+            return
+        latest_rns = None
+        try:
+            latest_rns = await get_latest_rns_for_ticker(ticker, force=False)
+        except Exception:
+            latest_rns = None
+        try:
+            stockpickers = await get_stockpickers_for_ticker(ticker)
+        except Exception:
+            stockpickers = []
+
+        if view == "sum":
+            body = format_stock_summary(
+                ticker, meta, stockpickers, latest_rns=latest_rns
+            )
+            markup = brief_action_keyboard(ticker)
+        elif view == "cat":
+            body = format_catalyst_snapshot(ticker, meta)
+            markup = brief_action_keyboard(ticker)
+        elif view == "rns":
+            rows = await _fetch_rns_history_for_ticker(ticker, limit=10)
+            page_size = 5
+            max_page = max(0, (len(rows) - 1) // page_size) if rows else 0
+            if page > max_page:
+                page = max_page
+            start = page * page_size
+            chunk = rows[start : start + page_size]
+            company = meta.get("company") or "N/A"
+            lines = [
+                f"📰 *RNS News* · *#{ticker}* — {company}",
+                f"_Page {page + 1}/{max_page + 1} · last {len(rows)} from News Log_",
+                "",
+            ]
+            if not chunk:
+                lines.append("_No RNS rows in Hive RNS News Log for this ticker._")
+            else:
+                for i, r in enumerate(chunk, start=start + 1):
+                    date_bit = r.get("date") or "—"
+                    lines.append(f"*{i}. {date_bit}* · {r.get('title') or 'RNS'}")
+                    if r.get("summary"):
+                        lines.append(r["summary"])
+                    if r.get("link"):
+                        lines.append(r["link"])
+                    lines.append("")
+            body = "\n".join(lines).strip()
+            # Pagination row for RNS view
+            nav = []
+            if page > 0:
+                nav.append(
+                    InlineKeyboardButton(
+                        "‹ Prev",
+                        callback_data=f"sbrief:rns:{ticker}:{page - 1}",
+                    )
+                )
+            nav.append(
+                InlineKeyboardButton(
+                    f"{page + 1}/{max_page + 1}",
+                    callback_data="sbrief:noop",
+                )
+            )
+            if page < max_page:
+                nav.append(
+                    InlineKeyboardButton(
+                        "Next ›",
+                        callback_data=f"sbrief:rns:{ticker}:{page + 1}",
+                    )
+                )
+            kb_rows = [
+                [
+                    InlineKeyboardButton(
+                        "📋 Stock Summary",
+                        callback_data=f"sbrief:sum:{ticker}",
+                    ),
+                    InlineKeyboardButton(
+                        "⚡ Snap Shot",
+                        callback_data=f"sbrief:cat:{ticker}",
+                    ),
+                    InlineKeyboardButton(
+                        "📰 RNS News",
+                        callback_data=f"sbrief:rns:{ticker}:{page}",
+                    ),
+                ],
+            ]
+            if nav:
+                kb_rows.append(nav)
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "➕ Save to My Watchlist",
+                        callback_data=f"snap:save:{ticker}",
+                    )
+                ]
+            )
+            kb_rows.append(
+                [InlineKeyboardButton("« Hub", callback_data="hub:home")]
+            )
+            markup = InlineKeyboardMarkup(kb_rows)
+        else:
+            await query.answer()
+            return
+
+        try:
+            await query.edit_message_text(
+                body,
+                parse_mode="Markdown",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            try:
+                await query.edit_message_text(
+                    body.replace("*", "").replace("_", ""),
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("sbrief edit failed: %s", e)
+        await remember_nav_panel(user.id, query.message)
+    except Exception as e:
+        logger.error("sbrief_button failed %s: %s", data, e)
+        try:
+            await query.answer("Failed to load view.", show_alert=True)
         except Exception:
             pass
 
@@ -7827,6 +8225,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(watchlist_button, pattern=r"^wl:"))
     app.add_handler(CallbackQueryHandler(menu_button, pattern=r"^cmd:"))
     app.add_handler(CallbackQueryHandler(snapshot_button, pattern=r"^snap:"))
+    app.add_handler(CallbackQueryHandler(sbrief_button, pattern=r"^sbrief:"))
     app.add_handler(CallbackQueryHandler(sotd_button, pattern=r"^sotd:"))
     app.add_handler(CallbackQueryHandler(daily_brief_button, pattern=r"^brief:"))
     app.add_handler(CallbackQueryHandler(msp_button, pattern=r"^msp:"))
