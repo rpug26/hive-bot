@@ -4950,15 +4950,20 @@ async def whats_new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    if not query:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = (query.data or "").replace("cmd:", "")
 
-    # Build a minimal update proxy when only callback_query is present
+    # Callback updates have no update.message — build a proxy that exposes
+    # effective_message / message with reply_text → send_message so cmds work.
     def _proxy_update():
         if update.message:
             return update
-        chat = update.effective_chat
-        if not chat or not query or not query.message:
+        if not query.message:
             return update
 
         class _MsgProxy:
@@ -4968,6 +4973,7 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 self.chat = msg.chat
                 self.chat_id = msg.chat_id
                 self.message_id = msg.message_id
+                self.from_user = getattr(msg, "from_user", None)
 
             async def reply_text(self, *a, **k):
                 return await self._bot.send_message(self.chat_id, *a, **k)
@@ -4977,31 +4983,43 @@ async def menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 self.effective_user = orig.effective_user
                 self.effective_chat = orig.effective_chat
                 self.message = msg
+                self.effective_message = msg  # required by status_cmd / faq / etc.
                 self.callback_query = orig.callback_query
 
         return _Up(update, _MsgProxy(query.message, context.bot))
 
-    if data == "start":
-        await start(update, context)
-    elif data == "faq":
-        await faq(_proxy_update(), context)
-    elif data == "status":
-        await status_cmd(_proxy_update(), context)
-    elif data == "request":
-        await request_access(_proxy_update(), context)
-    elif data == "menu":
-        await menu_cmd(_proxy_update(), context)
-    elif data == "snap":
-        # Same entry as Home "Stock Snapshot" – prompt for ticker
-        await stock_snapshot_prompt(_proxy_update(), context)
-    elif data == "mystockpick":
-        await mystockpick_cmd(_proxy_update(), context)
-    elif data == "link":
-        await link_cmd(_proxy_update(), context)
-    elif data == "whatsnew":
-        await stock_of_the_day_cmd(_proxy_update(), context)
-    elif data == "sotd":
-        await stock_of_the_day_cmd(_proxy_update(), context)
+    try:
+        if data == "start":
+            await start(update, context)
+        elif data == "faq":
+            await faq(_proxy_update(), context)
+        elif data == "status":
+            await status_cmd(_proxy_update(), context)
+        elif data == "request":
+            await request_access(_proxy_update(), context)
+        elif data == "menu":
+            await menu_cmd(_proxy_update(), context)
+        elif data == "snap":
+            await stock_snapshot_prompt(_proxy_update(), context)
+        elif data == "mystockpick":
+            await mystockpick_cmd(_proxy_update(), context)
+        elif data == "link":
+            await link_cmd(_proxy_update(), context)
+        elif data == "whatsnew":
+            await stock_of_the_day_cmd(_proxy_update(), context)
+        elif data == "sotd":
+            await stock_of_the_day_cmd(_proxy_update(), context)
+        else:
+            logger.info("menu_button: unknown cmd:%s", data)
+    except Exception as e:
+        logger.error("menu_button cmd:%s failed: %s", data, e)
+        try:
+            await context.bot.send_message(
+                query.message.chat_id,
+                f"Could not run that menu action ({data}). Please try /{data} as a command.",
+            )
+        except Exception:
+            pass
 
 async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -7586,12 +7604,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     Show access status aligned with Notion Authorised Users + live Telegram check.
     Prefer Notion for Admin status / Group Member when Telegram API fails.
+    Works from /status command and Menu → Status inline button.
     """
     user = update.effective_user
     if not user:
         return
 
-    msg = update.effective_message
+    msg = getattr(update, "effective_message", None) or getattr(
+        update, "message", None
+    )
+    if not msg and getattr(update, "callback_query", None):
+        msg = update.callback_query.message
     authorised = await is_authorized(update, context)
     in_group_tg, group_detail = await is_group_member(context, user.id)
 
@@ -7732,11 +7755,42 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Notion was updated to match Telegram where possible._"
         )
 
-    await msg.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=main_reply_keyboard(),
-    )
+    body = "\n".join(lines)
+    chat_id = None
+    if msg is not None:
+        chat_id = getattr(msg, "chat_id", None) or getattr(
+            getattr(msg, "chat", None), "id", None
+        )
+    if chat_id is None and update.effective_chat:
+        chat_id = update.effective_chat.id
+
+    try:
+        if msg is not None and hasattr(msg, "reply_text"):
+            await msg.reply_text(
+                body,
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+        elif chat_id is not None:
+            await context.bot.send_message(
+                chat_id,
+                body,
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard(),
+            )
+        else:
+            logger.error("status_cmd: no message/chat to reply to for user %s", user.id)
+    except Exception as e:
+        logger.error("status_cmd reply failed: %s", e)
+        if chat_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    body.replace("*", "").replace("_", "").replace("`", ""),
+                    reply_markup=main_reply_keyboard(),
+                )
+            except Exception as e2:
+                logger.error("status_cmd plain fallback failed: %s", e2)
 
 
 # ------------------------------------------------------------
