@@ -1972,7 +1972,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton("📌 My Stockpick"),
             ],
             [
-                KeyboardButton("📊 Stock Snapshot"),
+                KeyboardButton("📊 Stock Brief"),
                 KeyboardButton("🔗 Group Links"),
             ],
             [
@@ -2032,10 +2032,10 @@ async def send_home_menu(bot, chat_id: int | None) -> None:
         "🏠 *Home*\n\n"
         "• 👀 My Watchlist\n"
         "• 📌 My Stockpick\n"
-        "• 📊 Stock Snapshot\n"
+        "• 📊 Stock Brief\n"
         "• 🔗 Group Links\n"
-        "• 🏆 Stock of the Day\n"
-        "• 📰 Daily Brief\n"
+        "• 📈 Top 10\n"
+        "• 📰 RNS Brief\n"
         "• 📋 Menu\n"
         "• 🙈 Hide"
     )
@@ -2279,7 +2279,7 @@ def format_catalyst_snapshot(ticker: str, data: dict) -> str:
     )
 
 
-async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 10) -> list[dict]:
+async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 12) -> list[dict]:
     """Newest RNS rows for a ticker from Hive RNS News Log."""
     t = (ticker or "").lstrip("#").upper().strip()
     if not t or not (notion or NOTION_TOKEN):
@@ -2293,7 +2293,7 @@ async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 10) -> list[di
             database_id=db_id or None,
             filter={"property": "Ticker", "rich_text": {"equals": t}},
             sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=min(20, max(limit, 5)),
+            page_size=min(24, max(limit, 12)),
         )
         for page in resp.get("results", []):
             props = page.get("properties") or {}
@@ -3172,13 +3172,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await menu_cmd(update, context)
         return
 
-    # Stock Snapshot – Home keyboard
+    # Stock Brief – Home keyboard (legacy: Stock Snapshot)
     if text in (
+        "📊 Stock Brief",
+        "Stock Brief",
         "📊 Stock Snapshot",
         "Stock Snapshot",
         "📊 Snapshot",
         "Snapshot",
     ) or lower in (
+        "stock brief",
+        "📊 stock brief",
         "stock snapshot",
         "📊 stock snapshot",
         "snapshot",
@@ -3561,10 +3565,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Home keyboard (always available):\n"
             "• 👀 My Watchlist\n"
             "• 📌 My Stockpick\n"
-            "• 📊 Stock Snapshot\n"
+            "• 📊 Stock Brief\n"
             "• 🔗 Group Links\n"
+            "• 📈 Top 10\n"
+            "• 📰 RNS Brief\n"
             "• 📋 Menu\n"
-            "• 🏆 Stock of the Day\n"
             "• 🙈 Hide\n\n"
             "In the group: `@Bot #KEFI summary` or `#stockpick …`"
         )
@@ -3604,7 +3609,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /request – Request access\n"
         "• /faq – FAQ\n\n"
         "Features are on the Home keyboard:\n"
-        "My Watchlist · My Stockpick · Stock Snapshot · Group Links"
+        "My Watchlist · My Stockpick · Stock Brief · Group Links"
     )
     await cleanup_trigger_message(update, context)
     chat = update.effective_chat
@@ -4844,7 +4849,7 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📌 *FAQ*\n\n"
         "• Data is pulled live from the curated UK AIM Micro-Cap database.\n"
         "• This is *not* financial advice – always DYOR.\n"
-        "• 📊 *Stock Snapshot* on the Home keyboard looks up any AIM ticker.\n"
+        "• 📊 *Stock Brief* on the Home keyboard looks up any AIM ticker.\n"
         "• Use `#stockpick` in the group to log ideas.\n"
         "• Contact a human admin in The Hive group if something looks wrong.",
         parse_mode="Markdown",
@@ -4857,7 +4862,7 @@ async def faq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def stock_snapshot_prompt(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Home keyboard → Stock Snapshot: ask for a ticker."""
+    """Home keyboard → Stock Brief: ask for a ticker."""
     user = update.effective_user
     msg = update.effective_message
     if not msg or not user:
@@ -4873,7 +4878,7 @@ async def stock_snapshot_prompt(
     await cleanup_trigger_message(update, context)
     await clear_nav_panel(context.bot, user.id)
     sent = await msg.reply_text(
-        "📊 *Stock Snapshot*\n\n"
+        "📊 *Stock Brief*\n\n"
         "Send a ticker (e.g. `ALRT` or `#KEFI`).",
         parse_mode="Markdown",
         reply_markup=hub_back_keyboard(),
@@ -6240,17 +6245,20 @@ async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             body = format_catalyst_snapshot(ticker, meta)
             markup = brief_action_keyboard(ticker)
         elif view == "rns":
-            rows = await _fetch_rns_history_for_ticker(ticker, limit=10)
-            page_size = 5
+            # Last 12 RNS from Hive RNS News Log · 4 per page (‹ ›)
+            rows = await _fetch_rns_history_for_ticker(ticker, limit=12)
+            page_size = 4
             max_page = max(0, (len(rows) - 1) // page_size) if rows else 0
             if page > max_page:
                 page = max_page
             start = page * page_size
             chunk = rows[start : start + page_size]
             company = meta.get("company") or "N/A"
+            end_n = start + len(chunk)
             lines = [
                 f"📰 *RNS News* · *#{ticker}* — {company}",
-                f"_Page {page + 1}/{max_page + 1} · last {len(rows)} from News Log_",
+                f"_Last {len(rows)} from Hive RNS News Log · "
+                f"showing {start + 1}–{end_n} · page {page + 1}/{max_page + 1}_",
                 "",
             ]
             if not chunk:
