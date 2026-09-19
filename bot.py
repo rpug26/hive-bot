@@ -1833,17 +1833,27 @@ async def get_latest_rns_for_ticker(
             return cached
 
     try:
-        response = notion_query_data_source(
-            data_source_id=ds_id,
-            database_id=db_id,
-            filter={
-                "property": "Ticker",
-                "rich_text": {"equals": t},
-            },
-            sorts=[{"property": "RNS Date", "direction": "descending"}],
-            page_size=3,
-        )
-        results = response.get("results", [])
+        results = []
+        filters_to_try = [
+            {"property": "Ticker", "rich_text": {"equals": t}},
+            {"property": "Ticker", "rich_text": {"equals": f"#{t}"}},
+            {"property": "Ticker", "title": {"equals": t}},
+            {"property": "Ticker", "rich_text": {"contains": t}},
+        ]
+        for f in filters_to_try:
+            try:
+                response = notion_query_data_source(
+                    data_source_id=ds_id,
+                    database_id=db_id,
+                    filter=f,
+                    sorts=[{"property": "RNS Date", "direction": "descending"}],
+                    page_size=5,
+                )
+                results = response.get("results", [])
+                if results:
+                    break
+            except Exception as fe:
+                logger.debug("RNS filter %s failed: %s", f, fe)
         # Prefer exact ticker match (case-insensitive)
         best = None
         for page in results:
@@ -2212,21 +2222,64 @@ def format_brief_header(ticker: str, data: dict, *, pct: float | None = None) ->
     return "\n".join(lines)
 
 
-def format_stock_summary(ticker: str, data: dict, stockpickers: list[str] | None = None) -> str:
-    text = (
-        f"📋 *Stock Summary* · *#{ticker}* — {data.get('company') or 'N/A'}\n\n"
-        f"*Snapshot Summary:*\n{data.get('summary') or 'No summary available.'}\n\n"
-        f"*Red Flags:*\n{data.get('red_flags') or 'None noted.'}\n"
-    )
+def format_stock_summary(
+    ticker: str,
+    data: dict,
+    stockpickers: list[str] | None = None,
+    latest_rns: dict | None = None,
+) -> str:
+    """
+    Stock Summary view. Always surfaces latest RNS (from News Log) first
+    when provided — does not rely on stale Micro-Cap summary alone.
+    """
+    company = data.get("company") or "N/A"
+    lines: list[str] = [
+        f"📋 *Stock Summary* · *#{ticker}* — {company}",
+        "",
+    ]
+
+    # --- Latest RNS (live from Hive RNS News Log) ---
+    rns = latest_rns or data.get("latest_rns")
+    lines.append("*Latest RNS*")
+    if rns:
+        date_bit = rns.get("date") or data.get("last_rns_date") or "—"
+        lines.append(f"*{date_bit}* · {rns.get('title') or 'RNS'}")
+        if rns.get("summary"):
+            lines.append(rns["summary"])
+        if rns.get("link"):
+            lines.append(rns["link"])
+    else:
+        fallback = (data.get("last_rns") or "").strip()
+        if fallback:
+            lines.append(fallback[:500])
+        else:
+            lines.append("_No RNS in News Log for this ticker yet._")
+
+    lines.append("")
+    lines.append("*Snapshot Summary*")
+    lines.append(data.get("summary") or "No summary available.")
+
+    lines.append("")
+    lines.append("*Red Flags*")
+    lines.append(data.get("red_flags") or "None noted.")
+
     if data.get("company_overview"):
-        text += f"\n*Company Overview:*\n{data['company_overview']}\n"
+        lines.append("")
+        lines.append("*Company Overview*")
+        lines.append(data["company_overview"])
+
+    lines.append("")
+    lines.append(f"*#{ticker} This Month Hive Stockpicker*")
     if stockpickers:
         quoted = ", ".join(f'"{n}"' for n in stockpickers)
-        text += f"\n*#{ticker} This Month Hive Stockpicker:* {quoted}\n"
+        lines.append(quoted)
     else:
-        text += f"\n*#{ticker} This Month Hive Stockpicker:* _None yet_\n"
-    text += "\n_🔋 Powered by The Hive 🐝 BuzzBot. Not financial advice. DYOR._"
-    return text
+        lines.append("_None yet_")
+
+    lines.append("")
+    lines.append("_🔋 Powered by The Hive 🐝 BuzzBot. Not financial advice. DYOR._")
+    return "\n".join(lines)
+
 
 
 def format_catalyst_snapshot(ticker: str, data: dict) -> str:
@@ -2244,12 +2297,20 @@ def format_catalyst_snapshot(ticker: str, data: dict) -> str:
                 break
     if not nxt:
         nxt = "_No catalyst detail on file._"
-    return (
-        f"⚡ *Catalyst Snapshot* · *#{ticker}* — {company}\n\n"
-        f"*Catalyst score:* {score_s}\n\n"
-        f"*Next catalyst:*\n{nxt}\n\n"
-        "_Not financial advice. DYOR._"
+    return "\n".join(
+        [
+            f"⚡ *Snap Shot* · *#{ticker}* — {company}",
+            "",
+            "*Catalyst Score*",
+            score_s,
+            "",
+            "*Next Catalyst*",
+            nxt,
+            "",
+            "_Not financial advice. DYOR._",
+        ]
     )
+
 
 
 async def _fetch_rns_history_for_ticker(ticker: str, limit: int = 10) -> list[dict]:
@@ -5018,15 +5079,19 @@ async def deliver_stock_snapshot(
         pct = meta.get("day_change_pct")
         if pct is None:
             pct = _fetch_pct_on_day_live(ticker)
+        try:
+            forced = await get_latest_rns_for_ticker(ticker, force=True)
+            if forced:
+                latest_rns = forced
+                meta["latest_rns"] = forced
+                if forced.get("date"):
+                    meta["last_rns_date"] = forced["date"]
+        except Exception as re:
+            logger.warning("force RNS on deliver failed %s: %s", ticker, re)
         body = format_brief_header(ticker, meta, pct=pct)
-        body += "\n\n" + format_stock_summary(ticker, meta, stockpickers)
-        if latest_rns:
-            body += "\n\n📰 *Latest RNS synced*"
-            if latest_rns.get("date"):
-                body += f" · {latest_rns.get('date')}"
-            body += f"\n{latest_rns.get('title') or '—'}"
-            if latest_rns.get("summary"):
-                body += f"\n_{latest_rns['summary'][:240]}_"
+        body += "\n\n" + format_stock_summary(
+            ticker, meta, stockpickers, latest_rns=latest_rns
+        )
         try:
             sent = await context.bot.send_message(
                 msg.chat_id,
