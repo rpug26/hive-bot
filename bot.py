@@ -11,7 +11,7 @@ import re
 import asyncio
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from notion_client import Client
@@ -232,6 +232,7 @@ _awaiting_watchlist: dict[int, str] = {}
 _awaiting_link: dict[int, bool] = {}
 # user_id -> waiting for ticker input after Stock Brief button
 _awaiting_snapshot: dict[int, bool] = {}
+_awaiting_backfill: dict[int, bool] = {}  # admin paste/forward stockpick backfill
 # admin_id -> Group Links request they are fulfilling (paste URL next)
 _awaiting_admin_glink: dict[int, dict] = {}
 # short req_id -> pending Group Links request details
@@ -1449,6 +1450,105 @@ async def save_stockpick_to_notion(
         logger.error("Failed to write #stockpick to Notion: %s", msg)
         return None, msg
 
+async def already_have_stockpick_message(
+    user_id: int | None, ticker: str | None, message_text: str
+) -> bool:
+    """
+    Dedup: same user + ticker + similar message already in Hive Stock Picks
+    in the last 7 days.
+    """
+    if not notion:
+        return False
+    db_id = (
+        os.getenv("NOTION_STOCKPICKS_DB_ID")
+        or os.getenv("NOTION_DATABASE_ID")
+        or "9095ded4ad6a4b25988719a77baba12f"
+    )
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
+        resp = notion.databases.query(
+            database_id=db_id,
+            filter={"property": "Telegram Date", "date": {"on_or_after": since}},
+            page_size=100,
+        )
+        needle = (message_text or "").strip().lower()[:120]
+        t = (ticker or "").upper()
+        uid_marker = f"uid:{user_id}" if user_id else None
+        for page in resp.get("results", []):
+            props = page.get("properties") or {}
+            notes = _get_plain_text(props.get("Notes")).lower()
+            msg = _get_plain_text(props.get("Message")).strip().lower()
+            row_t = _get_plain_text(props.get("Ticker")).upper().strip()
+            if t and row_t and row_t != t:
+                continue
+            if uid_marker and uid_marker in notes and needle and needle[:80] in msg:
+                return True
+            if needle and needle[:100] and needle[:100] in msg and (not t or row_t == t):
+                return True
+        return False
+    except Exception as e:
+        logger.warning("already_have_stockpick_message failed: %s", e)
+        return False
+
+
+async def capture_stockpick_from_text(
+    *,
+    text: str,
+    user_name: str,
+    user_id: int | None,
+    skip_month_limit: bool = False,
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Core capture used by live group posts and admin backfill.
+    Returns (page_id, ticker, error_or_status).
+    """
+    clean = (text or "").strip()
+    if "#stockpick" not in clean.lower():
+        return None, None, "no_stockpick_tag"
+    tickers = extract_hashtag_tickers(clean)
+    # Prefer non-month, non-generic tags
+    ticker = None
+    skip = set(MONTH_HASHTAGS.keys()) | {
+        "stockpick", "stockpicks", "hive", "aim"
+    }
+    for t in tickers:
+        if t.lower() in skip:
+            continue
+        ticker = t
+        break
+    if not ticker and tickers:
+        # last resort: first tag that isn't stockpick
+        for t in tickers:
+            if t.lower() != "stockpick":
+                ticker = t
+                break
+    if not ticker:
+        return None, None, "missing_ticker"
+    if await already_have_stockpick_message(user_id, ticker, clean):
+        return None, ticker, "duplicate"
+    if not skip_month_limit and user_id:
+        # Lightweight month check using existing helper needs a user-like object
+        pass
+    period_type, period_value = extract_period(clean)
+    # Default period to current month if none tagged
+    if not period_value:
+        period_type, period_value = (
+            "Monthly",
+            datetime.now(timezone.utc).strftime("%B"),
+        )
+    page_id, err = await save_stockpick_to_notion(
+        clean,
+        user_name,
+        ticker,
+        period_type,
+        period_value,
+        user_id=user_id,
+    )
+    if page_id:
+        return page_id, ticker, None
+    return None, ticker, err or "save_failed"
+
+
 async def has_submitted_this_month(user) -> bool:
     """
     Return True if this Telegram user already has a #stockpick
@@ -1523,6 +1623,7 @@ MONTH_HASHTAGS = {
     "august": "August", "aug": "August",
     "september": "September", "sep": "September", "sept": "September",
     "october": "October", "oct": "October",
+    "octobee": "October", "octoberbee": "October", "octbee": "October",
     "november": "November", "nov": "November",
     "december": "December", "dec": "December",
 }
@@ -3285,7 +3386,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await cleanup_trigger_message(update, context)
         return
 
-    # Stock Brief follow-up – user typed a ticker after tapping the button
+        # Admin stockpick backfill (paste / forward)
+    if user and user.id in _awaiting_backfill:
+        if await process_backfill_message(update, context):
+            return
+
+# Stock Brief follow-up – user typed a ticker after tapping the button
     if user and user.id in _awaiting_snapshot:
         _awaiting_snapshot.pop(user.id, None)
         raw = text.strip()
@@ -3633,6 +3739,121 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
             reply_markup=main_reply_keyboard(),
         )
+
+
+async def backfill_stockpicks_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Admin only: paste or forward group #stockpick posts from the last day(s)
+    to backfill Notion. Telegram Bot API cannot read group history, so the
+    admin must forward or paste the posts.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not msg or not user:
+        return
+    if not is_admin(user):
+        await msg.reply_text("Admin only.")
+        return
+    _awaiting_backfill[user.id] = True
+    await cleanup_trigger_message(update, context)
+    await msg.reply_text(
+        "📥 *Stockpick backfill mode*\n\n"
+        "Telegram bots *cannot* read past group history.\n"
+        "To capture missed picks since yesterday:\n\n"
+        "1. In the Hive group, *forward* each `#stockpick` post here, or\n"
+        "2. *Paste* one post per message (must include `#stockpick` + `#TICKER`).\n\n"
+        "I will write each one into *Hive Stock Picks* (skips duplicates).\n"
+        "Send /donebackfill when finished.",
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+async def done_backfill_cmd(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    _awaiting_backfill.pop(user.id, None)
+    await msg.reply_text(
+        "✅ Backfill mode closed.",
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+async def process_backfill_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """
+    Handle admin backfill paste or forward. Returns True if consumed.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or user.id not in _awaiting_backfill:
+        return False
+    if not is_admin(user):
+        _awaiting_backfill.pop(user.id, None)
+        return False
+
+    # Prefer forward origin for author name/id when available
+    text = (msg.text or msg.caption or "").strip()
+    if not text:
+        await msg.reply_text("No text on that message — forward the original post.")
+        return True
+
+    author_name = user.full_name or "Admin"
+    author_id = user.id
+    if msg.forward_from:
+        author_name = msg.forward_from.full_name or author_name
+        author_id = msg.forward_from.id
+    elif getattr(msg, "forward_sender_name", None):
+        author_name = msg.forward_sender_name
+        author_id = None  # hidden forward — still save text
+    elif msg.forward_from_chat and not msg.forward_from:
+        # channel / hidden user
+        author_name = msg.forward_sender_name or author_name
+
+    if "#stockpick" not in text.lower():
+        await msg.reply_text(
+            "Skipped — needs `#stockpick` in the text.\n"
+            "Send /donebackfill to exit.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    page_id, ticker, err = await capture_stockpick_from_text(
+        text=text,
+        user_name=author_name,
+        user_id=author_id,
+        skip_month_limit=True,
+    )
+    if page_id:
+        bit = f" #{ticker}" if ticker else ""
+        await msg.reply_text(
+            f"✅ Backfilled{bit} → Notion (*{author_name}*)",
+            parse_mode="Markdown",
+        )
+        try:
+            await log_member_activity(
+                user, REQUEST_TYPE_STOCKPICK, notes=f"backfill{bit}"
+            )
+        except Exception:
+            pass
+    elif err == "duplicate":
+        await msg.reply_text(
+            f"↷ Already in Notion"
+            + (f" (#{ticker})" if ticker else "")
+            + " — skipped."
+        )
+    elif err == "missing_ticker":
+        await msg.reply_text("⚠️ Needs a `#TICKER` hashtag as well as `#stockpick`.")
+    else:
+        await msg.reply_text(f"Could not save: {err or 'unknown'}")
+    return True
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7671,6 +7892,16 @@ async def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     if has_mention and hashtag_tickers:
         return True
 
+    # 4) #stockpick contributions: authorised + ticker is enough (no @ required)
+    #    so Hive members can post picks in-thread and the bot still logs them.
+    if "#stockpick" in lower and hashtag_tickers:
+        logger.info(
+            "Group #stockpick capture allowed without @mention user_id=%s tickers=%s",
+            update.effective_user.id if update.effective_user else None,
+            hashtag_tickers,
+        )
+        return True
+
     # Everything else in the group: stay mute
     return False
     
@@ -8168,6 +8399,9 @@ def main() -> None:
     app.add_handler(CommandHandler("faq", with_command_cleanup(faq)))
     app.add_handler(CommandHandler("snap", with_command_cleanup(snap_cmd)))
     app.add_handler(CommandHandler("mystockpick", with_command_cleanup(mystockpick_cmd)))
+    app.add_handler(CommandHandler("backfill_stockpicks", with_command_cleanup(backfill_stockpicks_cmd)))
+    app.add_handler(CommandHandler("backfillstockpicks", with_command_cleanup(backfill_stockpicks_cmd)))
+    app.add_handler(CommandHandler("donebackfill", with_command_cleanup(done_backfill_cmd)))
     app.add_handler(CommandHandler("help", with_command_cleanup(menu_cmd)))
     app.add_handler(CommandHandler("tickers", with_command_cleanup(snap_cmd)))
     app.add_handler(CommandHandler("status", with_command_cleanup(status_cmd)))
