@@ -11,7 +11,7 @@ import re
 import asyncio
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from notion_client import Client
@@ -3827,8 +3827,91 @@ async def _rank_tickers_by_live_pct(
     return ranked
 
 
+# UK bank / public holidays (England & Wales) — extend yearly as needed
+_UK_BANK_HOLIDAYS = {
+    date(2025, 12, 25),
+    date(2025, 12, 26),
+    date(2026, 1, 1),
+    date(2026, 4, 3),   # Good Friday
+    date(2026, 4, 6),   # Easter Monday
+    date(2026, 5, 4),   # Early May
+    date(2026, 5, 25),  # Spring bank
+    date(2026, 8, 31),  # Summer bank
+    date(2026, 12, 25),
+    date(2026, 12, 28),  # Boxing Day (observed)
+    date(2027, 1, 1),
+}
+
+
+def _uk_today() -> date:
+    """Calendar date in Europe/London (falls back to UTC)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo("Europe/London")).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
+
+
+def _is_non_trading_day(d: date) -> bool:
+    """Weekend or UK bank holiday → no normal LSE/AIM session."""
+    return d.weekday() >= 5 or d in _UK_BANK_HOLIDAYS
+
+
+def _previous_trading_day(d: date) -> date:
+    d = d - timedelta(days=1)
+    while _is_non_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _rns_brief_target_day() -> tuple[date, str | None]:
+    """
+    Day to use for RNS Brief.
+    Saturday / Sunday / UK holiday → previous trading day.
+    Returns (day, human note or None).
+    """
+    today = _uk_today()
+    if not _is_non_trading_day(today):
+        return today, None
+    prev = _previous_trading_day(today)
+    if today.weekday() == 5:
+        note = f"Saturday — showing previous session ({prev.isoformat()})"
+    elif today.weekday() == 6:
+        note = f"Sunday — showing previous session ({prev.isoformat()})"
+    else:
+        note = (
+            f"Market holiday — showing previous session ({prev.isoformat()})"
+        )
+    return prev, note
+
+
+async def _resolve_rns_brief_day() -> tuple[str, str | None]:
+    """
+    Resolve the RNS Brief calendar day and optional status note.
+    On weekend/holiday uses previous trading day.
+    If that day has no rows, walks back up to 5 prior sessions (holiday gaps).
+    """
+    target, note = _rns_brief_target_day()
+    day = target.isoformat()
+    rows = await _ensure_daily_brief_rns(day)
+    if rows:
+        return day, note
+
+    # Empty feed — walk back across prior sessions
+    d = target
+    for _ in range(5):
+        d = _previous_trading_day(d)
+        day2 = d.isoformat()
+        rows2 = await _ensure_daily_brief_rns(day2)
+        if rows2:
+            extra = f"No RNS for {day}; using {day2}"
+            return day2, f"{note} · {extra}" if note else extra
+    return day, note
+
+
 async def _ensure_daily_brief_rns(day: str) -> list[dict]:
-    """Load & cache today's ranked RNS only (Notion) with a hard timeout."""
+    """Load & cache ranked RNS for a calendar day (Notion) with a hard timeout."""
     rns = _daily_brief_rns.get(day)
     if rns is not None:
         return rns
@@ -3887,9 +3970,13 @@ async def _ensure_daily_brief_data(
 
 
 def _format_daily_brief_news(
-    day: str, rns: list[dict], page: int
+    day: str,
+    rns: list[dict],
+    page: int,
+    *,
+    note: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Page 0 = ranks 1–5, page 1 = ranks 6–10."""
+    """Page 0 = ranks 1–5, page 1 = ranks 6–10 (top 10)."""
     page = 0 if page < 0 else (1 if page > 1 else page)
     start = page * 5
     chunk = rns[start : start + 5]
@@ -3898,11 +3985,17 @@ def _format_daily_brief_news(
     lines = [
         "📰 *RNS Brief*",
         f"_Hive RNS News Log · {day}_",
-        f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + (len(chunk) or 0)}_",
-        "",
     ]
+    if note:
+        lines.append(f"_{note}_")
+    lines.extend(
+        [
+            f"_Page {page + 1}/{max_page + 1} · ranks {start + 1}–{start + (len(chunk) or 0)}_",
+            "",
+        ]
+    )
     if not chunk:
-        lines.append("_No RNS items for this page today._")
+        lines.append("_No RNS items for this page._")
     else:
         for i, r in enumerate(chunk, start + 1):
             t = (r.get("ticker") or "—").upper()
@@ -4067,7 +4160,8 @@ async def daily_brief_cmd(
         )
         return
 
-    day = datetime.now(timezone.utc).date().isoformat()
+    # Weekend / holiday → previous trading day's top RNS
+    day, day_note = await _resolve_rns_brief_day()
 
     # IMPORTANT: clear old panels BEFORE posting the loading message.
     # Previous bug: remember(status) then clear_nav_panel() deleted status,
@@ -4081,9 +4175,12 @@ async def daily_brief_cmd(
     except Exception:
         pass
 
+    loading = "📰 *RNS Brief*\n\nLoading RNS…"
+    if day_note:
+        loading = f"📰 *RNS Brief*\n\n_{day_note}_\n\nLoading…"
     try:
         status = await msg.reply_text(
-            "📰 *Daily Brief*\n\nLoading today’s RNS…",
+            loading,
             parse_mode="Markdown",
             reply_markup=main_reply_keyboard(),
         )
@@ -4095,10 +4192,12 @@ async def daily_brief_cmd(
     try:
         rns = await _ensure_daily_brief_rns(day)
         if not rns:
+            note_line = f"\n_{day_note}_\n" if day_note else "\n"
             text = (
                 f"📰 *RNS Brief*\n"
-                f"_Hive RNS News Log · {day}_\n\n"
-                "_No RNS rows for today yet "
+                f"_Hive RNS News Log · {day}_"
+                f"{note_line}\n"
+                "_No RNS rows for this session yet "
                 "(or Notion timed out under 15s)._\n\n"
                 "Try again shortly, or use Top 10 for session %."
             )
@@ -4108,7 +4207,9 @@ async def daily_brief_cmd(
                 ]
             )
         else:
-            text, markup = _format_daily_brief_news(day, rns, page=0)
+            text, markup = _format_daily_brief_news(
+                day, rns, page=0, note=day_note
+            )
         try:
             await status.edit_text(
                 text,
@@ -4173,7 +4274,8 @@ async def daily_brief_button(
         await query.answer("Authorised members only.", show_alert=True)
         return
 
-    day = datetime.now(timezone.utc).date().isoformat()
+    # Same calendar rule as open: weekend/holiday → previous session
+    day, day_note = await _resolve_rns_brief_day()
 
     # News pages — fast
     if data.startswith("brief:news:"):
@@ -4183,7 +4285,9 @@ async def daily_brief_button(
         except ValueError:
             page = 0
         rns = await _ensure_daily_brief_rns(day)
-        text, markup = _format_daily_brief_news(day, rns, page)
+        text, markup = _format_daily_brief_news(
+            day, rns, page, note=day_note
+        )
         try:
             await query.edit_message_text(
                 text,
