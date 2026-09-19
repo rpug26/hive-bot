@@ -1980,7 +1980,8 @@ def format_reply(ticker: str, data: dict, stockpickers: list[str] | None = None)
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """
     Home navigation – always-on persistent reply keyboard.
-    Stays visible after /start and after every menu selection.
+    Buttons: Watchlist, Stockpick, Stock Brief, Group Links,
+    Top 10, RNS Brief, Menu, Hide.
     """
     return ReplyKeyboardMarkup(
         [
@@ -2049,10 +2050,10 @@ async def send_home_menu(bot, chat_id: int | None) -> None:
         "🏠 *Home*\n\n"
         "• 👀 My Watchlist\n"
         "• 📌 My Stockpick\n"
-        "• 📊 Stock Brief\n"
+        "• 📊 Stock Brief — summary, catalyst & RNS\n"
         "• 🔗 Group Links\n"
-        "• 🏆 Stock of the Day\n"
-        "• 📰 Daily Brief\n"
+        "• 📈 Top 10 — session movers\n"
+        "• 📰 RNS Brief — significant RNS today\n"
         "• 📋 Menu\n"
         "• 🙈 Hide"
     )
@@ -3538,10 +3539,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Home keyboard (always available):\n"
             "• 👀 My Watchlist\n"
             "• 📌 My Stockpick\n"
-            "• 📊 Stock Brief\n"
+            "• 📊 Stock Brief — summary, catalyst & RNS\n"
             "• 🔗 Group Links\n"
+            "• 📈 Top 10 — session movers\n"
+            "• 📰 RNS Brief — significant RNS today\n"
             "• 📋 Menu\n"
-            "• 🏆 Stock of the Day\n"
             "• 🙈 Hide\n\n"
             "In the group: `@Bot #KEFI summary` or `#stockpick …`"
         )
