@@ -2103,10 +2103,10 @@ def hub_back_keyboard() -> InlineKeyboardMarkup:
 
 def brief_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
     """
-    Stock Brief panel actions.
-    Top: Stock Summary (primary)
-    Second: Catalyst Snapshot | RNS News
-    Third: Save + Hub
+    Stock Brief panel (as designed):
+      Row 1: Stock Summary (primary)
+      Row 2: Snap Shot | RNS News | « Hub
+    Snap Shot = Catalyst Score + Next Catalyst only.
     """
     t = (ticker or "").upper()[:20]
     return InlineKeyboardMarkup(
@@ -2119,18 +2119,12 @@ def brief_action_keyboard(ticker: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "⚡ Catalyst Snapshot",
+                    "⚡ Snap Shot",
                     callback_data=f"sbrief:cat:{t}",
                 ),
                 InlineKeyboardButton(
                     "📰 RNS News",
                     callback_data=f"sbrief:rns:{t}:0",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "➕ Save to Watchlist",
-                    callback_data=f"snap:save:{t}",
                 ),
                 InlineKeyboardButton("« Hub", callback_data="hub:home"),
             ],
@@ -3155,11 +3149,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in (
         "📊 Stock Brief",
         "Stock Brief",
+        "📊 Stock Snapshot",
+        "Stock Snapshot",
         "📊 Snapshot",
         "Snapshot",
     ) or lower in (
         "stock brief",
         "📊 stock brief",
+        "stock snapshot",
+        "📊 stock snapshot",
         "snapshot",
     ):
         await stock_snapshot_prompt(update, context)
@@ -4161,7 +4159,7 @@ async def sbrief_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 nav,
                 [
                     InlineKeyboardButton("📋 Stock Summary", callback_data=f"sbrief:sum:{ticker[:20]}"),
-                    InlineKeyboardButton("⚡ Catalyst", callback_data=f"sbrief:cat:{ticker[:20]}"),
+                    InlineKeyboardButton("⚡ Snap Shot", callback_data=f"sbrief:cat:{ticker[:20]}"),
                 ],
                 [InlineKeyboardButton("« Hub", callback_data="hub:home")],
             ])
@@ -4946,7 +4944,11 @@ async def stock_snapshot_prompt(
     await clear_nav_panel(context.bot, user.id)
     sent = await msg.reply_text(
         "📊 *Stock Brief*\n\n"
-        "Send a ticker (e.g. `ALRT` or `#KEFI`).",
+        "Send a ticker (e.g. `ALRT` or `#KEFI`).\n\n"
+        "After load you get:\n"
+        "• *Stock Summary* — full brief\n"
+        "• *Snap Shot* — catalyst score & next catalyst\n"
+        "• *RNS News* — last 10 RNS (5 per page)",
         parse_mode="Markdown",
         reply_markup=hub_back_keyboard(),
     )
